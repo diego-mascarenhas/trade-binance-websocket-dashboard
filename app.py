@@ -1397,28 +1397,93 @@ def add_order_block_overlays(
         )
 
 
+def chart_use_line_mode(df: pd.DataFrame) -> bool:
+    """Use close line chart when 1m candles are too flat for readable candlesticks (e.g. ETC)."""
+    lookback = min(len(df), 60)
+    if lookback < 10:
+        return False
+    recent = df.tail(lookback)
+    ref = float(recent["c"].median()) or float(recent["c"].iloc[-1]) or 1.0
+    avg_body = float((recent["c"] - recent["o"]).abs().mean())
+    avg_range = float((recent["h"] - recent["l"]).mean())
+    return avg_body < ref * 0.0001 or avg_range < ref * 0.00012
+
+
+def add_price_chart(fig: go.Figure, df: pd.DataFrame, row: int = 1, col: int = 1) -> str:
+    """Add candlesticks or close line depending on pair volatility. Returns chart mode label."""
+    if chart_use_line_mode(df):
+        closes = df["c"].astype(float)
+        prev = closes.shift(1).fillna(closes.iloc[0])
+        marker_colors = [
+            "#00c176" if c >= p else "#ff4d4f"
+            for c, p in zip(closes, prev, strict=False)
+        ]
+        hovers = [
+            f"O {format_price(float(r.o))} H {format_price(float(r.h))} "
+            f"L {format_price(float(r.l))} C {format_price(float(r.c))}"
+            for r in df.itertuples()
+        ]
+        fig.add_trace(
+            go.Scatter(
+                x=df["t"],
+                y=closes,
+                mode="lines+markers",
+                name=f"{SYMBOL.upper()} close",
+                line=dict(color="rgba(88,166,255,0.85)", width=1.5),
+                marker=dict(size=4, color=marker_colors, line=dict(width=0)),
+                text=hovers,
+                hoverinfo="text+x",
+            ),
+            row=row,
+            col=col,
+        )
+        return "line"
+
+    fig.add_trace(
+        go.Candlestick(
+            x=df["t"],
+            open=df["o"],
+            high=df["h"],
+            low=df["l"],
+            close=df["c"],
+            increasing=dict(
+                line=dict(color="#00c176", width=1),
+                fillcolor="rgba(0,193,118,0.9)",
+            ),
+            decreasing=dict(
+                line=dict(color="#ff4d4f", width=1),
+                fillcolor="rgba(255,77,79,0.9)",
+            ),
+            whiskerwidth=0.4,
+            name=SYMBOL.upper(),
+        ),
+        row=row,
+        col=col,
+    )
+    return "candles"
+
+
 def candle_chart_y_range(df: pd.DataFrame, metrics: dict) -> tuple[float, float]:
     lookback = min(len(df), max(CANDLE_CHART_LOOKBACK, 30))
     recent = df.tail(lookback)
     bar_ranges = (recent["h"] - recent["l"]).astype(float)
-    avg_range = float(bar_ranges.mean()) if not bar_ranges.empty else 0.0
-    p90_range = float(bar_ranges.quantile(0.9)) if len(bar_ranges) >= 5 else avg_range
+    closes = recent["c"].astype(float)
+    mid = metrics.get("price") or float(closes.iloc[-1])
 
-    # Ignore isolated wick spikes (common on low-vol pairs like ETC 1m).
-    y_min = float(recent["l"].quantile(0.08))
-    y_max = float(recent["h"].quantile(0.92))
-    mid = metrics.get("price") or float(recent["c"].iloc[-1])
-
-    target_span = max(p90_range * 7, avg_range * 10, mid * 0.0007)
+    y_min = float(min(closes.quantile(0.04), recent["l"].quantile(0.04)))
+    y_max = float(max(closes.quantile(0.96), recent["h"].quantile(0.96)))
     span = max(y_max - y_min, 1e-12)
-    if span < target_span:
+
+    typical_range = float(bar_ranges.quantile(0.75)) if len(bar_ranges) >= 5 else float(bar_ranges.mean())
+    min_span = max(typical_range * 8, mid * 0.0018, 0.003)
+    if span < min_span:
         center = mid if mid else (y_min + y_max) / 2
-        half = target_span / 2
+        half = min_span / 2
         y_min = center - half
         y_max = center + half
-        span = target_span
+        span = min_span
 
-    max_extend = span * 0.12
+    max_extend = span * 0.1
 
     def maybe_extend(value: float | None) -> None:
         nonlocal y_min, y_max, span
@@ -1448,7 +1513,7 @@ def candle_chart_y_range(df: pd.DataFrame, metrics: dict) -> tuple[float, float]
         for leg in plan.get("legs") or []:
             maybe_extend(leg.get("price"))
 
-    padding = max(span * 0.06, mid * 0.0002)
+    padding = max(span * 0.05, mid * 0.00015)
     return y_min - padding, y_max + padding
 
 
@@ -1568,6 +1633,14 @@ def add_trade_plan_overlays(
 
 def build_figure() -> go.Figure:
     df, ob, metrics = get_candles_df()
+    price_chart_mode = (
+        "line" if not df.empty and chart_use_line_mode(df) else "candles"
+    )
+    price_subtitle = (
+        "Price (line) + Order Blocks"
+        if price_chart_mode == "line"
+        else "OHLC + Order Blocks"
+    )
 
     fig = make_subplots(
         rows=2,
@@ -1575,31 +1648,11 @@ def build_figure() -> go.Figure:
         shared_xaxes=False,
         vertical_spacing=0.1,
         row_heights=[0.72, 0.28],
-        subplot_titles=("OHLC + Order Blocks", "Order Book Depth"),
+        subplot_titles=(price_subtitle, "Order Book Depth"),
     )
 
     if not df.empty:
-        fig.add_trace(
-            go.Candlestick(
-                x=df["t"],
-                open=df["o"],
-                high=df["h"],
-                low=df["l"],
-                close=df["c"],
-                increasing=dict(
-                    line=dict(color="#00c176", width=1.2),
-                    fillcolor="#00c176",
-                ),
-                decreasing=dict(
-                    line=dict(color="#ff4d4f", width=1.2),
-                    fillcolor="#ff4d4f",
-                ),
-                whiskerwidth=0.35,
-                name=SYMBOL.upper(),
-            ),
-            row=1,
-            col=1,
-        )
+        add_price_chart(fig, df, row=1, col=1)
 
         closed_df = df[df["x"]] if "x" in df.columns else df.iloc[:-1]
         pattern_x: list = []
@@ -1642,7 +1695,9 @@ def build_figure() -> go.Figure:
         add_trade_plan_overlays(fig, metrics, row=1, col=1)
         y_min, y_max = candle_chart_y_range(df, metrics)
         tick_fmt = price_tick_format(metrics.get("price"))
-        fig.update_yaxes(range=[y_min, y_max], tickformat=tick_fmt, row=1, col=1)
+        mid_price = metrics.get("price") or (y_min + y_max) / 2
+        y_dtick = max((y_max - y_min) / 8, float(mid_price) * 0.0005)
+        fig.update_yaxes(range=[y_min, y_max], tickformat=tick_fmt, dtick=y_dtick, row=1, col=1)
 
     bids = ob["bids"]
     asks = ob["asks"]
@@ -1712,7 +1767,7 @@ def build_figure() -> go.Figure:
         margin=dict(l=20, r=20, t=56, b=20),
     )
 
-    fig.update_xaxes(type="date", rangeslider_visible=False, row=1, col=1)
+    fig.update_xaxes(type="date", rangeslider_visible=False, tickformat="%H:%M", row=1, col=1)
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_xaxes(
         title_text="Quantity (← Bids | Asks →)",
