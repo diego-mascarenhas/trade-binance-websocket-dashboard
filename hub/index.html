@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Binance Live Dashboards</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="shell">
+        <header class="header">
+            <div>
+                <h1>Binance Live Dashboards</h1>
+                <p class="subtitle">Select a pair to open its live chart, order book, and signals.</p>
+            </div>
+            <div class="meta" id="meta"></div>
+        </header>
+        <main id="grid" class="grid"></main>
+        <p class="footer" id="footer"></p>
+    </div>
+    <script>
+        const grid = document.getElementById("grid");
+        const meta = document.getElementById("meta");
+        const footer = document.getElementById("footer");
+
+        function card(pair) {
+            const host = window.location.hostname || "127.0.0.1";
+            const url = `http://${host}:${pair.port}/`;
+            const article = document.createElement("article");
+            article.className = "card";
+            article.innerHTML = `
+                <div class="card-head">
+                    <span class="symbol">${pair.symbol}</span>
+                    <span class="port">:${pair.port}</span>
+                </div>
+                <p class="card-copy">Live OHLC, depth, signals, and optional execution.</p>
+                <a class="card-link" href="${url}" target="_blank" rel="noopener noreferrer">Open dashboard</a>
+            `;
+            return article;
+        }
+
+        fetch("pairs.json")
+            .then((response) => {
+                if (!response.ok) {
+                    throw new Error("pairs.json not found");
+                }
+                return response.json();
+            })
+            .then((pairs) => {
+                if (!Array.isArray(pairs) || pairs.length === 0) {
+                    throw new Error("No pairs configured");
+                }
+                meta.textContent = `${pairs.length} pair${pairs.length === 1 ? "" : "s"} · hub :${window.location.port || "8050"}`;
+                pairs.forEach((pair) => grid.appendChild(card(pair)));
+                footer.textContent = "Start dashboards with ./run-all.sh · Hub links use this host automatically.";
+            })
+            .catch((error) => {
+                meta.textContent = "Hub idle";
+                grid.innerHTML = `<div class="empty">Run <code>./run-all.sh</code> to generate pairs.json and start the dashboards.<br><small>${error.message}</small></div>`;
+            });
+    </script>
+</body>
+</html>

@@ -56,7 +56,12 @@ REST_SL_TP_POLL_INTERVAL = float(os.getenv("REST_SL_TP_POLL_INTERVAL", "2"))
 TP_ORDER_TYPE = os.getenv("TP_ORDER_TYPE", "trailing").lower()
 TP_TRAILING_CALLBACK_RATE = float(os.getenv("TP_TRAILING_CALLBACK_RATE", "0.5"))
 EXECUTION_ORDER_COOLDOWN = int(os.getenv("EXECUTION_ORDER_COOLDOWN", "180"))
+EXECUTION_BLOCK_IF_OPEN = _env_bool("EXECUTION_BLOCK_IF_OPEN", "true")
+EXECUTION_POSITION_CACHE_SEC = float(os.getenv("EXECUTION_POSITION_CACHE_SEC", "5"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
+DEBUG_LOG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug-f64afe.log"
+)
 
 _status_lock = threading.Lock()
 _hedge_mode_lock = threading.Lock()
@@ -77,6 +82,8 @@ _symbol_filters: dict[str, dict[str, Decimal]] = {}
 _max_leverage_cache: dict[str, int] = {}
 _filters_lock = threading.Lock()
 _leverage_lock = threading.Lock()
+_position_snapshot_lock = threading.Lock()
+_position_snapshot_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 def get_execution_status() -> dict[str, Any]:
@@ -154,6 +161,309 @@ def _apply_position_params(params: dict[str, Any], direction: str, *, reduce_onl
     elif reduce_only:
         out["reduceOnly"] = "true"
     return out
+
+
+def _agent_debug(
+    location: str,
+    message: str,
+    data: dict[str, Any],
+    hypothesis_id: str,
+    *,
+    run_id: str = "pre-fix",
+) -> None:
+    # #region agent log
+    try:
+        payload = {
+            "sessionId": "f64afe",
+            "location": location,
+            "message": message,
+            "data": data,
+            "hypothesisId": hypothesis_id,
+            "runId": run_id,
+            "timestamp": int(time.time() * 1000),
+        }
+        os.makedirs(os.path.dirname(DEBUG_LOG_PATH), exist_ok=True)
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, default=str) + "\n")
+    except OSError:
+        pass
+    # #endregion
+
+
+def _position_amt(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return Decimal(0)
+
+
+def _get_position_risk(symbol: str) -> list[dict[str, Any]]:
+    if not _keys_configured():
+        return []
+    try:
+        resp = _fapi_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol.upper()})
+        return resp if isinstance(resp, list) else []
+    except RuntimeError as exc:
+        logger.warning("positionRisk failed for %s: %s", symbol, exc)
+        return []
+
+
+def has_open_position(symbol: str) -> bool:
+    """True when Binance reports a non-zero futures position on symbol."""
+    if not _keys_configured():
+        return False
+    symbol = symbol.upper()
+    for row in _get_position_risk(symbol):
+        if row.get("symbol") != symbol:
+            continue
+        if _position_amt(row.get("positionAmt", "0")).copy_abs() > Decimal("0"):
+            return True
+    return False
+
+
+def _parse_position_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    amt = _position_amt(row.get("positionAmt", "0"))
+    if amt.copy_abs() <= Decimal("0"):
+        return None
+
+    pos_side = (row.get("positionSide") or "BOTH").upper()
+    if is_hedge_mode() and pos_side in ("LONG", "SHORT"):
+        direction = pos_side
+    elif amt > 0:
+        direction = "LONG"
+    else:
+        direction = "SHORT"
+
+    qty_decimal = amt.copy_abs()
+    qty = format(qty_decimal.normalize(), "f")
+    entry = float(row.get("entryPrice", 0) or 0)
+    mark = float(row.get("markPrice", 0) or 0)
+    upnl = float(row.get("unRealizedProfit", 0) or 0)
+
+    if entry > 0:
+        volume_usdt = float(qty_decimal) * entry
+    elif mark > 0:
+        volume_usdt = float(qty_decimal) * mark
+    else:
+        volume_usdt = None
+
+    return {
+        "open": True,
+        "pending": False,
+        "direction": direction,
+        "qty": qty,
+        "entry": entry if entry > 0 else None,
+        "volume_usdt": round(volume_usdt, 2) if volume_usdt is not None else None,
+        "unrealized_pnl": round(upnl, 2),
+        "mark_price": mark if mark > 0 else None,
+    }
+
+
+def _pending_entry_snapshot(symbol: str) -> dict[str, Any] | None:
+    for order in _get_open_orders(symbol):
+        if not _is_entry_limit_order(order):
+            continue
+        side = order.get("side")
+        direction = "LONG" if side == "BUY" else "SHORT"
+        price = float(order.get("price", 0) or 0)
+        qty_raw = order.get("origQty") or order.get("quantity") or "0"
+        qty_decimal = _position_amt(qty_raw)
+        if qty_decimal <= Decimal("0") or price <= 0:
+            continue
+        volume_usdt = float(qty_decimal) * price
+        return {
+            "open": False,
+            "pending": True,
+            "direction": direction,
+            "qty": format(qty_decimal.normalize(), "f"),
+            "entry": price,
+            "volume_usdt": round(volume_usdt, 2),
+            "unrealized_pnl": None,
+            "mark_price": None,
+            "order_id": order.get("orderId"),
+        }
+    return None
+
+
+def _fetch_exchange_exposure(symbol: str) -> dict[str, Any]:
+    empty: dict[str, Any] = {
+        "open": False,
+        "pending": False,
+        "direction": None,
+        "qty": None,
+        "entry": None,
+        "volume_usdt": None,
+        "unrealized_pnl": None,
+        "mark_price": None,
+    }
+    if not _keys_configured():
+        empty["source"] = "no_keys"
+        return empty
+
+    symbol = symbol.upper()
+    legs: list[dict[str, Any]] = []
+    for row in _get_position_risk(symbol):
+        if row.get("symbol") != symbol:
+            continue
+        parsed = _parse_position_row(row)
+        if parsed:
+            legs.append(parsed)
+
+    if len(legs) == 1:
+        snapshot = dict(legs[0])
+        snapshot["source"] = "binance"
+        return snapshot
+
+    if len(legs) > 1:
+        total_vol = sum(leg.get("volume_usdt") or 0 for leg in legs)
+        total_pnl = sum(leg.get("unrealized_pnl") or 0 for leg in legs)
+        directions = "+".join(leg["direction"] for leg in legs)
+        snapshot = {
+            "open": True,
+            "pending": False,
+            "direction": directions,
+            "qty": ", ".join(f"{leg['direction']} {leg['qty']}" for leg in legs),
+            "entry": legs[0].get("entry"),
+            "volume_usdt": round(total_vol, 2) if total_vol else None,
+            "unrealized_pnl": round(total_pnl, 2),
+            "mark_price": legs[0].get("mark_price"),
+            "legs": legs,
+            "source": "binance",
+        }
+        return snapshot
+
+    pending = _pending_entry_snapshot(symbol)
+    if pending:
+        pending["source"] = "binance"
+        return pending
+
+    empty["source"] = "binance"
+    return empty
+
+
+def get_exchange_exposure(symbol: str) -> dict[str, Any]:
+    """Open position or pending entry LIMIT on Binance Futures (cached for dashboard)."""
+    symbol = symbol.upper()
+    if not EXECUTION_ENABLED or not _keys_configured():
+        return {
+            "open": False,
+            "pending": False,
+            "direction": None,
+            "qty": None,
+            "entry": None,
+            "volume_usdt": None,
+            "unrealized_pnl": None,
+            "mark_price": None,
+            "source": "disabled" if not EXECUTION_ENABLED else "no_keys",
+        }
+
+    now = time.monotonic()
+    with _position_snapshot_lock:
+        cached = _position_snapshot_cache.get(symbol)
+        if cached and now - cached[0] < EXECUTION_POSITION_CACHE_SEC:
+            return dict(cached[1])
+
+    snapshot = _fetch_exchange_exposure(symbol)
+    with _position_snapshot_lock:
+        _position_snapshot_cache[symbol] = (now, snapshot)
+    return dict(snapshot)
+
+
+def _get_open_orders(symbol: str) -> list[dict[str, Any]]:
+    if not _keys_configured():
+        return []
+    try:
+        resp = _fapi_request("GET", "/fapi/v1/openOrders", {"symbol": symbol.upper()})
+        return resp if isinstance(resp, list) else []
+    except RuntimeError as exc:
+        logger.warning("openOrders failed for %s: %s", symbol, exc)
+        return []
+
+
+def _is_entry_limit_order(order: dict[str, Any]) -> bool:
+    if order.get("type") not in ("LIMIT", "LIMIT_MAKER"):
+        return False
+    if order.get("reduceOnly") in (True, "true", "True"):
+        return False
+    return True
+
+
+def has_open_limit_same_side(symbol: str, direction: str) -> bool:
+    direction = direction.upper()
+    side = "BUY" if direction == "LONG" else "SELL"
+    want_ps = direction if is_hedge_mode() else None
+    for order in _get_open_orders(symbol):
+        if not _is_entry_limit_order(order):
+            continue
+        if order.get("side") != side:
+            continue
+        if want_ps:
+            pos_side = (order.get("positionSide") or "").upper()
+            if pos_side and pos_side not in (want_ps, "BOTH"):
+                continue
+        return True
+    return False
+
+
+def has_conflicting_entry_limits(symbol: str) -> bool:
+    return has_open_limit_same_side(symbol, "LONG") and has_open_limit_same_side(symbol, "SHORT")
+
+
+def has_limit_at_price(symbol: str, direction: str, entry: float) -> bool:
+    direction = direction.upper()
+    side = "BUY" if direction == "LONG" else "SELL"
+    want_ps = direction if is_hedge_mode() else None
+    entry_str = round_price(symbol, entry)
+    for order in _get_open_orders(symbol):
+        if not _is_entry_limit_order(order):
+            continue
+        if order.get("side") != side:
+            continue
+        if want_ps:
+            pos_side = (order.get("positionSide") or "").upper()
+            if pos_side and pos_side not in (want_ps, "BOTH"):
+                continue
+        price_str = round_price(symbol, float(order.get("price", 0)))
+        if price_str == entry_str:
+            return True
+    return False
+
+
+def can_place_new_order(symbol: str, direction: str, entry: float) -> tuple[bool, str]:
+    """Mirror trade-binance-websocket-order-blocks can_place_new_order."""
+    if not EXECUTION_BLOCK_IF_OPEN or not _keys_configured():
+        return True, ""
+
+    symbol = symbol.upper()
+    direction = direction.upper()
+
+    if has_open_position(symbol):
+        return False, "open_position"
+    if has_conflicting_entry_limits(symbol):
+        return False, "conflicting_limits"
+    opposite = "SHORT" if direction == "LONG" else "LONG"
+    if has_open_limit_same_side(symbol, opposite):
+        return False, "pending_opposite_limit"
+    if has_open_limit_same_side(symbol, direction):
+        return False, "pending_entry_limit"
+    if has_limit_at_price(symbol, direction, entry):
+        return False, "duplicate_limit_price"
+    return True, ""
+
+
+def _log_skip_order(symbol: str, signal: str, reason: str, *, entry: float | None = None) -> None:
+    event = {
+        "open_position": "skip_open_position",
+        "pending_entry_limit": "skip_pending_limit",
+        "pending_opposite_limit": "skip_pending_limit",
+        "conflicting_limits": "skip_conflicting_limits",
+        "duplicate_limit_price": "skip_duplicate_limit",
+    }.get(reason, "skip_order_guard")
+    fields: dict[str, Any] = {"symbol": symbol.upper(), "signal": signal, "reason": reason}
+    if entry is not None:
+        fields["entry"] = entry
+    _append_orders_log(event, **fields)
+    logger.warning("%s: blocked new %s order (%s)", symbol.upper(), signal, reason)
 
 
 def _sign_query(params: dict[str, Any]) -> str:
@@ -462,6 +772,27 @@ def _execute_open(
     global _last_execution_monotonic
 
     symbol = symbol.upper()
+    allowed, block_reason = can_place_new_order(symbol, direction, entry)
+    # #region agent log
+    _agent_debug(
+        "execution.py:_execute_open",
+        "position guard re-check",
+        {
+            "symbol": symbol,
+            "direction": direction,
+            "entry": entry,
+            "allowed": allowed,
+            "block_reason": block_reason,
+            "has_open_position": has_open_position(symbol) if _keys_configured() else None,
+        },
+        "C",
+    )
+    # #endregion
+    if not allowed:
+        _log_skip_order(symbol, direction, block_reason, entry=entry)
+        _set_status(message=f"Blocked: {block_reason}", last_event=block_reason)
+        return
+
     price_str = round_price(symbol, entry)
     try:
         qty = _calculate_quantity(symbol, entry, size_pct)
@@ -601,6 +932,32 @@ def try_execute_valid_entry(
     size_pct = float(legs[0]["size_pct"]) if legs else float(trade_plan.get("partial_close_pct", 50))
     entry_price = float(legs[0]["price"]) if legs else float(entry)
     fingerprint = f"{signal}|{entry_price:.2f}|{sl:.2f}|{tp:.2f}"
+
+    allowed, block_reason = can_place_new_order(symbol, signal, entry_price)
+    # #region agent log
+    _agent_debug(
+        "execution.py:try_execute_valid_entry",
+        "position guard check",
+        {
+            "symbol": symbol.upper(),
+            "signal": signal,
+            "entry_price": entry_price,
+            "allowed": allowed,
+            "block_reason": block_reason,
+            "cooldown_sec": EXECUTION_ORDER_COOLDOWN,
+            "cooldown_remaining": (
+                max(0, EXECUTION_ORDER_COOLDOWN - (now - _last_execution_monotonic))
+                if _last_execution_monotonic is not None
+                else 0
+            ),
+            "has_open_position": has_open_position(symbol) if _keys_configured() else None,
+        },
+        "A",
+    )
+    # #endregion
+    if not allowed:
+        _log_skip_order(symbol, signal, block_reason, entry=entry_price)
+        return
 
     thread = threading.Thread(
         target=_execute_open,

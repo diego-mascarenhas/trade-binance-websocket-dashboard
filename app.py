@@ -1366,7 +1366,10 @@ def get_candles_df() -> pd.DataFrame:
                 signal_dir,
             ),
             "log_dir": LOG_DIR,
-            "execution": execution.get_execution_status(),
+            "execution": {
+                **execution.get_execution_status(),
+                "position": execution.get_exchange_exposure(SYMBOL),
+            },
         }
 
     return pd.DataFrame(rows), ob, metrics
@@ -2068,6 +2071,7 @@ def build_execution_panel_section(metrics: dict) -> list:
     enabled = ex.get("enabled", False)
     mode = (ex.get("mode") or "dry").upper()
     log_dir = metrics.get("log_dir", LOG_DIR)
+    pos = ex.get("position") or {}
 
     children: list = [
         panel_section("Order execution"),
@@ -2084,8 +2088,51 @@ def build_execution_panel_section(metrics: dict) -> list:
             ],
             className="badge-row",
         ),
-        kv_row("Status", ex.get("message", "—"), strong=True),
     ]
+
+    if pos.get("open"):
+        vol_text = (
+            f"{pos['volume_usdt']:.2f} USDT"
+            if pos.get("volume_usdt") is not None
+            else "—"
+        )
+        entry_text = format_price(pos.get("entry")) if pos.get("entry") is not None else "—"
+        pnl = pos.get("unrealized_pnl")
+        pnl_text = f"{pnl:+.2f} USDT" if pnl is not None else "—"
+        children.extend(
+            [
+                kv_row(
+                    "Binance position",
+                    f"{pos.get('direction', '—')} · {vol_text}",
+                    strong=True,
+                ),
+                kv_row("Entry", entry_text, strong=True),
+                kv_row("Size", pos.get("qty", "—"), strong=True),
+                kv_row("Unrealized PnL", pnl_text, strong=True),
+            ]
+        )
+    elif pos.get("pending"):
+        vol_text = (
+            f"{pos['volume_usdt']:.2f} USDT"
+            if pos.get("volume_usdt") is not None
+            else "—"
+        )
+        entry_text = format_price(pos.get("entry")) if pos.get("entry") is not None else "—"
+        children.extend(
+            [
+                kv_row(
+                    "Pending entry",
+                    f"{pos.get('direction', '—')} LIMIT · {vol_text}",
+                    strong=True,
+                ),
+                kv_row("Limit price", entry_text, strong=True),
+                kv_row("Size", pos.get("qty", "—"), strong=True),
+            ]
+        )
+    elif enabled and pos.get("source") == "binance":
+        children.append(kv_row("Binance position", "None", strong=True))
+
+    children.append(kv_row("Status", ex.get("message", "—"), strong=True))
     if telegram.is_trading_paused():
         children.append(kv_row("Telegram", "Trading paused (/start to resume)", strong=True))
     if ex.get("last_at"):
