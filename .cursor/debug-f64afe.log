@@ -1,1 +1,0 @@
-{"sessionId": "f64afe", "location": "execution.py:try_execute_valid_entry", "message": "position guard check", "data": {"symbol": "BTCUSDT", "signal": "LONG", "entry_price": 73967.0, "allowed": false, "block_reason": "open_position", "cooldown_sec": 180, "cooldown_remaining": 0, "has_open_position": true}, "hypothesisId": "A", "runId": "pre-fix", "timestamp": 1780176997602}

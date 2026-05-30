@@ -59,9 +59,6 @@ EXECUTION_ORDER_COOLDOWN = int(os.getenv("EXECUTION_ORDER_COOLDOWN", "180"))
 EXECUTION_BLOCK_IF_OPEN = _env_bool("EXECUTION_BLOCK_IF_OPEN", "true")
 EXECUTION_POSITION_CACHE_SEC = float(os.getenv("EXECUTION_POSITION_CACHE_SEC", "5"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
-DEBUG_LOG_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug-f64afe.log"
-)
 
 _status_lock = threading.Lock()
 _hedge_mode_lock = threading.Lock()
@@ -161,33 +158,6 @@ def _apply_position_params(params: dict[str, Any], direction: str, *, reduce_onl
     elif reduce_only:
         out["reduceOnly"] = "true"
     return out
-
-
-def _agent_debug(
-    location: str,
-    message: str,
-    data: dict[str, Any],
-    hypothesis_id: str,
-    *,
-    run_id: str = "pre-fix",
-) -> None:
-    # #region agent log
-    try:
-        payload = {
-            "sessionId": "f64afe",
-            "location": location,
-            "message": message,
-            "data": data,
-            "hypothesisId": hypothesis_id,
-            "runId": run_id,
-            "timestamp": int(time.time() * 1000),
-        }
-        os.makedirs(os.path.dirname(DEBUG_LOG_PATH), exist_ok=True)
-        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, default=str) + "\n")
-    except OSError:
-        pass
-    # #endregion
 
 
 def _position_amt(value: Any) -> Decimal:
@@ -773,21 +743,6 @@ def _execute_open(
 
     symbol = symbol.upper()
     allowed, block_reason = can_place_new_order(symbol, direction, entry)
-    # #region agent log
-    _agent_debug(
-        "execution.py:_execute_open",
-        "position guard re-check",
-        {
-            "symbol": symbol,
-            "direction": direction,
-            "entry": entry,
-            "allowed": allowed,
-            "block_reason": block_reason,
-            "has_open_position": has_open_position(symbol) if _keys_configured() else None,
-        },
-        "C",
-    )
-    # #endregion
     if not allowed:
         _log_skip_order(symbol, direction, block_reason, entry=entry)
         _set_status(message=f"Blocked: {block_reason}", last_event=block_reason)
@@ -934,27 +889,6 @@ def try_execute_valid_entry(
     fingerprint = f"{signal}|{entry_price:.2f}|{sl:.2f}|{tp:.2f}"
 
     allowed, block_reason = can_place_new_order(symbol, signal, entry_price)
-    # #region agent log
-    _agent_debug(
-        "execution.py:try_execute_valid_entry",
-        "position guard check",
-        {
-            "symbol": symbol.upper(),
-            "signal": signal,
-            "entry_price": entry_price,
-            "allowed": allowed,
-            "block_reason": block_reason,
-            "cooldown_sec": EXECUTION_ORDER_COOLDOWN,
-            "cooldown_remaining": (
-                max(0, EXECUTION_ORDER_COOLDOWN - (now - _last_execution_monotonic))
-                if _last_execution_monotonic is not None
-                else 0
-            ),
-            "has_open_position": has_open_position(symbol) if _keys_configured() else None,
-        },
-        "A",
-    )
-    # #endregion
     if not allowed:
         _log_skip_order(symbol, signal, block_reason, entry=entry_price)
         return

@@ -98,7 +98,7 @@
 
 .panels {
     display: grid;
-    grid-template-columns: minmax(260px, 280px) minmax(280px, 1fr) minmax(240px, 280px);
+    grid-template-columns: repeat(4, minmax(200px, 1fr));
     gap: 12px;
     margin-bottom: 12px;
     align-items: start;
@@ -117,17 +117,37 @@
 
 .panel-pattern,
 .panel-signal,
-.panel-metrics {
+.panel-metrics,
+.panel-trade-plan {
     flex-direction: column;
     align-items: stretch;
     gap: 4px;
 }
 
-.panel-trade-plan {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 4px;
-    margin-bottom: 12px;
+.panel-pattern .panel-section-title:first-child,
+.panel-signal .panel-section-title:first-child,
+.panel-metrics .panel-section-title:first-child,
+.panel-trade-plan .panel-section-title:first-child {
+    margin-top: 0;
+    padding-top: 0;
+    border-top: none;
+}
+
+.trade-plan-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0 10px;
+    width: 100%;
+}
+
+.trade-plan-grid .kv-row,
+.trade-plan-grid .panel-section-title {
+    grid-column: 1 / -1;
+}
+
+.trade-plan-grid .panel-section-title:not(:first-child) {
+    margin-top: 4px;
+    padding-top: 4px;
 }
 
 .panel-section-title {
@@ -140,14 +160,6 @@
     font-weight: 700;
     letter-spacing: 0.06em;
     text-transform: uppercase;
-}
-
-.panel-pattern .panel-section-title:first-child,
-.panel-signal .panel-section-title:first-child,
-.panel-metrics .panel-section-title:first-child {
-    margin-top: 0;
-    padding-top: 0;
-    border-top: none;
 }
 
 .kv-row {
@@ -323,6 +335,12 @@
     border: 1px solid #2a2f3a;
     border-radius: 10px;
     overflow: hidden;
+}
+
+@media (max-width: 1200px) {
+    .panels {
+        grid-template-columns: repeat(2, minmax(200px, 1fr));
+    }
 }
 
 @media (max-width: 900px) {

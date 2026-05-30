@@ -2070,20 +2070,15 @@ def build_execution_panel_section(metrics: dict) -> list:
     ex = metrics.get("execution") or {}
     enabled = ex.get("enabled", False)
     mode = (ex.get("mode") or "dry").upper()
-    log_dir = metrics.get("log_dir", LOG_DIR)
     pos = ex.get("position") or {}
 
     children: list = [
-        panel_section("Order execution"),
+        panel_section("Execution"),
         html.Div(
             [
                 html.Span(
                     f"{mode} · Futures" if enabled else "Off",
                     className=execution_badge_class(ex.get("mode", "dry"), enabled),
-                ),
-                html.Span(
-                    "Binance REST" if enabled else "Set EXECUTION_ENABLED=true",
-                    className="badge badge-neutral",
                 ),
             ],
             className="badge-row",
@@ -2098,17 +2093,12 @@ def build_execution_panel_section(metrics: dict) -> list:
         )
         entry_text = format_price(pos.get("entry")) if pos.get("entry") is not None else "—"
         pnl = pos.get("unrealized_pnl")
-        pnl_text = f"{pnl:+.2f} USDT" if pnl is not None else "—"
+        pnl_text = f"{pnl:+.2f}" if pnl is not None else "—"
         children.extend(
             [
-                kv_row(
-                    "Binance position",
-                    f"{pos.get('direction', '—')} · {vol_text}",
-                    strong=True,
-                ),
-                kv_row("Entry", entry_text, strong=True),
+                kv_row("Position", f"{pos.get('direction', '—')} · {vol_text}", strong=True),
+                kv_row("Entry", entry_text, strong=True, hint=f"PnL {pnl_text} USDT"),
                 kv_row("Size", pos.get("qty", "—"), strong=True),
-                kv_row("Unrealized PnL", pnl_text, strong=True),
             ]
         )
     elif pos.get("pending"):
@@ -2120,140 +2110,106 @@ def build_execution_panel_section(metrics: dict) -> list:
         entry_text = format_price(pos.get("entry")) if pos.get("entry") is not None else "—"
         children.extend(
             [
-                kv_row(
-                    "Pending entry",
-                    f"{pos.get('direction', '—')} LIMIT · {vol_text}",
-                    strong=True,
-                ),
-                kv_row("Limit price", entry_text, strong=True),
-                kv_row("Size", pos.get("qty", "—"), strong=True),
+                kv_row("Pending", f"{pos.get('direction', '—')} · {vol_text}", strong=True),
+                kv_row("Limit", entry_text, strong=True, hint=f"qty {pos.get('qty', '—')}"),
             ]
         )
     elif enabled and pos.get("source") == "binance":
-        children.append(kv_row("Binance position", "None", strong=True))
+        children.append(kv_row("Position", "None", strong=True))
 
     children.append(kv_row("Status", ex.get("message", "—"), strong=True))
     if telegram.is_trading_paused():
-        children.append(kv_row("Telegram", "Trading paused (/start to resume)", strong=True))
-    if ex.get("last_at"):
-        children.append(kv_row("Last order", ex.get("last_at", "—")))
-    if ex.get("last_symbol"):
+        children.append(kv_row("Telegram", "Paused", strong=True))
+    if ex.get("last_order_id"):
+        last_bits = [
+            ex.get("last_direction"),
+            ex.get("last_symbol"),
+            str(ex.get("last_order_id")),
+        ]
         children.append(
             kv_row(
-                "Last side",
-                f"{ex.get('last_direction', '—')} · {ex.get('last_symbol', '—')}",
+                "Last order",
+                " · ".join(bit for bit in last_bits if bit),
+                hint=ex.get("last_at"),
             )
         )
-    if ex.get("last_order_id"):
-        children.append(kv_row("Order ID", str(ex.get("last_order_id")), strong=True))
-
-    note = (
-        "Dry-run logs to orders.log — no API calls."
-        if ex.get("mode") == "dry"
-        else "Live mode sends LIMIT + SL/TP to Binance Futures (fapi)."
-    )
-    children.append(html.P(note, className="panel-hint panel-footnote"))
-    children.append(
-        html.P(
-            f"Log: {log_dir}/orders.log · triggers on valid chart entries (HTF-aligned).",
-            className="panel-hint panel-footnote",
-        )
-    )
     return children
 
 
 def build_trade_plan_panel_children(metrics: dict) -> list:
     plan = metrics.get("trade_plan") or {}
-    log_dir = metrics.get("log_dir", LOG_DIR)
 
     if not plan.get("active"):
         return [
-            panel_section("Suggested trade plan"),
-            html.P(plan.get("summary", "No active plan."), className="panel-hint panel-footnote"),
-            html.P("Informational only — not financial advice.", className="panel-hint"),
+            panel_section("Trade plan"),
+            kv_row("Plan", plan.get("summary", "No active plan."), strong=True),
             *build_execution_panel_section(metrics),
-            html.P(
-                f"Logs: {log_dir}/signals.log · trades.log · plans.log · orders.log · errors.log",
-                className="panel-hint panel-footnote",
-            ),
         ]
 
     status_class = "badge badge-trade" if plan.get("live_match") else "badge badge-watch"
     status_label = "Live" if plan.get("live_match") else "Held"
 
+    plan_details: list = [
+        panel_section("Entry"),
+    ]
+    for leg in plan.get("legs") or []:
+        plan_details.append(kv_row(leg["label"], format_price(leg["price"]), strong=True))
+    plan_details.append(kv_row("Avg entry", format_price(plan["avg_entry"]), strong=True))
+
+    plan_details.append(panel_section("Targets"))
+    plan_details.extend(
+        [
+            kv_row(
+                "Stop loss",
+                format_price(plan["sl"]),
+                strong=True,
+                hint=f"risk {plan['risk_pct']:.2f}%",
+            ),
+            kv_row(
+                "TP1",
+                format_price(plan["tp1"]),
+                strong=True,
+                hint=f"+{plan['reward_tp1_pct']:.2f}% · {plan['partial_close_pct']:.0f}%",
+            ),
+            kv_row(
+                "TP2",
+                format_price(plan["tp2"]),
+                strong=True,
+                hint=f"RR {plan['rr_tp2']:.1f}",
+            ),
+            kv_row(
+                "Break even",
+                format_price(plan["breakeven_price"]),
+                strong=True,
+                hint=f"{plan['runner_pct']:.0f}% runner",
+            ),
+            kv_row(
+                "Trail",
+                f"{plan['trail_pct']:.2f}%",
+                strong=True,
+                hint=f"from {'peak' if plan['signal'] == 'LONG' else 'trough'}",
+            ),
+        ]
+    )
+
     children: list = [
-        panel_section("Suggested trade plan"),
+        panel_section("Trade plan"),
         html.Div(
             [
                 html.Span(plan["signal"], className=signal_badge_class(plan["signal"])),
                 html.Span(status_label, className=status_class),
-                html.Span("Informational", className="badge badge-neutral"),
             ],
             className="badge-row",
         ),
-        kv_row("Suggested at", plan.get("created_at", "—"), strong=True),
-        html.P(plan.get("status_note", plan.get("summary", "")), className="panel-hint"),
-        html.P(plan["summary"], className="panel-hint"),
+        kv_row(
+            "Status",
+            plan.get("status_note", plan.get("summary", "—")),
+            strong=True,
+            hint=plan.get("created_at"),
+        ),
+        html.Div(plan_details, className="trade-plan-grid"),
+        *build_execution_panel_section(metrics),
     ]
-
-    children.append(panel_section("Entry · DCA"))
-    for leg in plan.get("legs") or []:
-        children.append(kv_row(leg["label"], format_price(leg["price"]), strong=True))
-    children.append(kv_row("Weighted avg", format_price(plan["avg_entry"]), strong=True))
-
-    children.append(panel_section("Stop · targets"))
-    children.append(
-        kv_row(
-            "Stop loss",
-            format_price(plan["sl"]),
-            strong=True,
-            hint=f"risk {plan['risk_pct']:.2f}%",
-        )
-    )
-    children.append(
-        kv_row(
-            "TP1",
-            format_price(plan["tp1"]),
-            strong=True,
-            hint=f"+{plan['reward_tp1_pct']:.2f}% · close {plan['partial_close_pct']:.0f}%",
-        )
-    )
-    children.append(
-        kv_row(
-            "TP2",
-            format_price(plan["tp2"]),
-            strong=True,
-            hint=f"RR {plan['rr_tp2']:.1f}",
-        )
-    )
-
-    children.append(panel_section("Break even · trailing"))
-    children.append(
-        kv_row(
-            "After TP1",
-            format_price(plan["breakeven_price"]),
-            strong=True,
-            hint=f"SL on {plan['runner_pct']:.0f}% runner",
-        )
-    )
-    children.append(
-        kv_row(
-            "Trailing",
-            f"{plan['trail_pct']:.2f}%",
-            strong=True,
-            hint=f"from {'peak' if plan['signal'] == 'LONG' else 'trough'}",
-        )
-    )
-    children.append(html.P(plan["breakeven_note"], className="panel-hint panel-footnote"))
-    children.append(html.P(plan["trail_note"], className="panel-hint panel-footnote"))
-    children.extend(build_execution_panel_section(metrics))
-    children.append(html.P("Informational only — not financial advice.", className="panel-hint"))
-    children.append(
-        html.P(
-            f"Logs: {log_dir}/signals.log · trades.log · plans.log · orders.log · errors.log",
-            className="panel-hint panel-footnote",
-        )
-    )
     return children
 
 
@@ -2308,10 +2264,10 @@ app.layout = html.Div(
                 html.Div(id="pattern-panel", className="panel panel-pattern"),
                 html.Div(id="signal-panel", className="panel panel-signal"),
                 html.Div(id="metrics-panel", className="panel panel-metrics"),
+                html.Div(id="trade-plan-panel", className="panel panel-trade-plan"),
             ],
             className="panels",
         ),
-        html.Div(id="trade-plan-panel", className="panel panel-trade-plan"),
         dcc.Graph(id="live-chart", config={"displayModeBar": True}),
         dcc.Interval(id="interval", interval=1500, n_intervals=0),
     ],
