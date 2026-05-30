@@ -23,6 +23,7 @@ INTERVAL = os.getenv("INTERVAL", "1m")
 DEPTH_LEVELS = int(os.getenv("DEPTH_LEVELS", "20"))
 MAX_CANDLES = int(os.getenv("MAX_CANDLES", "200"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "50"))
+MIN_PATTERN_RANGE_PCT = float(os.getenv("MIN_PATTERN_RANGE_PCT", "0.02"))
 DASH_HOST = os.getenv("DASH_HOST", "0.0.0.0")
 DASH_PORT = int(os.getenv("DASH_PORT", "8050"))
 
@@ -51,21 +52,127 @@ zone_position_pct: float | None = None
 change_24h: float | None = None
 
 
-def detect_pattern(row: pd.Series) -> str | None:
-    body = abs(row["c"] - row["o"])
-    rng = max(row["h"] - row["l"], 1e-12)
-    upper = row["h"] - max(row["o"], row["c"])
-    lower = min(row["o"], row["c"]) - row["l"]
+def _immediate_bullish_run(prior_rows: pd.DataFrame | None, lookback: int = 4) -> bool:
+    if prior_rows is None or len(prior_rows) < 3:
+        return False
+    tail = prior_rows.tail(lookback)
+    closes = [float(value) for value in tail["c"].tolist()]
+    rises = sum(1 for i in range(1, len(closes)) if closes[i] > closes[i - 1])
+    return rises >= 2 and closes[-1] >= closes[0]
+
+
+def _immediate_bearish_run(prior_rows: pd.DataFrame | None, lookback: int = 4) -> bool:
+    if prior_rows is None or len(prior_rows) < 3:
+        return False
+    tail = prior_rows.tail(lookback)
+    closes = [float(value) for value in tail["c"].tolist()]
+    falls = sum(1 for i in range(1, len(closes)) if closes[i] < closes[i - 1])
+    return falls >= 2 and closes[-1] <= closes[0]
+
+
+def _at_swing_high(row: pd.Series, prior_rows: pd.DataFrame | None, lookback: int = 10) -> bool:
+    if prior_rows is None or len(prior_rows) < 3:
+        return False
+    window = prior_rows.tail(lookback - 1)
+    prior_high = float(window["h"].max())
+    return float(row["h"]) >= prior_high * 0.9995
+
+
+def _at_swing_low(row: pd.Series, prior_rows: pd.DataFrame | None, lookback: int = 10) -> bool:
+    if prior_rows is None or len(prior_rows) < 3:
+        return False
+    window = prior_rows.tail(lookback - 1)
+    prior_low = float(window["l"].min())
+    return float(row["l"]) <= prior_low * 1.0005
+
+
+def _near_support(row: pd.Series, support_level: float | None, resistance_level: float | None) -> bool:
+    if not support_level or not resistance_level or resistance_level <= support_level:
+        return False
+    position = (float(row["c"]) - support_level) * 100 / (resistance_level - support_level)
+    return position <= 30
+
+
+def _near_resistance(row: pd.Series, support_level: float | None, resistance_level: float | None) -> bool:
+    if not support_level or not resistance_level or resistance_level <= support_level:
+        return False
+    position = (float(row["c"]) - support_level) * 100 / (resistance_level - support_level)
+    return position >= 70
+
+
+def detect_pattern(
+    row: pd.Series,
+    prior_rows: pd.DataFrame | None = None,
+    support_level: float | None = None,
+    resistance_level: float | None = None,
+) -> str | None:
+    body = abs(float(row["c"]) - float(row["o"]))
+    rng = max(float(row["h"]) - float(row["l"]), 1e-12)
+    upper = float(row["h"]) - max(float(row["o"]), float(row["c"]))
+    lower = min(float(row["o"]), float(row["c"])) - float(row["l"])
+    close = float(row["c"])
+
+    if close <= 0 or (rng / close) * 100 < MIN_PATTERN_RANGE_PCT:
+        return None
 
     body_pct = body / rng
     upper_pct = upper / rng
     lower_pct = lower / rng
+    close_pos = (close - float(row["l"])) / rng
 
-    if body_pct < 0.35 and lower_pct > 0.55 and upper_pct < 0.2:
+    is_hammer_shape = body_pct <= 0.28 and lower_pct >= 0.62 and upper_pct <= 0.12
+    is_star_shape = body_pct <= 0.28 and upper_pct >= 0.62 and lower_pct <= 0.12
+
+    hammer_context = _immediate_bearish_run(prior_rows) or _near_support(
+        row, support_level, resistance_level
+    )
+    star_context = _immediate_bullish_run(prior_rows) or _near_resistance(
+        row, support_level, resistance_level
+    )
+
+    if (
+        is_hammer_shape
+        and close_pos >= 0.58
+        and hammer_context
+        and _at_swing_low(row, prior_rows)
+    ):
         return "Hammer"
-    if body_pct < 0.35 and upper_pct > 0.55 and lower_pct < 0.2:
+
+    if (
+        is_star_shape
+        and close_pos <= 0.42
+        and float(row["c"]) <= float(row["o"])
+        and star_context
+        and _at_swing_high(row, prior_rows)
+    ):
         return "Shooting Star"
+
     return None
+
+
+def pattern_signal_match(pattern: str, signal_dir: str) -> bool:
+    if pattern == "Hammer":
+        return signal_dir == "LONG"
+    if pattern == "Shooting Star":
+        return signal_dir == "SHORT"
+    return False
+
+
+def confirmed_pattern(
+    pattern: str | None,
+    signal_dir: str,
+    confidence: int,
+    min_confidence: int = MIN_CONFIDENCE,
+) -> str | None:
+    if not pattern or not pattern_signal_match(pattern, signal_dir):
+        return None
+    if confidence < min_confidence:
+        return None
+    return pattern
+
+
+def pattern_marker_label(pattern: str, signal_dir: str, confidence: int) -> str:
+    return f"{pattern} · {signal_dir} {confidence}%"
 
 
 def format_price(price: float | None) -> str:
@@ -339,7 +446,7 @@ async def sync_orderbook(session: aiohttp.ClientSession, depth_buffer: list[dict
 
 
 async def ws_loop() -> None:
-    global forming_candle, latest_pattern, latest_price, orderbook, ws_status, change_24h
+    global forming_candle, latest_price, orderbook, ws_status, change_24h
 
     depth_buffer: list[dict] = []
     stream_url = (
@@ -393,15 +500,21 @@ async def ws_loop() -> None:
                                 forming_candle = row
                                 if row["x"]:
                                     candles.append(row)
-                                    latest_pattern = detect_pattern(pd.Series(row)) or "None"
                                 if orderbook.get("bids") and orderbook.get("asks"):
                                     update_metrics(orderbook["bids"], orderbook["asks"])
 
-                        elif data.get("e") == "24hrMiniTicker":
-                            with state_lock:
-                                change_24h = float(data["P"])
-                                if orderbook.get("bids") and orderbook.get("asks"):
-                                    update_metrics(orderbook["bids"], orderbook["asks"])
+                        elif data.get("e") == "24hrMiniTicker" or msg.get("stream", "").endswith("@miniTicker"):
+                            pct_raw = data.get("P")
+                            if pct_raw is not None:
+                                try:
+                                    with state_lock:
+                                        change_24h = float(pct_raw)
+                                        if orderbook.get("bids") and orderbook.get("asks"):
+                                            update_metrics(orderbook["bids"], orderbook["asks"])
+                                except (TypeError, ValueError):
+                                    logger.warning("Invalid miniTicker change pct: %r", pct_raw)
+                            else:
+                                logger.debug("miniTicker event without P field: %s", data)
 
                         elif "U" in data and "u" in data:
                             if data["u"] <= last_update_id:
@@ -424,13 +537,32 @@ async def ws_loop() -> None:
                 await asyncio.sleep(3)
 
 
+def resolve_confirmed_pattern(closed_rows: list[dict]) -> str | None:
+    if not closed_rows:
+        return None
+    prior = pd.DataFrame(closed_rows[:-1]) if len(closed_rows) > 1 else None
+    last_closed = pd.Series(closed_rows[-1])
+    raw_pattern = detect_pattern(
+        last_closed,
+        prior_rows=prior,
+        support_level=support,
+        resistance_level=resistance,
+    )
+    return confirmed_pattern(raw_pattern, signal_dir, signal_confidence)
+
+
 def get_candles_df() -> pd.DataFrame:
+    global latest_pattern
     with state_lock:
         rows = list(candles)
         if forming_candle and (not rows or forming_candle["t"] != rows[-1]["t"]):
             rows = rows + [forming_candle.copy()]
         elif forming_candle and rows and forming_candle["t"] == rows[-1]["t"]:
             rows = rows[:-1] + [forming_candle.copy()]
+
+        closed_rows = [row for row in candles if row.get("x")]
+        confirmed = resolve_confirmed_pattern(closed_rows)
+        latest_pattern = confirmed or "None"
 
         ob = {
             "bids": list(orderbook.get("bids", [])),
@@ -468,7 +600,7 @@ def build_depth_bar_data(
 ) -> tuple[list[str], list[float | None], list[float | None]]:
     bid_map = {price: qty for price, qty in bids}
     ask_map = {price: qty for price, qty in asks}
-    all_prices = sorted(set(bid_map) | set(ask_map), reverse=True)
+    all_prices = sorted(set(bid_map) | set(ask_map))
     labels = [f"{price:.2f}" for price in all_prices]
     bid_values = [-bid_map[price] if price in bid_map else None for price in all_prices]
     ask_values = [ask_map[price] if price in ask_map else None for price in all_prices]
@@ -484,7 +616,7 @@ def build_figure() -> go.Figure:
         shared_xaxes=False,
         vertical_spacing=0.1,
         row_heights=[0.72, 0.28],
-        subplot_titles=("OHLC + Patterns", "Order Book Depth"),
+        subplot_titles=("OHLC + Confirmed Patterns", "Order Book Depth"),
     )
 
     if not df.empty:
@@ -515,13 +647,19 @@ def build_figure() -> go.Figure:
         pattern_y: list = []
         pattern_text: list = []
         pattern_hover: list = []
-        for _, row in closed_df.iterrows():
-            pattern = detect_pattern(row)
-            if pattern:
+        if not closed_df.empty:
+            confirmed = metrics.get("pattern")
+            if confirmed and confirmed != "None":
+                row = closed_df.iloc[-1]
+                marker_label = pattern_marker_label(
+                    confirmed,
+                    metrics.get("signal", "NEUTRAL"),
+                    metrics.get("confidence", 0),
+                )
                 pattern_x.append(row["t"])
                 pattern_y.append(row["c"])
-                pattern_text.append(pattern)
-                pattern_hover.append(pattern)
+                pattern_text.append(marker_label)
+                pattern_hover.append(marker_label)
 
         if pattern_x:
             fig.add_trace(
@@ -766,9 +904,29 @@ def update_dashboard(_: int):
     ]
 
     pattern_children = [
-        html.Span("Last closed pattern", className="panel-label"),
-        html.Span(metrics["pattern"], className=pattern_badge_class(metrics["pattern"])),
+        html.Span("Confirmed pattern", className="panel-label"),
+        html.Span(
+            metrics["pattern"],
+            className=pattern_badge_class(metrics["pattern"]),
+        ),
     ]
+    if metrics["pattern"] == "None":
+        pattern_children.append(
+            html.Span(
+                f"Hammer→LONG · Star→SHORT · conf≥{metrics.get('min_confidence', MIN_CONFIDENCE)}%",
+                className="panel-hint",
+            )
+        )
+    else:
+        pattern_children.append(
+            html.Span(
+                f"{metrics.get('signal')} {metrics.get('confidence')}%",
+                className=confidence_badge_class(
+                    metrics.get("confidence", 0),
+                    metrics.get("min_confidence", MIN_CONFIDENCE),
+                ),
+            )
+        )
 
     signal = metrics.get("signal", "NEUTRAL")
     confidence = metrics.get("confidence", 0)
