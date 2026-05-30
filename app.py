@@ -44,6 +44,15 @@ MACD_FAST = int(os.getenv("MACD_FAST", "12"))
 MACD_SLOW = int(os.getenv("MACD_SLOW", "26"))
 MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", "9"))
 SWING_LOOKBACK = int(os.getenv("SWING_LOOKBACK", "20"))
+TRADE_PLAN_DCA_STEPS = int(os.getenv("TRADE_PLAN_DCA_STEPS", "2"))
+TRADE_PLAN_DCA_STEP_PCT = float(os.getenv("TRADE_PLAN_DCA_STEP_PCT", "0.12"))
+TRADE_PLAN_SL_BUFFER_PCT = float(os.getenv("TRADE_PLAN_SL_BUFFER_PCT", "0.06"))
+TRADE_PLAN_TP1_RR = float(os.getenv("TRADE_PLAN_TP1_RR", "1.0"))
+TRADE_PLAN_TP2_RR = float(os.getenv("TRADE_PLAN_TP2_RR", "2.0"))
+TRADE_PLAN_PARTIAL_CLOSE_PCT = float(os.getenv("TRADE_PLAN_PARTIAL_CLOSE_PCT", "70"))
+TRADE_PLAN_TRAIL_PCT = float(os.getenv("TRADE_PLAN_TRAIL_PCT", "0.25"))
+TRADE_PLAN_INITIAL_SIZE_PCT = float(os.getenv("TRADE_PLAN_INITIAL_SIZE_PCT", "50"))
+LOG_DIR = os.getenv("LOG_DIR", "logs")
 DASH_HOST = os.getenv("DASH_HOST", "0.0.0.0")
 DASH_PORT = int(os.getenv("DASH_PORT", "8050"))
 
@@ -80,6 +89,84 @@ signal_entry: float | None = None
 zone_position_pct: float | None = None
 change_24h: float | None = None
 valid_entries: deque = deque(maxlen=MAX_ENTRY_MARKERS)
+active_trade_plan: dict | None = None
+active_trade_plan_created_at: str | None = None
+
+
+def utc_now_str() -> str:
+    return pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def append_event_log(log_name: str, event: str, **fields) -> None:
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        record = {"ts": utc_now_str(), "event": event, "symbol": SYMBOL.upper(), **fields}
+        path = os.path.join(LOG_DIR, f"{log_name}.log")
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, default=str) + "\n")
+    except OSError:
+        logger.exception("Failed writing %s log", log_name)
+
+
+def log_error(event: str, **fields) -> None:
+    append_event_log("errors", event, **fields)
+    logger.error("%s %s", event, fields)
+
+
+def trade_plan_fingerprint(plan: dict) -> str:
+    return "|".join(
+        f"{plan.get('signal')}:{round(float(plan[key]), 2)}"
+        for key in ("avg_entry", "sl", "tp1", "tp2")
+        if plan.get(key) is not None
+    )
+
+
+def trade_plan_log_payload(plan: dict) -> dict:
+    keys = (
+        "signal",
+        "entry",
+        "avg_entry",
+        "sl",
+        "tp1",
+        "tp2",
+        "partial_close_pct",
+        "runner_pct",
+        "trail_pct",
+        "risk_pct",
+        "reward_tp1_pct",
+    )
+    return {key: plan[key] for key in keys if key in plan}
+
+
+def resolve_trade_plan(current_plan: dict, live_signal: str) -> dict:
+    global active_trade_plan, active_trade_plan_created_at
+
+    if current_plan.get("active"):
+        fingerprint = trade_plan_fingerprint(current_plan)
+        stored_fingerprint = trade_plan_fingerprint(active_trade_plan) if active_trade_plan else None
+        if stored_fingerprint != fingerprint:
+            active_trade_plan = dict(current_plan)
+            active_trade_plan_created_at = utc_now_str()
+            payload = trade_plan_log_payload(active_trade_plan)
+            append_event_log("plans", "plan_suggested", fingerprint=fingerprint, **payload)
+            append_event_log("trades", "plan_opened", fingerprint=fingerprint, **payload)
+
+    if active_trade_plan:
+        display = dict(active_trade_plan)
+        display["active"] = True
+        display["created_at"] = active_trade_plan_created_at
+        display["persisted"] = True
+        display["live_signal"] = live_signal
+        display["live_match"] = live_signal == active_trade_plan.get("signal") and current_plan.get(
+            "active", False
+        )
+        if display["live_match"]:
+            display["status_note"] = "Matches live TRADE signal"
+        else:
+            display["status_note"] = f"Held until next plan · live signal: {live_signal}"
+        return display
+
+    return current_plan
 
 
 def _immediate_bullish_run(prior_rows: pd.DataFrame | None, lookback: int = 4) -> bool:
@@ -375,6 +462,122 @@ def compute_market_analysis(
     return analysis
 
 
+def compute_trade_plan(
+    signal: str,
+    confidence: int,
+    entry: float | None,
+    support: float | None,
+    resistance: float | None,
+    price: float | None,
+    market_analysis: dict | None,
+    min_confidence: int = MIN_CONFIDENCE,
+) -> dict:
+    inactive = {
+        "active": False,
+        "summary": "Wait for a TRADE signal (LONG/SHORT with minimum confidence).",
+    }
+    if not is_tradable_signal(signal, confidence, min_confidence) or entry is None or entry <= 0:
+        return inactive
+
+    analysis = market_analysis or {}
+    fvg = analysis.get("fvg") or {}
+    is_long = signal == "LONG"
+    step = TRADE_PLAN_DCA_STEP_PCT / 100
+    buffer = TRADE_PLAN_SL_BUFFER_PCT / 100
+
+    dca_prices: list[float] = [float(entry)]
+    for step_index in range(1, TRADE_PLAN_DCA_STEPS + 1):
+        offset = step * step_index
+        dca_price = entry * (1 - offset) if is_long else entry * (1 + offset)
+        if is_long and support:
+            dca_price = max(dca_price, float(support) * (1 - buffer))
+        elif not is_long and resistance:
+            dca_price = min(dca_price, float(resistance) * (1 + buffer))
+        dca_prices.append(dca_price)
+
+    if is_long and fvg.get("type") == "BULL" and len(dca_prices) > 1:
+        fvg_mid = (float(fvg["low"]) + float(fvg["high"])) / 2
+        if fvg_mid < entry:
+            dca_prices[1] = fvg_mid
+    elif not is_long and fvg.get("type") == "BEAR" and len(dca_prices) > 1:
+        fvg_mid = (float(fvg["low"]) + float(fvg["high"])) / 2
+        if fvg_mid > entry:
+            dca_prices[1] = fvg_mid
+
+    total_slots = len(dca_prices)
+    remaining_size = max(0.0, 100.0 - TRADE_PLAN_INITIAL_SIZE_PCT)
+    dca_size = remaining_size / max(total_slots - 1, 1) if total_slots > 1 else 0.0
+    legs: list[dict] = [
+        {
+            "label": f"Entry · {TRADE_PLAN_INITIAL_SIZE_PCT:.0f}%",
+            "price": dca_prices[0],
+            "size_pct": TRADE_PLAN_INITIAL_SIZE_PCT,
+        }
+    ]
+    for index, dca_price in enumerate(dca_prices[1:], start=1):
+        legs.append(
+            {
+                "label": f"DCA {index} · {dca_size:.0f}%",
+                "price": dca_price,
+                "size_pct": dca_size,
+            }
+        )
+
+    avg_entry = sum(leg["price"] * leg["size_pct"] for leg in legs) / 100.0
+
+    if is_long:
+        structure_sl = float(support) * (1 - buffer) if support else entry * (1 - step * (TRADE_PLAN_DCA_STEPS + 1))
+        sl = min(structure_sl, min(leg["price"] for leg in legs) * (1 - buffer))
+        risk = avg_entry - sl
+        tp1 = avg_entry + risk * TRADE_PLAN_TP1_RR
+        tp2 = avg_entry + risk * TRADE_PLAN_TP2_RR
+        if resistance and tp2 > float(resistance) * 0.998:
+            tp2 = float(resistance) * 0.998
+    else:
+        structure_sl = float(resistance) * (1 + buffer) if resistance else entry * (1 + step * (TRADE_PLAN_DCA_STEPS + 1))
+        sl = max(structure_sl, max(leg["price"] for leg in legs) * (1 + buffer))
+        risk = sl - avg_entry
+        tp1 = avg_entry - risk * TRADE_PLAN_TP1_RR
+        tp2 = avg_entry - risk * TRADE_PLAN_TP2_RR
+        if support and tp2 < float(support) * 1.002:
+            tp2 = float(support) * 1.002
+
+    if risk <= 0:
+        return inactive
+
+    runner_pct = 100.0 - TRADE_PLAN_PARTIAL_CLOSE_PCT
+    risk_pct = abs(avg_entry - sl) / avg_entry * 100
+    reward_tp1_pct = abs(tp1 - avg_entry) / avg_entry * 100
+
+    return {
+        "active": True,
+        "signal": signal,
+        "summary": f"Suggested {signal} plan · partial {TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% at TP1",
+        "entry": entry,
+        "avg_entry": avg_entry,
+        "legs": legs,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "partial_close_pct": TRADE_PLAN_PARTIAL_CLOSE_PCT,
+        "runner_pct": runner_pct,
+        "breakeven_price": avg_entry,
+        "breakeven_note": (
+            f"At TP1: close {TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% → SL to BE "
+            f"({format_price(avg_entry)}) on remaining {runner_pct:.0f}%"
+        ),
+        "trail_pct": TRADE_PLAN_TRAIL_PCT,
+        "trail_note": (
+            f"Trail remaining {runner_pct:.0f}% at {TRADE_PLAN_TRAIL_PCT:.2f}% "
+            f"from {'peak' if is_long else 'trough'}"
+        ),
+        "risk_pct": risk_pct,
+        "reward_tp1_pct": reward_tp1_pct,
+        "rr_tp1": TRADE_PLAN_TP1_RR,
+        "rr_tp2": TRADE_PLAN_TP2_RR,
+    }
+
+
 def format_price(price: float | None) -> str:
     if price is None:
         return "—"
@@ -521,6 +724,16 @@ def record_valid_entry(
         }
     )
     last_valid_entry_monotonic = now
+    append_event_log(
+        "trades",
+        "valid_entry",
+        signal=signal,
+        entry=entry,
+        confidence=confidence,
+        reasons=reasons,
+        candle_time=str(candle_time),
+        trend_bias=trend_bias,
+    )
 
 
 def apply_signal_debounce(
@@ -541,6 +754,16 @@ def apply_signal_debounce(
         pending_signal_count = 1
 
     if pending_signal_count >= SIGNAL_DEBOUNCE_COUNT and candidate != stable_signal_dir:
+        append_event_log(
+            "signals",
+            "signal_stable",
+            from_signal=stable_signal_dir,
+            to_signal=candidate,
+            confidence=confidence,
+            reasons=reasons,
+            entry=entry,
+            trend_bias=trend_bias,
+        )
         if is_tradable_signal(candidate, confidence):
             record_valid_entry(candidate, entry, confidence, reasons, candle_time, trend_bias)
         stable_signal_dir = candidate
@@ -899,6 +1122,7 @@ async def ws_loop() -> None:
                                                 analysis_orderbook.get("asks"),
                                             )
                                 except (TypeError, ValueError):
+                                    log_error("mini_ticker_parse_error", raw=pct_raw)
                                     logger.warning("Invalid miniTicker change pct: %r", pct_raw)
                             else:
                                 logger.debug("miniTicker event without P field: %s", data)
@@ -907,6 +1131,7 @@ async def ws_loop() -> None:
                             if data["u"] <= last_update_id:
                                 continue
                             if not (data["U"] <= last_update_id + 1 <= data["u"]):
+                                log_error("orderbook_desync", last_update_id=last_update_id, event=data)
                                 logger.warning("Order book desync detected, resyncing...")
                                 break
 
@@ -916,7 +1141,8 @@ async def ws_loop() -> None:
                             with state_lock:
                                 sync_orderbook_state(bid_map, ask_map)
 
-            except Exception:
+            except Exception as exc:
+                log_error("websocket_loop_error", error=str(exc))
                 logger.exception("WebSocket loop error, reconnecting in 3s")
                 ws_status = "reconnecting"
                 await asyncio.sleep(3)
@@ -986,6 +1212,20 @@ def get_candles_df() -> pd.DataFrame:
             "market_analysis": market_analysis,
             "require_trend_align": REQUIRE_TREND_ALIGN,
             "signal_cooldown_sec": SIGNAL_COOLDOWN_SEC,
+            "trade_plan": resolve_trade_plan(
+                compute_trade_plan(
+                    signal_dir,
+                    signal_confidence,
+                    signal_entry,
+                    support,
+                    resistance,
+                    latest_price,
+                    market_analysis,
+                    MIN_CONFIDENCE,
+                ),
+                signal_dir,
+            ),
+            "log_dir": LOG_DIR,
         }
 
     return pd.DataFrame(rows), ob, metrics
@@ -1112,6 +1352,17 @@ def candle_chart_y_range(df: pd.DataFrame, metrics: dict) -> tuple[float, float]
         y_min = min(y_min, float(active_entry))
         y_max = max(y_max, float(active_entry))
 
+    plan = metrics.get("trade_plan") or {}
+    if plan.get("active"):
+        for key in ("sl", "tp1", "tp2", "avg_entry"):
+            value = plan.get(key)
+            if value is not None:
+                y_min = min(y_min, float(value))
+                y_max = max(y_max, float(value))
+        for leg in plan.get("legs") or []:
+            y_min = min(y_min, float(leg["price"]))
+            y_max = max(y_max, float(leg["price"]))
+
     padding = max((y_max - y_min) * 0.06, mid * 0.0005)
     return y_min - padding, y_max + padding
 
@@ -1184,6 +1435,50 @@ def add_valid_entry_markers(
             row=row,
             col=col,
         )
+
+
+def add_trade_plan_overlays(
+    fig: go.Figure,
+    metrics: dict,
+    row: int = 1,
+    col: int = 1,
+) -> None:
+    plan = metrics.get("trade_plan") or {}
+    if not plan.get("active"):
+        return
+
+    fig.add_hline(
+        y=plan["sl"],
+        line_dash="dash",
+        line_color="rgba(255,77,79,0.75)",
+        line_width=1.5,
+        row=row,
+        col=col,
+    )
+    fig.add_hline(
+        y=plan["avg_entry"],
+        line_dash="dashdot",
+        line_color="rgba(88,166,255,0.6)",
+        line_width=1,
+        row=row,
+        col=col,
+    )
+    fig.add_hline(
+        y=plan["tp1"],
+        line_dash="dot",
+        line_color="rgba(0,193,118,0.7)",
+        line_width=1.5,
+        row=row,
+        col=col,
+    )
+    fig.add_hline(
+        y=plan["tp2"],
+        line_dash="dot",
+        line_color="rgba(0,193,118,0.45)",
+        line_width=1,
+        row=row,
+        col=col,
+    )
 
 
 def build_figure() -> go.Figure:
@@ -1259,6 +1554,7 @@ def build_figure() -> go.Figure:
 
         add_order_block_overlays(fig, metrics, row=1, col=1)
         add_valid_entry_markers(fig, metrics, row=1, col=1)
+        add_trade_plan_overlays(fig, metrics, row=1, col=1)
         y_min, y_max = candle_chart_y_range(df, metrics)
         fig.update_yaxes(range=[y_min, y_max], row=1, col=1)
 
@@ -1585,6 +1881,99 @@ def build_metrics_panel_children(metrics: dict) -> list:
     ]
 
 
+def build_trade_plan_panel_children(metrics: dict) -> list:
+    plan = metrics.get("trade_plan") or {}
+    log_dir = metrics.get("log_dir", LOG_DIR)
+
+    if not plan.get("active"):
+        return [
+            panel_section("Suggested trade plan"),
+            html.P(plan.get("summary", "No active plan."), className="panel-hint panel-footnote"),
+            html.P("Informational only — not financial advice.", className="panel-hint"),
+            html.P(
+                f"Logs: {log_dir}/signals.log · trades.log · plans.log · errors.log",
+                className="panel-hint panel-footnote",
+            ),
+        ]
+
+    status_class = "badge badge-trade" if plan.get("live_match") else "badge badge-watch"
+    status_label = "Live" if plan.get("live_match") else "Held"
+
+    children: list = [
+        panel_section("Suggested trade plan"),
+        html.Div(
+            [
+                html.Span(plan["signal"], className=signal_badge_class(plan["signal"])),
+                html.Span(status_label, className=status_class),
+                html.Span("Informational", className="badge badge-neutral"),
+            ],
+            className="badge-row",
+        ),
+        kv_row("Suggested at", plan.get("created_at", "—"), strong=True),
+        html.P(plan.get("status_note", plan.get("summary", "")), className="panel-hint"),
+        html.P(plan["summary"], className="panel-hint"),
+    ]
+
+    children.append(panel_section("Entry · DCA"))
+    for leg in plan.get("legs") or []:
+        children.append(kv_row(leg["label"], format_price(leg["price"]), strong=True))
+    children.append(kv_row("Weighted avg", format_price(plan["avg_entry"]), strong=True))
+
+    children.append(panel_section("Stop · targets"))
+    children.append(
+        kv_row(
+            "Stop loss",
+            format_price(plan["sl"]),
+            strong=True,
+            hint=f"risk {plan['risk_pct']:.2f}%",
+        )
+    )
+    children.append(
+        kv_row(
+            "TP1",
+            format_price(plan["tp1"]),
+            strong=True,
+            hint=f"+{plan['reward_tp1_pct']:.2f}% · close {plan['partial_close_pct']:.0f}%",
+        )
+    )
+    children.append(
+        kv_row(
+            "TP2",
+            format_price(plan["tp2"]),
+            strong=True,
+            hint=f"RR {plan['rr_tp2']:.1f}",
+        )
+    )
+
+    children.append(panel_section("Break even · trailing"))
+    children.append(
+        kv_row(
+            "After TP1",
+            format_price(plan["breakeven_price"]),
+            strong=True,
+            hint=f"SL on {plan['runner_pct']:.0f}% runner",
+        )
+    )
+    children.append(
+        kv_row(
+            "Trailing",
+            f"{plan['trail_pct']:.2f}%",
+            strong=True,
+            hint=f"from {'peak' if plan['signal'] == 'LONG' else 'trough'}",
+        )
+    )
+    children.append(html.P(plan["breakeven_note"], className="panel-hint panel-footnote"))
+    children.append(html.P(plan["trail_note"], className="panel-hint panel-footnote"))
+    children.append(html.P("Informational only — not financial advice.", className="panel-hint"))
+    children.append(
+        html.P(
+            f"Logs: {log_dir}/signals.log · trades.log · plans.log · errors.log",
+            className="panel-hint panel-footnote",
+        )
+    )
+    return children
+
+
 def pattern_badge_class(pattern: str) -> str:
     if pattern == "Hammer":
         return "badge badge-bull"
@@ -1639,6 +2028,7 @@ app.layout = html.Div(
             ],
             className="panels",
         ),
+        html.Div(id="trade-plan-panel", className="panel panel-trade-plan"),
         dcc.Graph(id="live-chart", config={"displayModeBar": True}),
         dcc.Interval(id="interval", interval=1500, n_intervals=0),
     ],
@@ -1652,6 +2042,7 @@ app.layout = html.Div(
     Output("pattern-panel", "children"),
     Output("signal-panel", "children"),
     Output("metrics-panel", "children"),
+    Output("trade-plan-panel", "children"),
     Input("interval", "n_intervals"),
 )
 def update_dashboard(_: int):
@@ -1681,8 +2072,16 @@ def update_dashboard(_: int):
     pattern_children = build_pattern_panel_children(metrics)
     signal_children = build_signal_panel_children(metrics)
     metrics_children = build_metrics_panel_children(metrics)
+    trade_plan_children = build_trade_plan_panel_children(metrics)
 
-    return figure, price_header_children, pattern_children, signal_children, metrics_children
+    return (
+        figure,
+        price_header_children,
+        pattern_children,
+        signal_children,
+        metrics_children,
+        trade_plan_children,
+    )
 
 
 def start_ws() -> None:
