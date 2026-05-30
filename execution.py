@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import telegram_notify as telegram
+
 logger = logging.getLogger(__name__)
 
 
@@ -449,6 +451,7 @@ def _execute_open(
             last_order_id=None,
         )
         _last_execution_monotonic = time.monotonic()
+        telegram.notify_dry_run(symbol, direction, price_str)
         return
 
     if not _keys_configured():
@@ -471,12 +474,20 @@ def _execute_open(
             last_order_id=order_id,
         )
         _last_execution_monotonic = time.monotonic()
+        vol_usdt = f"{float(qty) * float(price_str):.2f}"
+        tp_label = telegram.format_tp_label(
+            payload["tp"],
+            TP_ORDER_TYPE == "trailing",
+            TP_TRAILING_CALLBACK_RATE,
+        )
+        telegram.notify_live_open(symbol, direction, price_str, payload["sl"], tp_label, vol_usdt)
         if order_id is not None:
             _place_sl_tp_after_fill(symbol, direction, sl, tp, qty, int(order_id))
     except RuntimeError as exc:
         logger.exception("Order failed for %s", symbol)
         _append_orders_log("live_open_failed", symbol=symbol, error=str(exc), **payload)
         _set_status(message=f"Order failed: {exc}", last_event="error")
+        telegram.notify_order_failed(symbol, direction)
 
 
 def try_execute_valid_entry(

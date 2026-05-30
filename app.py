@@ -19,6 +19,7 @@ from plotly.subplots import make_subplots
 load_dotenv()
 
 import execution
+import telegram_notify as telegram
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -818,6 +819,18 @@ def record_valid_entry(
         reasons=reasons,
         candle_time=str(candle_time),
         trend_bias=trend_bias,
+    )
+    sl_val = trade_plan.get("sl") if trade_plan else None
+    tp1_val = trade_plan.get("tp1") if trade_plan else None
+    telegram.notify_valid_entry(
+        SYMBOL,
+        signal,
+        format_price(entry),
+        confidence,
+        reasons,
+        trend_bias,
+        format_price(sl_val) if sl_val else None,
+        format_price(tp1_val) if tp1_val else None,
     )
     execution.try_execute_valid_entry(
         SYMBOL,
@@ -2289,18 +2302,33 @@ def start_ws() -> None:
     asyncio.run(ws_loop())
 
 
-if __name__ == "__main__":
-    Thread(target=start_ws, daemon=True).start()
+def run_server() -> None:
+    ui_enabled = is_port_available(DASH_HOST, DASH_PORT)
+    telegram.notify_started(
+        SYMBOL,
+        execution.EXECUTION_ENABLED,
+        execution.EXECUTION_MODE,
+        DASH_PORT,
+        ui_enabled,
+        INTERVAL,
+    )
 
-    if is_port_available(DASH_HOST, DASH_PORT):
-        app.run(debug=False, host=DASH_HOST, port=DASH_PORT)
-    else:
-        logger.warning(
-            "Port %s already in use — skipping Dash UI; websocket and execution continue",
-            DASH_PORT,
-        )
-        try:
+    try:
+        if ui_enabled:
+            app.run(debug=False, host=DASH_HOST, port=DASH_PORT)
+        else:
+            logger.warning(
+                "Port %s already in use — skipping Dash UI; websocket and execution continue",
+                DASH_PORT,
+            )
             while True:
                 time.sleep(3600)
-        except KeyboardInterrupt:
-            logger.info("Shutting down")
+    except KeyboardInterrupt:
+        logger.info("Shutting down")
+    finally:
+        telegram.notify_stopped()
+
+
+if __name__ == "__main__":
+    Thread(target=start_ws, daemon=True).start()
+    run_server()

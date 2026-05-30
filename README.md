@@ -57,6 +57,7 @@ Open the dashboard at `http://127.0.0.1:8050` (or the host/port from `.env` / `-
 | `POSITION_SIZE_USDT` | Notional per entry (Futures) | `25` |
 | `LEVERAGE_MODE` | `max` = max per symbol via API, `fixed` = use `LEVERAGE` | `fixed` |
 | `LEVERAGE` | Fixed leverage, or fallback when `LEVERAGE_MODE=max` / API fails | `4` |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Optional Telegram alerts (same emoji style as order-blocks bot) | — |
 
 The app loads historical klines via REST, then keeps the order book in sync using Binance’s depth snapshot + incremental updates. It also streams `@miniTicker` for 24h change and computes **order-block signal + confidence** (support/resistance walls, zone position, and fallback 24h rules). With `EXECUTION_ENABLED=true`, confirmed valid entries can open **Futures** positions (dry-run or live). The UI refreshes every 1.5s.
 
@@ -70,6 +71,7 @@ The dashboard can run on any machine with Python (local dev, VPS, or dedicated s
 trade-binance-websocket-dashboard/
 ├── app.py               # Entry script (run this)
 ├── execution.py         # Binance Futures dry/live order execution
+├── telegram_notify.py   # Telegram alerts (optional)
 ├── assets/              # Dash static assets (custom.css)
 ├── .env.example
 ├── requirements.txt
