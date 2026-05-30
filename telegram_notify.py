@@ -27,6 +27,7 @@ _trading_paused = False
 _pause_lock = threading.Lock()
 _update_offset = 0
 _listener_stop = threading.Event()
+_polling_conflict_warned = False
 
 
 def is_configured() -> bool:
@@ -183,16 +184,35 @@ def notify_stopped() -> None:
 
 
 def _telegram_api_get(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    query = urllib.parse.urlencode(params or {})
+    query = urllib.parse.urlencode(params or {}, doseq=True)
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     if query:
         url = f"{url}?{query}"
     request = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(request, timeout=20) as response:
-        payload = json.loads(response.read().decode())
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode())
+    except urllib.error.HTTPError:
+        raise
     if not payload.get("ok"):
         raise RuntimeError(payload.get("description", "Telegram API error"))
     return payload
+
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    try:
+        body = json.loads(exc.read().decode())
+        return str(body.get("description") or body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return exc.reason or str(exc)
+
+
+def _prepare_command_polling() -> None:
+    """Use long-polling: drop webhook if set (webhook and getUpdates cannot run together)."""
+    try:
+        _telegram_api_get("deleteWebhook", {"drop_pending_updates": "false"})
+    except Exception as exc:
+        logger.warning("Telegram deleteWebhook failed: %s", exc)
 
 
 def _parse_command(text: str) -> str | None:
@@ -223,11 +243,14 @@ def _handle_command(command: str, status_provider: Callable[[], str]) -> None:
 
 
 def _command_loop(status_provider: Callable[[], str]) -> None:
-    global _update_offset
+    global _update_offset, _polling_conflict_warned
     logger.info("Telegram command listener started (/start /stop /status)")
     while not _listener_stop.is_set():
         try:
-            params: dict[str, Any] = {"timeout": 0, "allowed_updates": json.dumps(["message"])}
+            params: dict[str, Any] = {
+                "timeout": 0,
+                "allowed_updates": json.dumps(["message"]),
+            }
             if _update_offset:
                 params["offset"] = _update_offset
             result = _telegram_api_get("getUpdates", params)
@@ -241,6 +264,20 @@ def _command_loop(status_provider: Callable[[], str]) -> None:
                 command = _parse_command(text.strip())
                 if command:
                     _handle_command(command, status_provider)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                if not _polling_conflict_warned:
+                    logger.warning(
+                        "Telegram 409 Conflict: another process is already polling getUpdates "
+                        "with this TELEGRAM_BOT_TOKEN (only one poller allowed). "
+                        "sendMessage from other scripts is OK; /status /stop /start disabled here. %s",
+                        _http_error_detail(exc),
+                    )
+                    _polling_conflict_warned = True
+                if _listener_stop.wait(max(TELEGRAM_POLL_INTERVAL, 15)):
+                    break
+                continue
+            logger.exception("Telegram command poll failed: %s", _http_error_detail(exc))
         except Exception:
             logger.exception("Telegram command poll failed")
         if _listener_stop.wait(TELEGRAM_POLL_INTERVAL):
@@ -252,11 +289,19 @@ def start_command_listener(status_provider: Callable[[], str]) -> None:
     if not is_configured():
         return
     global _update_offset
+    _prepare_command_polling()
     try:
         bootstrap = _telegram_api_get("getUpdates", {"offset": -1, "limit": 1})
         updates = bootstrap.get("result") or []
         if updates:
             _update_offset = int(updates[-1]["update_id"]) + 1
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            logger.warning(
+                "Telegram commands unavailable: bot token already used for getUpdates elsewhere"
+            )
+        else:
+            logger.warning("Telegram bootstrap getUpdates failed: %s", _http_error_detail(exc))
     except Exception:
         logger.warning("Telegram bootstrap getUpdates failed; old messages may replay")
     thread = threading.Thread(
