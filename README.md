@@ -29,6 +29,10 @@ The **only entry script** in this project is `app.py` (project root). Styles liv
 ```bash
 source .venv/bin/activate
 python app.py
+
+# Single symbol (overrides SYMBOL in .env — same as trade-binance-websocket-order-blocks)
+python app.py BNBUSDT
+python app.py etcusdt
 ```
 
 Open the dashboard at `http://127.0.0.1:8050` (or the host/port set in `.env`).
@@ -37,7 +41,7 @@ Open the dashboard at `http://127.0.0.1:8050` (or the host/port set in `.env`).
 
 | Variable       | Description                          | Default   |
 | -------------- | ------------------------------------ | --------- |
-| `SYMBOL`       | Trading pair (lowercase)             | `btcusdt` |
+| `SYMBOL`       | Trading pair (lowercase) — default when no CLI arg | `btcusdt` |
 | `INTERVAL`     | Kline interval (e.g. `1m`, `5m`)     | `1m`      |
 | `DEPTH_LEVELS` | Order book levels shown in the chart | `20`      |
 | `MAX_CANDLES`  | Max candles kept in memory           | `200`     |

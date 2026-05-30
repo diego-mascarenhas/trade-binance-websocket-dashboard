@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import logging
@@ -21,7 +22,36 @@ import execution
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-SYMBOL = os.getenv("SYMBOL", "btcusdt").lower()
+
+def normalize_symbol(value: str) -> str:
+    return value.strip().lower().replace("/", "").replace("-", "")
+
+
+def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Binance WebSocket Dashboard — live OHLC, order book, signals.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python app.py\n"
+            "  python app.py BNBUSDT\n"
+            "  python app.py etcusdt"
+        ),
+    )
+    parser.add_argument(
+        "symbol",
+        nargs="?",
+        metavar="SYMBOL",
+        help="Trading pair (e.g. BTCUSDT). Overrides SYMBOL in .env",
+    )
+    return parser.parse_args(argv)
+
+
+_cli_args = parse_cli_args()
+_env_symbol = normalize_symbol(os.getenv("SYMBOL", "btcusdt"))
+SYMBOL = normalize_symbol(_cli_args.symbol) if _cli_args.symbol else _env_symbol
+if _cli_args.symbol:
+    logger.info("Symbol %s (CLI overrides .env SYMBOL=%s)", SYMBOL.upper(), _env_symbol.upper())
 INTERVAL = os.getenv("INTERVAL", "1m")
 DEPTH_LEVELS = int(os.getenv("DEPTH_LEVELS", "20"))
 MAX_CANDLES = int(os.getenv("MAX_CANDLES", "200"))
