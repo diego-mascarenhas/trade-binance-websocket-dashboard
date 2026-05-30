@@ -98,9 +98,10 @@
 
 .panels {
     display: grid;
-    grid-template-columns: minmax(240px, 260px) minmax(320px, 1.2fr) minmax(280px, 1fr);
+    grid-template-columns: minmax(260px, 280px) minmax(280px, 1fr) minmax(240px, 280px);
     gap: 12px;
     margin-bottom: 12px;
+    align-items: start;
 }
 
 .panel {
@@ -109,15 +110,89 @@
     border-radius: 10px;
     padding: 12px 14px;
     display: flex;
-    align-items: center;
-    gap: 10px;
+    align-items: stretch;
+    gap: 8px;
     flex-wrap: wrap;
 }
 
-.panel-pattern {
+.panel-pattern,
+.panel-signal,
+.panel-metrics {
     flex-direction: column;
     align-items: stretch;
-    gap: 6px;
+    gap: 4px;
+}
+
+.panel-section-title {
+    width: 100%;
+    margin: 8px 0 2px;
+    padding-top: 6px;
+    border-top: 1px solid #2a2f3a;
+    color: #7d848f;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.panel-pattern .panel-section-title:first-child,
+.panel-signal .panel-section-title:first-child,
+.panel-metrics .panel-section-title:first-child {
+    margin-top: 0;
+    padding-top: 0;
+    border-top: none;
+}
+
+.kv-row {
+    display: grid;
+    grid-template-columns: minmax(88px, 42%) 1fr;
+    align-items: start;
+    gap: 8px 10px;
+    width: 100%;
+    padding: 3px 0;
+}
+
+.kv-label {
+    line-height: 1.35;
+}
+
+.kv-value-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 2px;
+    min-width: 0;
+    text-align: right;
+}
+
+.kv-value {
+    color: #ffffff;
+    font-size: 0.88rem;
+    line-height: 1.35;
+    word-break: break-word;
+}
+
+.kv-value-wrap .panel-hint {
+    font-size: 0.75rem;
+}
+
+.badge-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    width: 100%;
+    padding: 2px 0 4px;
+}
+
+.panel-footnote {
+    width: 100%;
+    margin: 6px 0 0;
+    line-height: 1.35;
+}
+
+.panel-pattern {
+    gap: 2px;
 }
 
 .analysis-heading {
@@ -146,13 +221,11 @@
 }
 
 .panel-signal {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 8px;
+    gap: 4px;
 }
 
 .panel-metrics {
-    align-items: stretch;
+    gap: 4px;
 }
 
 .signal-row {
@@ -189,10 +262,12 @@
 
 .badge {
     display: inline-block;
-    padding: 6px 12px;
+    padding: 4px 10px;
     border-radius: 999px;
     font-weight: 600;
-    font-size: 0.9rem;
+    font-size: 0.82rem;
+    line-height: 1.2;
+    white-space: nowrap;
 }
 
 .badge-neutral {

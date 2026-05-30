@@ -1062,8 +1062,6 @@ def add_order_block_overlays(
         y=support,
         line_color="rgba(0,193,118,0.95)",
         line_width=2,
-        annotation_text=f"OB Support · {format_price(support)} · qty {support_qty:.4f}",
-        annotation_position="right",
         row=row,
         col=col,
     )
@@ -1071,8 +1069,6 @@ def add_order_block_overlays(
         y=resistance,
         line_color="rgba(255,77,79,0.95)",
         line_width=2,
-        annotation_text=f"OB Resistance · {format_price(resistance)} · qty {resistance_qty:.4f}",
-        annotation_position="right",
         row=row,
         col=col,
     )
@@ -1181,8 +1177,6 @@ def add_valid_entry_markers(
             line_dash="dot",
             line_color=line_color,
             line_width=1.5,
-            annotation_text=f"Active {signal} entry · {format_price(entry_price)}",
-            annotation_position="right",
             row=row,
             col=col,
         )
@@ -1313,53 +1307,23 @@ def build_figure() -> go.Figure:
         )
 
     price_text = format_price(metrics.get("price"))
-    spread_text = f"{metrics['spread']:.4f}" if metrics["spread"] is not None else "—"
-    spread_pct_text = f"{metrics['spread_pct']:.4f}%" if metrics["spread_pct"] is not None else "—"
-    delta_text = f"{metrics['volume_delta']:.4f}" if metrics["volume_delta"] is not None else "—"
     signal_text = metrics.get("signal", "NEUTRAL")
     confidence_text = f"{metrics.get('confidence', 0)}%"
-    change_text = (
-        f"{metrics['change_24h']:+.2f}%"
-        if metrics.get("change_24h") is not None
-        else "—"
-    )
 
     fig.update_layout(
-        title=(
-            f"Live Binance {SYMBOL.upper()} ({INTERVAL}) | "
-            f"Price: {price_text} | Signal: {signal_text} {confidence_text} | "
-            f"24h: {change_text} | Status: {metrics['status']}"
+        title=dict(
+            text=f"{SYMBOL.upper()} · {INTERVAL} · {signal_text} {confidence_text} · {price_text}",
+            x=0.01,
+            xanchor="left",
+            font=dict(size=15),
         ),
         template="plotly_dark",
         height=900,
         barmode="overlay",
         xaxis_rangeslider_visible=False,
         legend_orientation="h",
-        margin=dict(l=20, r=20, t=80, b=20),
-        annotations=[
-            dict(
-                text=(
-                    f"Spread: {spread_text} ({spread_pct_text}) | "
-                    f"Bid vol: {metrics['bid_volume']:.4f} | "
-                    f"Ask vol: {metrics['ask_volume']:.4f} | "
-                    f"Delta: {delta_text} | "
-                    f"Zone: {metrics['zone_position_pct']:.1f}%"
-                    if metrics.get("zone_position_pct") is not None
-                    else (
-                        f"Spread: {spread_text} ({spread_pct_text}) | "
-                        f"Bid vol: {metrics['bid_volume']:.4f} | "
-                        f"Ask vol: {metrics['ask_volume']:.4f} | "
-                        f"Delta: {delta_text}"
-                    )
-                ),
-                xref="paper",
-                yref="paper",
-                x=0,
-                y=1.08,
-                showarrow=False,
-                font=dict(size=12, color="#cccccc"),
-            )
-        ],
+        legend=dict(y=1.02, x=0, orientation="h"),
+        margin=dict(l=20, r=20, t=56, b=20),
     )
 
     fig.update_xaxes(type="date", rangeslider_visible=False, row=1, col=1)
@@ -1415,58 +1379,76 @@ def macd_badge_class(histogram: float | None) -> str:
     return "badge badge-neutral"
 
 
+def panel_section(title: str) -> html.Div:
+    return html.Div(title, className="panel-section-title")
+
+
+def kv_row(
+    label: str,
+    value,
+    *,
+    strong: bool = False,
+    badge_class: str | None = None,
+    hint: str | None = None,
+) -> html.Div:
+    if badge_class:
+        value_node = html.Span(str(value), className=badge_class)
+    elif strong:
+        value_node = html.Strong(str(value), className="kv-value")
+    else:
+        value_node = html.Span(str(value), className="kv-value")
+
+    children = [
+        html.Span(label, className="panel-label kv-label"),
+        html.Div(
+            [value_node, html.Span(hint, className="panel-hint")] if hint else [value_node],
+            className="kv-value-wrap",
+        ),
+    ]
+    return html.Div(children, className="kv-row")
+
+
 def build_pattern_panel_children(metrics: dict) -> list:
     analysis = metrics.get("market_analysis") or {}
     children: list = [
-        html.Div(
-            [
-                html.Span("Confirmed pattern", className="panel-label"),
-                html.Span(metrics["pattern"], className=pattern_badge_class(metrics["pattern"])),
-            ],
-            className="analysis-row",
+        panel_section("Pattern"),
+        kv_row(
+            "Confirmed",
+            metrics["pattern"],
+            badge_class=pattern_badge_class(metrics["pattern"]),
         ),
     ]
 
     if metrics["pattern"] == "None":
         children.append(
             html.P(
-                f"Hammer→LONG · Star→SHORT · conf≥{metrics.get('min_confidence', MIN_CONFIDENCE)}%",
-                className="panel-hint",
+                f"Hammer → LONG · Star → SHORT · min {metrics.get('min_confidence', MIN_CONFIDENCE)}%",
+                className="panel-hint panel-footnote",
             )
         )
     else:
         children.append(
-            html.Div(
-                [
-                    html.Span(
-                        f"{metrics.get('signal')} {metrics.get('confidence')}%",
-                        className=confidence_badge_class(
-                            metrics.get("confidence", 0),
-                            metrics.get("min_confidence", MIN_CONFIDENCE),
-                        ),
-                    ),
-                ],
-                className="analysis-row",
+            kv_row(
+                "Aligned signal",
+                f"{metrics.get('signal')} {metrics.get('confidence')}%",
+                badge_class=confidence_badge_class(
+                    metrics.get("confidence", 0),
+                    metrics.get("min_confidence", MIN_CONFIDENCE),
+                ),
             )
         )
 
-    children.append(html.Div(className="analysis-divider"))
-    children.append(
-        html.Span(f"Market context · {INTERVAL}", className="panel-label analysis-heading")
-    )
-
     htf_interval = analysis.get("htf_interval", HTF_INTERVAL)
-    htf_bias = analysis.get("htf_bias", "NEUTRAL")
+    children.append(panel_section(f"Trend · {htf_interval}"))
     children.append(
-        html.Div(
-            [
-                html.Span(f"HTF ({htf_interval})", className="panel-label"),
-                html.Span(htf_bias, className=trend_badge_class(htf_bias)),
-            ],
-            className="analysis-row",
+        kv_row(
+            "Bias",
+            analysis.get("htf_bias", "NEUTRAL"),
+            badge_class=trend_badge_class(analysis.get("htf_bias", "NEUTRAL")),
         )
     )
 
+    children.append(panel_section(f"Indicators · {INTERVAL}"))
     ema_fast = analysis.get("ema_fast")
     ema_slow = analysis.get("ema_slow")
     ema_text = (
@@ -1475,76 +1457,124 @@ def build_pattern_panel_children(metrics: dict) -> list:
         else "—"
     )
     children.append(
-        html.Div(
-            [
-                html.Span(f"EMA {EMA_FAST}/{EMA_SLOW}", className="panel-label"),
-                html.Strong(ema_text, className="analysis-value"),
-                html.Span(analysis.get("ema_cross", "—"), className="panel-hint"),
-            ],
-            className="analysis-row",
+        kv_row(
+            f"EMA {EMA_FAST}/{EMA_SLOW}",
+            ema_text,
+            strong=True,
+            hint=analysis.get("ema_cross"),
         )
     )
 
     rsi = analysis.get("rsi")
     rsi_text = f"{rsi:.1f}" if rsi is not None else "—"
-    children.append(
-        html.Div(
-            [
-                html.Span(f"RSI ({RSI_PERIOD})", className="panel-label"),
-                html.Span(rsi_text, className=rsi_badge_class(rsi)),
-            ],
-            className="analysis-row",
-        )
-    )
+    children.append(kv_row(f"RSI ({RSI_PERIOD})", rsi_text, badge_class=rsi_badge_class(rsi)))
 
     macd = analysis.get("macd")
     macd_hist = analysis.get("macd_hist")
     if macd is not None and macd_hist is not None:
-        macd_text = f"{macd:.2f} · hist {macd_hist:+.2f}"
+        macd_text = f"{macd:.2f} (hist {macd_hist:+.2f})"
     else:
         macd_text = "—"
-    children.append(
-        html.Div(
-            [
-                html.Span("MACD", className="panel-label"),
-                html.Span(macd_text, className=macd_badge_class(macd_hist)),
-            ],
-            className="analysis-row",
-        )
-    )
+    children.append(kv_row("MACD", macd_text, badge_class=macd_badge_class(macd_hist)))
 
+    children.append(panel_section("Structure"))
     fvg = analysis.get("fvg")
     fvg_label = analysis.get("fvg_label", "—")
-    fvg_class = trend_badge_class("BULLISH" if fvg and fvg.get("type") == "BULL" else "BEARISH" if fvg else "NEUTRAL")
-    children.append(
-        html.Div(
-            [
-                html.Span("FVG", className="panel-label"),
-                html.Span(fvg_label, className=fvg_class if fvg else "badge badge-neutral"),
-            ],
-            className="analysis-row",
-        )
+    fvg_class = (
+        trend_badge_class("BULLISH")
+        if fvg and fvg.get("type") == "BULL"
+        else trend_badge_class("BEARISH")
+        if fvg
+        else "badge badge-neutral"
     )
-
-    children.append(
-        html.Div(
-            [
-                html.Span("Liquidity", className="panel-label"),
-                html.Strong(analysis.get("liquidity", "—"), className="analysis-value"),
-            ],
-            className="analysis-row",
-        )
-    )
+    children.append(kv_row("FVG", fvg_label, badge_class=fvg_class if fvg else "badge badge-neutral"))
+    children.append(kv_row("Liquidity", analysis.get("liquidity", "—"), strong=True))
 
     if metrics.get("require_trend_align"):
         children.append(
             html.P(
-                f"Valid entries need HTF trend · cooldown {metrics.get('signal_cooldown_sec', SIGNAL_COOLDOWN_SEC)}s",
-                className="panel-hint",
+                f"Valid entries: HTF trend + {metrics.get('signal_cooldown_sec', SIGNAL_COOLDOWN_SEC)}s cooldown",
+                className="panel-hint panel-footnote",
             )
         )
 
     return children
+
+
+def build_signal_panel_children(metrics: dict) -> list:
+    signal = metrics.get("signal", "NEUTRAL")
+    confidence = metrics.get("confidence", 0)
+    min_conf = metrics.get("min_confidence", MIN_CONFIDENCE)
+    action_label = "TRADE" if is_tradable_signal(signal, confidence, min_conf) else "WATCH"
+    pending = metrics.get("pending_signal", "NEUTRAL")
+    pending_count = metrics.get("pending_signal_count", 0)
+    debounce_target = metrics.get("signal_debounce_count", SIGNAL_DEBOUNCE_COUNT)
+    pending_text = (
+        f"Confirming {pending} ({pending_count}/{debounce_target})"
+        if pending != signal and pending_count > 0
+        else None
+    )
+    entry_text = (
+        format_price(metrics.get("signal_entry"))
+        if metrics.get("signal_entry") is not None
+        else "—"
+    )
+    support_text = format_price(metrics.get("support")) if metrics.get("support") else "—"
+    resistance_text = format_price(metrics.get("resistance")) if metrics.get("resistance") else "—"
+    zone_text = (
+        f"{metrics['zone_position_pct']:.1f}%"
+        if metrics.get("zone_position_pct") is not None
+        else "—"
+    )
+    change_text = (
+        f"{metrics['change_24h']:+.2f}%"
+        if metrics.get("change_24h") is not None
+        else "—"
+    )
+    reasons = metrics.get("signal_reasons") or "No active setup"
+    valid_count = len(metrics.get("valid_entries") or [])
+
+    children: list = [
+        panel_section("Signal"),
+        html.Div(
+            [
+                html.Span(signal, className=signal_badge_class(signal)),
+                html.Span(action_label, className=confidence_badge_class(confidence, min_conf)),
+            ],
+            className="badge-row",
+        ),
+        kv_row("Confidence", f"{confidence}%", strong=True, hint=f"min {min_conf}%"),
+        kv_row("Entry", entry_text, strong=True),
+        panel_section("Order block zone"),
+        kv_row("Support", support_text, strong=True),
+        kv_row("Resistance", resistance_text, strong=True),
+        kv_row("Zone position", zone_text, strong=True),
+        kv_row("24h change", change_text, strong=True),
+        html.P(reasons, className="signal-reasons"),
+    ]
+    if pending_text:
+        children.append(html.P(pending_text, className="signal-pending"))
+    children.append(html.P(f"Valid entries on chart: {valid_count}", className="panel-hint panel-footnote"))
+    return children
+
+
+def build_metrics_panel_children(metrics: dict) -> list:
+    spread_text = f"{metrics['spread']:.4f}" if metrics.get("spread") is not None else "—"
+    spread_pct_text = f"{metrics['spread_pct']:.4f}%" if metrics.get("spread_pct") is not None else "—"
+    delta_text = (
+        f"{metrics['volume_delta']:+.4f}" if metrics.get("volume_delta") is not None else "—"
+    )
+
+    return [
+        panel_section("Order book"),
+        kv_row("Spread", spread_text, strong=True),
+        kv_row("Spread %", spread_pct_text, strong=True),
+        kv_row("Bid volume", f"{metrics.get('bid_volume', 0):.4f}", strong=True),
+        kv_row("Ask volume", f"{metrics.get('ask_volume', 0):.4f}", strong=True),
+        kv_row("Volume delta", delta_text, strong=True),
+        panel_section("Connection"),
+        kv_row("WebSocket", metrics.get("status", "—"), strong=True),
+    ]
 
 
 def pattern_badge_class(pattern: str) -> str:
@@ -1641,136 +1671,8 @@ def update_dashboard(_: int):
     ]
 
     pattern_children = build_pattern_panel_children(metrics)
-
-    signal = metrics.get("signal", "NEUTRAL")
-    confidence = metrics.get("confidence", 0)
-    min_conf = metrics.get("min_confidence", MIN_CONFIDENCE)
-    action_label = "TRADE" if is_tradable_signal(signal, confidence, min_conf) else "WATCH"
-    pending = metrics.get("pending_signal", "NEUTRAL")
-    pending_count = metrics.get("pending_signal_count", 0)
-    debounce_target = metrics.get("signal_debounce_count", SIGNAL_DEBOUNCE_COUNT)
-    pending_text = (
-        f"Confirming {pending} ({pending_count}/{debounce_target})"
-        if pending != signal and pending_count > 0
-        else None
-    )
-    entry_text = (
-        f"{metrics['signal_entry']:.2f}"
-        if metrics.get("signal_entry") is not None
-        else "—"
-    )
-    support_text = f"{metrics['support']:.2f}" if metrics.get("support") else "—"
-    resistance_text = f"{metrics['resistance']:.2f}" if metrics.get("resistance") else "—"
-    zone_text = (
-        f"{metrics['zone_position_pct']:.1f}%"
-        if metrics.get("zone_position_pct") is not None
-        else "—"
-    )
-    change_text = (
-        f"{metrics['change_24h']:+.2f}%"
-        if metrics.get("change_24h") is not None
-        else "—"
-    )
-    reasons = metrics.get("signal_reasons") or "No active setup"
-
-    signal_children = [
-        html.Div(
-            [
-                html.Span("Signal", className="panel-label"),
-                html.Span(signal, className=signal_badge_class(signal)),
-                html.Span(action_label, className=confidence_badge_class(confidence, min_conf)),
-            ],
-            className="signal-row",
-        ),
-        html.Div(
-            [
-                html.Span("Confidence", className="panel-label"),
-                html.Strong(f"{confidence}%"),
-                html.Span(f"need {min_conf}%", className="panel-hint"),
-            ],
-            className="signal-row",
-        ),
-        html.Div(
-            [
-                html.Span("Entry", className="panel-label"),
-                html.Strong(entry_text),
-            ],
-            className="signal-row",
-        ),
-        html.Div(
-            [
-                html.Span("Support", className="panel-label"),
-                html.Strong(support_text),
-                html.Span("Resistance", className="panel-label"),
-                html.Strong(resistance_text),
-                html.Span("Zone", className="panel-label"),
-                html.Strong(zone_text),
-                html.Span("24h", className="panel-label"),
-                html.Strong(change_text),
-            ],
-            className="signal-row",
-        ),
-        html.P(reasons, className="signal-reasons"),
-    ]
-    if pending_text:
-        signal_children.append(html.P(pending_text, className="signal-pending"))
-    valid_count = len(metrics.get("valid_entries") or [])
-    signal_children.append(
-        html.P(f"Valid entries on chart: {valid_count}", className="signal-pending")
-    )
-
-    metrics_children = [
-        html.Div(
-            [
-                html.Span("Spread", className="metric-label"),
-                html.Strong(
-                    f"{metrics['spread']:.4f}" if metrics["spread"] is not None else "—"
-                ),
-            ],
-            className="metric",
-        ),
-        html.Div(
-            [
-                html.Span("Spread %", className="metric-label"),
-                html.Strong(
-                    f"{metrics['spread_pct']:.4f}%" if metrics["spread_pct"] is not None else "—"
-                ),
-            ],
-            className="metric",
-        ),
-        html.Div(
-            [
-                html.Span("Bid volume", className="metric-label"),
-                html.Strong(f"{metrics['bid_volume']:.4f}"),
-            ],
-            className="metric",
-        ),
-        html.Div(
-            [
-                html.Span("Ask volume", className="metric-label"),
-                html.Strong(f"{metrics['ask_volume']:.4f}"),
-            ],
-            className="metric",
-        ),
-        html.Div(
-            [
-                html.Span("Volume delta", className="metric-label"),
-                html.Strong(
-                    f"{metrics['volume_delta']:+.4f}"
-                    if metrics["volume_delta"] is not None
-                    else "—"
-                ),
-            ],
-            className="metric",
-        ),
-        html.Div(
-            [
-                html.Span("WS status", className="metric-label"),
-                html.Strong(metrics["status"]),
-            ],
-            className="metric",
-        ),
-    ]
+    signal_children = build_signal_panel_children(metrics)
+    metrics_children = build_metrics_panel_children(metrics)
 
     return figure, price_header_children, pattern_children, signal_children, metrics_children
 
