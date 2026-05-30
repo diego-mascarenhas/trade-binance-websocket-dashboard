@@ -2,6 +2,8 @@
 
 **trade-binance-websocket-dashboard** is a **Binance Spot** live dashboard that streams **klines** and the **order book** over WebSocket, renders OHLC candles with pattern markers (Hammer, Shooting Star), and shows depth, spread, and volume metrics in a **Plotly Dash** UI.
 
+Optional **order execution** sends **Binance Futures** LIMIT entries (with SL/TP algos) when a **valid chart entry** is confirmed — same REST flow as [trade-binance-websocket-order-blocks](https://github.com/idoneo/trade-binance-websocket-order-blocks). Use `EXECUTION_MODE=dry` to log only, or `live` with API keys.
+
 ## Requirements
 
 * macOS or Linux with **Python 3.10+**
@@ -42,8 +44,14 @@ Open the dashboard at `http://127.0.0.1:8050` (or the host/port set in `.env`).
 | `MIN_CONFIDENCE` | Minimum confidence to highlight a **TRADE** setup (same logic as order-blocks bot) | `50` |
 | `DASH_HOST`    | Dash bind address                    | `0.0.0.0` |
 | `DASH_PORT`    | Dash HTTP port                       | `8050`    |
+| `EXECUTION_ENABLED` | Enable order execution on valid entries | `false` |
+| `EXECUTION_MODE` | `dry` (log only) or `live` (Binance Futures REST) | `dry` |
+| `BINANCE_API_KEY` / `BINANCE_SECRET_KEY` | Required for `live` mode | — |
+| `POSITION_SIZE_USDT` | Notional per entry (Futures) | `25` |
+| `LEVERAGE_MODE` | `max` = max per symbol via API, `fixed` = use `LEVERAGE` | `fixed` |
+| `LEVERAGE` | Fixed leverage, or fallback when `LEVERAGE_MODE=max` / API fails | `4` |
 
-The app loads historical klines via REST, then keeps the order book in sync using Binance’s depth snapshot + incremental updates. It also streams `@miniTicker` for 24h change and computes **order-block signal + confidence** (support/resistance walls, zone position, and fallback 24h rules — informational only, no orders). The UI refreshes every 1.5s.
+The app loads historical klines via REST, then keeps the order book in sync using Binance’s depth snapshot + incremental updates. It also streams `@miniTicker` for 24h change and computes **order-block signal + confidence** (support/resistance walls, zone position, and fallback 24h rules). With `EXECUTION_ENABLED=true`, confirmed valid entries can open **Futures** positions (dry-run or live). The UI refreshes every 1.5s.
 
 ## Hosting
 
@@ -54,6 +62,7 @@ The dashboard can run on any machine with Python (local dev, VPS, or dedicated s
 ```
 trade-binance-websocket-dashboard/
 ├── app.py               # Entry script (run this)
+├── execution.py         # Binance Futures dry/live order execution
 ├── assets/              # Dash static assets (custom.css)
 ├── .env.example
 ├── requirements.txt
@@ -75,8 +84,8 @@ Questions, support, or license-related notices: hola@idoneo.dev
 
 ## Security
 
-Do not commit `.env` or secrets to the repository. This project uses **public** Binance market data only; no trading keys are required. Report security issues to hola@idoneo.dev.
+Do not commit `.env` or secrets to the repository. Public Spot streams need no keys; **live execution** requires Futures API keys with trade permissions. Report security issues to hola@idoneo.dev.
 
 ## Disclaimer
 
-Trading software carries risk of capital loss. This dashboard is for monitoring and analysis only; it does not place orders. Use at your own risk; this is not financial advice.
+Trading software carries risk of capital loss. With `EXECUTION_MODE=live`, this app can place real orders on Binance Futures. Use dry-run first, understand the risks, and treat all signals as informational — not financial advice.

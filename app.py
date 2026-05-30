@@ -16,6 +16,8 @@ from plotly.subplots import make_subplots
 
 load_dotenv()
 
+import execution
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,7 @@ MAX_CANDLES = int(os.getenv("MAX_CANDLES", "200"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "50"))
 MIN_PATTERN_RANGE_PCT = float(os.getenv("MIN_PATTERN_RANGE_PCT", "0.02"))
 OB_WALL_RANGE_PCT = float(os.getenv("OB_WALL_RANGE_PCT", "0.6"))
+CANDLE_CHART_LOOKBACK = int(os.getenv("CANDLE_CHART_LOOKBACK", "90"))
 SIGNAL_ZONE_LONG_ENTER = float(os.getenv("SIGNAL_ZONE_LONG_ENTER", "20"))
 SIGNAL_ZONE_LONG_EXIT = float(os.getenv("SIGNAL_ZONE_LONG_EXIT", "35"))
 SIGNAL_ZONE_SHORT_ENTER = float(os.getenv("SIGNAL_ZONE_SHORT_ENTER", "80"))
@@ -588,6 +591,28 @@ def format_price(price: float | None) -> str:
     return f"{price:.6f}"
 
 
+def price_label(price: float) -> str:
+    if price >= 1000:
+        return f"{price:,.2f}"
+    if price >= 100:
+        return f"{price:.3f}"
+    if price >= 1:
+        return f"{price:.4f}"
+    return f"{price:.6f}"
+
+
+def price_tick_format(price: float | None) -> str:
+    if price is None or price <= 0:
+        return ".4f"
+    if price >= 1000:
+        return ",.2f"
+    if price >= 100:
+        return ".3f"
+    if price >= 1:
+        return ".4f"
+    return ".6f"
+
+
 def change_24h_class(change_24h_pct: float | None) -> str:
     if change_24h_pct is None:
         return "price-change-neutral"
@@ -691,6 +716,7 @@ def record_valid_entry(
     reasons: str,
     candle_time,
     trend_bias: str,
+    trade_plan: dict | None = None,
 ) -> None:
     global last_valid_entry_monotonic
 
@@ -734,6 +760,14 @@ def record_valid_entry(
         candle_time=str(candle_time),
         trend_bias=trend_bias,
     )
+    execution.try_execute_valid_entry(
+        SYMBOL,
+        signal,
+        entry,
+        trade_plan,
+        reasons,
+        trend_bias,
+    )
 
 
 def apply_signal_debounce(
@@ -743,6 +777,7 @@ def apply_signal_debounce(
     entry: float | None,
     candle_time,
     trend_bias: str,
+    trade_plan: dict | None = None,
 ) -> None:
     global stable_signal_dir, pending_signal, pending_signal_count
     global signal_dir, signal_confidence, signal_reasons, signal_entry
@@ -765,7 +800,9 @@ def apply_signal_debounce(
             trend_bias=trend_bias,
         )
         if is_tradable_signal(candidate, confidence):
-            record_valid_entry(candidate, entry, confidence, reasons, candle_time, trend_bias)
+            record_valid_entry(
+                candidate, entry, confidence, reasons, candle_time, trend_bias, trade_plan
+            )
         stable_signal_dir = candidate
 
     signal_dir = stable_signal_dir
@@ -911,6 +948,16 @@ def update_trading_signal(
     closed_rows = [row for row in candles if row.get("x")]
     htf_closed_rows = [row for row in htf_candles if row.get("x")]
     analysis = compute_market_analysis(closed_rows, htf_closed_rows, current_price)
+    current_plan = compute_trade_plan(
+        candidate if candidate in ("LONG", "SHORT") else stable_signal_dir,
+        confidence if pending_signal_count >= SIGNAL_DEBOUNCE_COUNT else signal_confidence,
+        entry if entry is not None else signal_entry,
+        support,
+        resistance,
+        current_price,
+        analysis,
+        MIN_CONFIDENCE,
+    )
     apply_signal_debounce(
         candidate,
         confidence,
@@ -918,6 +965,7 @@ def update_trading_signal(
         entry,
         candle_time,
         analysis.get("htf_bias", "NEUTRAL"),
+        current_plan if current_plan.get("active") else None,
     )
 
 
@@ -1226,6 +1274,7 @@ def get_candles_df() -> pd.DataFrame:
                 signal_dir,
             ),
             "log_dir": LOG_DIR,
+            "execution": execution.get_execution_status(),
         }
 
     return pd.DataFrame(rows), ob, metrics
@@ -1233,7 +1282,7 @@ def get_candles_df() -> pd.DataFrame:
 
 def depth_category_labels(bids: list[list[float]], asks: list[list[float]]) -> list[str]:
     prices = sorted({price for price, _ in bids} | {price for price, _ in asks})
-    return [f"{price:.2f}" for price in prices]
+    return [price_label(price) for price in prices]
 
 
 def side_bar_colors(
@@ -1242,8 +1291,8 @@ def side_bar_colors(
     base_color: str,
     wall_color: str,
 ) -> list[str]:
-    wall_label = f"{wall_price:.2f}" if wall_price else None
-    return [wall_color if f"{price:.2f}" == wall_label else base_color for price, _ in levels]
+    wall_label = price_label(wall_price) if wall_price else None
+    return [wall_color if price_label(price) == wall_label else base_color for price, _ in levels]
 
 
 def add_order_block_overlays(
@@ -1263,45 +1312,6 @@ def add_order_block_overlays(
         if abs(float(support) - current_price) > max_dist or abs(float(resistance) - current_price) > max_dist:
             return
 
-    price_range = resistance - support
-    spread = metrics.get("spread") or 0
-    wall_band = max(price_range * 0.012, spread * 2, support * 0.00005)
-    support_qty = metrics.get("support_qty", 0)
-    resistance_qty = metrics.get("resistance_qty", 0)
-
-    fig.add_hrect(
-        y0=support,
-        y1=support + price_range * 0.25,
-        fillcolor="rgba(0,193,118,0.07)",
-        line_width=0,
-        row=row,
-        col=col,
-    )
-    fig.add_hrect(
-        y0=resistance - price_range * 0.25,
-        y1=resistance,
-        fillcolor="rgba(255,77,79,0.07)",
-        line_width=0,
-        row=row,
-        col=col,
-    )
-    fig.add_hrect(
-        y0=support - wall_band,
-        y1=support + wall_band,
-        fillcolor="rgba(0,193,118,0.24)",
-        line_width=0,
-        row=row,
-        col=col,
-    )
-    fig.add_hrect(
-        y0=resistance - wall_band,
-        y1=resistance + wall_band,
-        fillcolor="rgba(255,77,79,0.24)",
-        line_width=0,
-        row=row,
-        col=col,
-    )
-
     fig.add_hline(
         y=support,
         line_color="rgba(0,193,118,0.95)",
@@ -1317,7 +1327,6 @@ def add_order_block_overlays(
         col=col,
     )
 
-    current_price = metrics.get("price")
     if current_price:
         fig.add_hline(
             y=current_price,
@@ -1330,40 +1339,57 @@ def add_order_block_overlays(
 
 
 def candle_chart_y_range(df: pd.DataFrame, metrics: dict) -> tuple[float, float]:
-    y_min = float(df["l"].min())
-    y_max = float(df["h"].max())
-    mid = metrics.get("price") or (y_min + y_max) / 2
-    max_dist = mid * (OB_WALL_RANGE_PCT / 100) * 1.5
+    lookback = min(len(df), max(CANDLE_CHART_LOOKBACK, 30))
+    recent = df.tail(lookback)
+    bar_ranges = (recent["h"] - recent["l"]).astype(float)
+    avg_range = float(bar_ranges.mean()) if not bar_ranges.empty else 0.0
+    p90_range = float(bar_ranges.quantile(0.9)) if len(bar_ranges) >= 5 else avg_range
 
-    for key in ("support", "resistance"):
-        value = metrics.get(key)
-        if value is not None and abs(float(value) - mid) <= max_dist:
-            y_min = min(y_min, float(value))
-            y_max = max(y_max, float(value))
+    # Ignore isolated wick spikes (common on low-vol pairs like ETC 1m).
+    y_min = float(recent["l"].quantile(0.08))
+    y_max = float(recent["h"].quantile(0.92))
+    mid = metrics.get("price") or float(recent["c"].iloc[-1])
+
+    target_span = max(p90_range * 7, avg_range * 10, mid * 0.0007)
+    span = max(y_max - y_min, 1e-12)
+    if span < target_span:
+        center = mid if mid else (y_min + y_max) / 2
+        half = target_span / 2
+        y_min = center - half
+        y_max = center + half
+        span = target_span
+
+    max_extend = span * 0.12
+
+    def maybe_extend(value: float | None) -> None:
+        nonlocal y_min, y_max, span
+        if value is None:
+            return
+        v = float(value)
+        if v < y_min and y_min - v <= max_extend:
+            y_min = v
+            span = y_max - y_min
+        elif v > y_max and v - y_max <= max_extend:
+            y_max = v
+            span = y_max - y_min
 
     for entry in metrics.get("valid_entries") or []:
-        y_min = min(y_min, float(entry["entry"]))
-        y_max = max(y_max, float(entry["entry"]))
+        maybe_extend(entry.get("entry"))
 
     active_entry = metrics.get("signal_entry")
     signal = metrics.get("signal", "NEUTRAL")
     confidence = metrics.get("confidence", 0)
     if active_entry is not None and is_tradable_signal(signal, confidence, metrics.get("min_confidence", MIN_CONFIDENCE)):
-        y_min = min(y_min, float(active_entry))
-        y_max = max(y_max, float(active_entry))
+        maybe_extend(active_entry)
 
     plan = metrics.get("trade_plan") or {}
     if plan.get("active"):
         for key in ("sl", "tp1", "tp2", "avg_entry"):
-            value = plan.get(key)
-            if value is not None:
-                y_min = min(y_min, float(value))
-                y_max = max(y_max, float(value))
+            maybe_extend(plan.get(key))
         for leg in plan.get("legs") or []:
-            y_min = min(y_min, float(leg["price"]))
-            y_max = max(y_max, float(leg["price"]))
+            maybe_extend(leg.get("price"))
 
-    padding = max((y_max - y_min) * 0.06, mid * 0.0005)
+    padding = max(span * 0.06, mid * 0.0002)
     return y_min - padding, y_max + padding
 
 
@@ -1502,14 +1528,14 @@ def build_figure() -> go.Figure:
                 low=df["l"],
                 close=df["c"],
                 increasing=dict(
-                    line=dict(color="#00c176", width=0.8),
+                    line=dict(color="#00c176", width=1.2),
                     fillcolor="#00c176",
                 ),
                 decreasing=dict(
-                    line=dict(color="#ff4d4f", width=0.8),
+                    line=dict(color="#ff4d4f", width=1.2),
                     fillcolor="#ff4d4f",
                 ),
-                whiskerwidth=0.2,
+                whiskerwidth=0.35,
                 name=SYMBOL.upper(),
             ),
             row=1,
@@ -1556,7 +1582,8 @@ def build_figure() -> go.Figure:
         add_valid_entry_markers(fig, metrics, row=1, col=1)
         add_trade_plan_overlays(fig, metrics, row=1, col=1)
         y_min, y_max = candle_chart_y_range(df, metrics)
-        fig.update_yaxes(range=[y_min, y_max], row=1, col=1)
+        tick_fmt = price_tick_format(metrics.get("price"))
+        fig.update_yaxes(range=[y_min, y_max], tickformat=tick_fmt, row=1, col=1)
 
     bids = ob["bids"]
     asks = ob["asks"]
@@ -1566,7 +1593,7 @@ def build_figure() -> go.Figure:
         fig.add_trace(
             go.Bar(
                 x=[-qty for _, qty in bids],
-                y=[f"{price:.2f}" for price, _ in bids],
+                y=[price_label(price) for price, _ in bids],
                 orientation="h",
                 name="Bids",
                 marker=dict(
@@ -1588,7 +1615,7 @@ def build_figure() -> go.Figure:
         fig.add_trace(
             go.Bar(
                 x=[qty for _, qty in asks],
-                y=[f"{price:.2f}" for price, _ in asks],
+                y=[price_label(price) for price, _ in asks],
                 orientation="h",
                 name="Asks",
                 marker=dict(
@@ -1881,6 +1908,64 @@ def build_metrics_panel_children(metrics: dict) -> list:
     ]
 
 
+def execution_badge_class(mode: str, enabled: bool) -> str:
+    if not enabled:
+        return "badge badge-neutral"
+    if mode == "live":
+        return "badge badge-trade"
+    return "badge badge-watch"
+
+
+def build_execution_panel_section(metrics: dict) -> list:
+    ex = metrics.get("execution") or {}
+    enabled = ex.get("enabled", False)
+    mode = (ex.get("mode") or "dry").upper()
+    log_dir = metrics.get("log_dir", LOG_DIR)
+
+    children: list = [
+        panel_section("Order execution"),
+        html.Div(
+            [
+                html.Span(
+                    f"{mode} · Futures" if enabled else "Off",
+                    className=execution_badge_class(ex.get("mode", "dry"), enabled),
+                ),
+                html.Span(
+                    "Binance REST" if enabled else "Set EXECUTION_ENABLED=true",
+                    className="badge badge-neutral",
+                ),
+            ],
+            className="badge-row",
+        ),
+        kv_row("Status", ex.get("message", "—"), strong=True),
+    ]
+    if ex.get("last_at"):
+        children.append(kv_row("Last order", ex.get("last_at", "—")))
+    if ex.get("last_symbol"):
+        children.append(
+            kv_row(
+                "Last side",
+                f"{ex.get('last_direction', '—')} · {ex.get('last_symbol', '—')}",
+            )
+        )
+    if ex.get("last_order_id"):
+        children.append(kv_row("Order ID", str(ex.get("last_order_id")), strong=True))
+
+    note = (
+        "Dry-run logs to orders.log — no API calls."
+        if ex.get("mode") == "dry"
+        else "Live mode sends LIMIT + SL/TP to Binance Futures (fapi)."
+    )
+    children.append(html.P(note, className="panel-hint panel-footnote"))
+    children.append(
+        html.P(
+            f"Log: {log_dir}/orders.log · triggers on valid chart entries (HTF-aligned).",
+            className="panel-hint panel-footnote",
+        )
+    )
+    return children
+
+
 def build_trade_plan_panel_children(metrics: dict) -> list:
     plan = metrics.get("trade_plan") or {}
     log_dir = metrics.get("log_dir", LOG_DIR)
@@ -1890,8 +1975,9 @@ def build_trade_plan_panel_children(metrics: dict) -> list:
             panel_section("Suggested trade plan"),
             html.P(plan.get("summary", "No active plan."), className="panel-hint panel-footnote"),
             html.P("Informational only — not financial advice.", className="panel-hint"),
+            *build_execution_panel_section(metrics),
             html.P(
-                f"Logs: {log_dir}/signals.log · trades.log · plans.log · errors.log",
+                f"Logs: {log_dir}/signals.log · trades.log · plans.log · orders.log · errors.log",
                 className="panel-hint panel-footnote",
             ),
         ]
@@ -1964,10 +2050,11 @@ def build_trade_plan_panel_children(metrics: dict) -> list:
     )
     children.append(html.P(plan["breakeven_note"], className="panel-hint panel-footnote"))
     children.append(html.P(plan["trail_note"], className="panel-hint panel-footnote"))
+    children.extend(build_execution_panel_section(metrics))
     children.append(html.P("Informational only — not financial advice.", className="panel-hint"))
     children.append(
         html.P(
-            f"Logs: {log_dir}/signals.log · trades.log · plans.log · errors.log",
+            f"Logs: {log_dir}/signals.log · trades.log · plans.log · orders.log · errors.log",
             className="panel-hint panel-footnote",
         )
     )
