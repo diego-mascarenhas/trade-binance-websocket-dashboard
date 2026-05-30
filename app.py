@@ -2066,6 +2066,8 @@ def build_execution_panel_section(metrics: dict) -> list:
         ),
         kv_row("Status", ex.get("message", "—"), strong=True),
     ]
+    if telegram.is_trading_paused():
+        children.append(kv_row("Telegram", "Trading paused (/start to resume)", strong=True))
     if ex.get("last_at"):
         children.append(kv_row("Last order", ex.get("last_at", "—")))
     if ex.get("last_symbol"):
@@ -2298,6 +2300,35 @@ def update_dashboard(_: int):
     )
 
 
+def build_telegram_status() -> str:
+    with state_lock:
+        price = latest_price
+        signal = signal_dir
+        confidence = signal_confidence
+        ws = ws_status
+        change = change_24h
+    ex = execution.get_execution_status()
+    exec_enabled = ex.get("enabled", False)
+    exec_mode = ex.get("mode", "dry").upper() if exec_enabled else "OFF"
+    if telegram.is_trading_paused():
+        trading = "paused (/start to resume)"
+    elif not exec_enabled:
+        trading = "off (EXECUTION_ENABLED=false)"
+    else:
+        trading = "active"
+    price_text = format_price(price) if price else "—"
+    change_text = f"{change:+.2f}%" if change is not None else "—"
+    lines = [
+        f"{SYMBOL.upper()} · {INTERVAL}",
+        f"Signal: {signal} {confidence}% · Price {price_text} ({change_text})",
+        f"WebSocket: {ws}",
+        f"Execution: {exec_mode} · {trading}",
+    ]
+    if ex.get("message"):
+        lines.append(f"Last: {ex['message']}")
+    return "\n".join(lines)
+
+
 def start_ws() -> None:
     asyncio.run(ws_loop())
 
@@ -2326,9 +2357,11 @@ def run_server() -> None:
     except KeyboardInterrupt:
         logger.info("Shutting down")
     finally:
+        telegram.stop_command_listener()
         telegram.notify_stopped()
 
 
 if __name__ == "__main__":
     Thread(target=start_ws, daemon=True).start()
+    telegram.start_command_listener(build_telegram_status)
     run_server()

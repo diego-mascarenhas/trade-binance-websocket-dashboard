@@ -1,4 +1,4 @@
-"""Telegram notifications — same style as trade-binance-websocket-order-blocks."""
+"""Telegram notifications and /start /stop /status commands."""
 
 from __future__ import annotations
 
@@ -6,8 +6,12 @@ import json
 import logging
 import os
 import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from collections.abc import Callable
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -17,17 +21,39 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_POLL_INTERVAL = float(os.getenv("TELEGRAM_POLL_INTERVAL", "2"))
+
+_trading_paused = False
+_pause_lock = threading.Lock()
+_update_offset = 0
+_listener_stop = threading.Event()
 
 
 def is_configured() -> bool:
     return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 
-def _send_sync(text: str) -> bool:
+def is_trading_paused() -> bool:
+    with _pause_lock:
+        return _trading_paused
+
+
+def set_trading_paused(paused: bool) -> None:
+    global _trading_paused
+    with _pause_lock:
+        _trading_paused = paused
+
+
+def trading_state_label() -> str:
+    return "paused" if is_trading_paused() else "active"
+
+
+def _send_sync(text: str, chat_id: str | None = None) -> bool:
     if not is_configured():
         return False
+    target_chat = chat_id or TELEGRAM_CHAT_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
+    payload = json.dumps({"chat_id": target_chat, "text": text}).encode()
     request = urllib.request.Request(
         url,
         data=payload,
@@ -147,9 +173,100 @@ def notify_started(
     send_bot(
         f"Dashboard started\n"
         f"Mode: {mode_label} | Symbol: {symbol.upper()} | Interval: {interval} | "
-        f"Port: {dash_port} | UI: {ui_label}"
+        f"Port: {dash_port} | UI: {ui_label}\n"
+        f"Commands: /status · /stop · /start"
     )
 
 
 def notify_stopped() -> None:
     send_bot("Dashboard stopped")
+
+
+def _telegram_api_get(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    query = urllib.parse.urlencode(params or {})
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    if query:
+        url = f"{url}?{query}"
+    request = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = json.loads(response.read().decode())
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("description", "Telegram API error"))
+    return payload
+
+
+def _parse_command(text: str) -> str | None:
+    if not text or not text.startswith("/"):
+        return None
+    command = text.split()[0].split("@")[0].lower()
+    if command in ("/start", "/stop", "/status"):
+        return command
+    return None
+
+
+def _authorized_chat(chat_id: Any) -> bool:
+    return str(chat_id) == str(TELEGRAM_CHAT_ID)
+
+
+def _handle_command(command: str, status_provider: Callable[[], str]) -> None:
+    if command == "/stop":
+        set_trading_paused(True)
+        send_bot("Trading paused — no new orders will be sent")
+        return
+    if command == "/start":
+        set_trading_paused(False)
+        send_bot("Trading resumed — orders enabled again")
+        return
+    if command == "/status":
+        send_bot(status_provider())
+        return
+
+
+def _command_loop(status_provider: Callable[[], str]) -> None:
+    global _update_offset
+    logger.info("Telegram command listener started (/start /stop /status)")
+    while not _listener_stop.is_set():
+        try:
+            params: dict[str, Any] = {"timeout": 0, "allowed_updates": json.dumps(["message"])}
+            if _update_offset:
+                params["offset"] = _update_offset
+            result = _telegram_api_get("getUpdates", params)
+            for update in result.get("result", []):
+                _update_offset = int(update["update_id"]) + 1
+                message = update.get("message") or {}
+                chat = message.get("chat") or {}
+                if not _authorized_chat(chat.get("id")):
+                    continue
+                text = message.get("text") or ""
+                command = _parse_command(text.strip())
+                if command:
+                    _handle_command(command, status_provider)
+        except Exception:
+            logger.exception("Telegram command poll failed")
+        if _listener_stop.wait(TELEGRAM_POLL_INTERVAL):
+            break
+    logger.info("Telegram command listener stopped")
+
+
+def start_command_listener(status_provider: Callable[[], str]) -> None:
+    if not is_configured():
+        return
+    global _update_offset
+    try:
+        bootstrap = _telegram_api_get("getUpdates", {"offset": -1, "limit": 1})
+        updates = bootstrap.get("result") or []
+        if updates:
+            _update_offset = int(updates[-1]["update_id"]) + 1
+    except Exception:
+        logger.warning("Telegram bootstrap getUpdates failed; old messages may replay")
+    thread = threading.Thread(
+        target=_command_loop,
+        args=(status_provider,),
+        daemon=True,
+        name="telegram-commands",
+    )
+    thread.start()
+
+
+def stop_command_listener() -> None:
+    _listener_stop.set()

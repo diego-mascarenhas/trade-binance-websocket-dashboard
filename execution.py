@@ -499,7 +499,7 @@ def try_execute_valid_entry(
     trend_bias: str,
 ) -> None:
     """Fire-and-forget execution when dashboard records a valid entry."""
-    if not EXECUTION_ENABLED:
+    if not EXECUTION_ENABLED or telegram.is_trading_paused():
         return
     if entry is None or not trade_plan or not trade_plan.get("active"):
         return
