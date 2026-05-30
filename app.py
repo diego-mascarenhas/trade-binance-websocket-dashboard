@@ -68,6 +68,26 @@ def detect_pattern(row: pd.Series) -> str | None:
     return None
 
 
+def format_price(price: float | None) -> str:
+    if price is None:
+        return "—"
+    if price >= 1000:
+        return f"{price:,.2f}"
+    if price >= 1:
+        return f"{price:.4f}"
+    return f"{price:.6f}"
+
+
+def change_24h_class(change_24h_pct: float | None) -> str:
+    if change_24h_pct is None:
+        return "price-change-neutral"
+    if change_24h_pct > 0:
+        return "price-change-up"
+    if change_24h_pct < 0:
+        return "price-change-down"
+    return "price-change-neutral"
+
+
 def kline_row(k: dict) -> dict:
     return {
         "t": pd.to_datetime(k["t"], unit="ms"),
@@ -416,9 +436,13 @@ def get_candles_df() -> pd.DataFrame:
             "bids": list(orderbook.get("bids", [])),
             "asks": list(orderbook.get("asks", [])),
         }
+        best_bid = ob["bids"][0][0] if ob["bids"] else None
+        best_ask = ob["asks"][0][0] if ob["asks"] else None
         metrics = {
             "pattern": latest_pattern,
             "price": latest_price,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
             "spread": spread,
             "spread_pct": spread_pct,
             "volume_delta": volume_delta,
@@ -557,7 +581,7 @@ def build_figure() -> go.Figure:
             col=1,
         )
 
-    price_text = f"{metrics['price']:.2f}" if metrics["price"] else "—"
+    price_text = format_price(metrics.get("price"))
     spread_text = f"{metrics['spread']:.4f}" if metrics["spread"] is not None else "—"
     spread_pct_text = f"{metrics['spread_pct']:.4f}%" if metrics["spread_pct"] is not None else "—"
     delta_text = f"{metrics['volume_delta']:.4f}" if metrics["volume_delta"] is not None else "—"
@@ -646,12 +670,18 @@ app.layout = html.Div(
     [
         html.Div(
             [
-                html.H2("Binance Live Dashboard", className="title"),
-                html.P(
-                    f"Streaming {SYMBOL.upper()} · interval {INTERVAL} · depth {DEPTH_LEVELS} levels · "
-                    f"min confidence {MIN_CONFIDENCE}%",
-                    className="subtitle",
+                html.Div(
+                    [
+                        html.H2("Binance Live Dashboard", className="title"),
+                        html.P(
+                            f"Streaming {SYMBOL.upper()} · interval {INTERVAL} · depth {DEPTH_LEVELS} levels · "
+                            f"min confidence {MIN_CONFIDENCE}%",
+                            className="subtitle",
+                        ),
+                    ],
+                    className="header-copy",
                 ),
+                html.Div(id="price-header", className="price-header"),
             ],
             className="header",
         ),
@@ -672,6 +702,7 @@ app.layout = html.Div(
 
 @app.callback(
     Output("live-chart", "figure"),
+    Output("price-header", "children"),
     Output("pattern-panel", "children"),
     Output("signal-panel", "children"),
     Output("metrics-panel", "children"),
@@ -680,6 +711,26 @@ app.layout = html.Div(
 def update_dashboard(_: int):
     _, _, metrics = get_candles_df()
     figure = build_figure()
+
+    change_text = (
+        f"{metrics['change_24h']:+.2f}%"
+        if metrics.get("change_24h") is not None
+        else "—"
+    )
+    price_header_children = [
+        html.Span(SYMBOL.upper(), className="price-symbol"),
+        html.Strong(format_price(metrics.get("price")), className="price-value"),
+        html.Span(change_text, className=change_24h_class(metrics.get("change_24h"))),
+        html.Div(
+            [
+                html.Span("Bid", className="price-side-label"),
+                html.Strong(format_price(metrics.get("best_bid")), className="price-bid"),
+                html.Span("Ask", className="price-side-label"),
+                html.Strong(format_price(metrics.get("best_ask")), className="price-ask"),
+            ],
+            className="price-book",
+        ),
+    ]
 
     pattern_children = [
         html.Span("Last closed pattern", className="panel-label"),
@@ -752,6 +803,13 @@ def update_dashboard(_: int):
     metrics_children = [
         html.Div(
             [
+                html.Span("Current price", className="metric-label"),
+                html.Strong(format_price(metrics.get("price")), className="metric-price"),
+            ],
+            className="metric metric-price-block",
+        ),
+        html.Div(
+            [
                 html.Span("Spread", className="metric-label"),
                 html.Strong(
                     f"{metrics['spread']:.4f}" if metrics["spread"] is not None else "—"
@@ -802,7 +860,7 @@ def update_dashboard(_: int):
         ),
     ]
 
-    return figure, pattern_children, signal_children, metrics_children
+    return figure, price_header_children, pattern_children, signal_children, metrics_children
 
 
 def start_ws() -> None:

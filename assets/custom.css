@@ -7,7 +7,81 @@
 }
 
 .header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
     margin-bottom: 12px;
+}
+
+.header-copy {
+    min-width: 0;
+}
+
+.price-header {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+    padding: 10px 14px;
+    background: #171a21;
+    border: 1px solid #2a2f3a;
+    border-radius: 10px;
+    min-width: 220px;
+}
+
+.price-symbol {
+    color: #9aa0a6;
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+}
+
+.price-value {
+    font-size: 2rem;
+    line-height: 1.1;
+    font-weight: 700;
+    color: #ffffff;
+}
+
+.price-change-up {
+    color: #00c176;
+    font-size: 0.95rem;
+    font-weight: 600;
+}
+
+.price-change-down {
+    color: #ff4d4f;
+    font-size: 0.95rem;
+    font-weight: 600;
+}
+
+.price-change-neutral {
+    color: #9aa0a6;
+    font-size: 0.95rem;
+    font-weight: 600;
+}
+
+.price-book {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 2px;
+    font-size: 0.85rem;
+}
+
+.price-side-label {
+    color: #7d848f;
+}
+
+.price-bid {
+    color: #00c176;
+    font-weight: 600;
+}
+
+.price-ask {
+    color: #ff4d4f;
+    font-weight: 600;
 }
 
 .title {
@@ -125,6 +199,15 @@
     color: #ffffff;
 }
 
+.metric-price-block {
+    min-width: 130px;
+}
+
+.metric-price {
+    font-size: 1.25rem !important;
+    font-weight: 700;
+}
+
 #live-chart {
     background: #171a21;
     border: 1px solid #2a2f3a;
@@ -133,6 +216,15 @@
 }
 
 @media (max-width: 900px) {
+    .header {
+        flex-direction: column;
+    }
+
+    .price-header {
+        align-items: flex-start;
+        width: 100%;
+    }
+
     .panels {
         grid-template-columns: 1fr;
     }
