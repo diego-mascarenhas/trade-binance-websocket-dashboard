@@ -86,6 +86,7 @@ if _cli_args.symbol:
     logger.info("Symbol %s (CLI overrides .env SYMBOL=%s)", SYMBOL.upper(), _env_symbol.upper())
 INTERVAL = os.getenv("INTERVAL", "1m")
 DEPTH_LEVELS = int(os.getenv("DEPTH_LEVELS", "20"))
+DEPTH_CHART_PADDING_PCT = float(os.getenv("DEPTH_CHART_PADDING_PCT", "0.1"))
 MAX_CANDLES = int(os.getenv("MAX_CANDLES", "200"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "50"))
 MIN_PATTERN_RANGE_PCT = float(os.getenv("MIN_PATTERN_RANGE_PCT", "0.02"))
@@ -1380,6 +1381,23 @@ def depth_category_labels(bids: list[list[float]], asks: list[list[float]]) -> l
     return [price_label(price) for price in prices]
 
 
+def depth_chart_x_range(
+    bids: list[list[float]],
+    asks: list[list[float]],
+    *,
+    padding_pct: float = DEPTH_CHART_PADDING_PCT,
+) -> tuple[float, float] | None:
+    """Symmetric quantity axis so 0 stays centered (← bids | asks →)."""
+    max_bid = max((qty for _, qty in bids), default=0.0)
+    max_ask = max((qty for _, qty in asks), default=0.0)
+    peak = max(max_bid, max_ask)
+    if peak <= 0:
+        return None
+    pad = max(padding_pct, 0.0)
+    limit = peak * (1 + pad)
+    return (-limit, limit)
+
+
 def side_bar_colors(
     levels: list[list[float]],
     wall_price: float | None,
@@ -1813,6 +1831,9 @@ def build_figure() -> go.Figure:
         row=2,
         col=1,
     )
+    depth_x_range = depth_chart_x_range(bids, asks)
+    if depth_x_range:
+        fig.update_xaxes(range=list(depth_x_range), row=2, col=1)
     if depth_labels:
         fig.update_yaxes(
             title_text="Price level",
