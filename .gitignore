@@ -1,8 +1,11 @@
 .env
+.env*
+!.env.example
+.vscode/
 .venv/
 venv/
 __pycache__/
 *.pyc
 .DS_Store
 .pytest_cache/
-logs/
+logs/*
