@@ -330,7 +330,9 @@ def compute_market_analysis(
         "macd_hist": None,
         "fvg": None,
         "fvg_label": "—",
+        "fvg_interval": HTF_INTERVAL,
         "liquidity": "—",
+        "liquidity_interval": INTERVAL,
     }
     if not closed_rows:
         return analysis
@@ -354,19 +356,21 @@ def compute_market_analysis(
     analysis["macd_signal"] = macd_signal
     analysis["macd_hist"] = macd_hist
 
-    fvg = detect_latest_fvg(closed_df)
-    if fvg:
-        analysis["fvg"] = fvg
-        analysis["fvg_label"] = fvg["label"]
-
     analysis["liquidity"] = liquidity_label(closed_df, price)
 
     if htf_closed_rows:
-        htf_bias, htf_fast, htf_slow, htf_trend = compute_htf_bias(pd.DataFrame(htf_closed_rows))
+        htf_df = pd.DataFrame(htf_closed_rows)
+        htf_bias, htf_fast, htf_slow, htf_trend = compute_htf_bias(htf_df)
         analysis["htf_bias"] = htf_bias
         analysis["htf_ema_fast"] = htf_fast
         analysis["htf_ema_slow"] = htf_slow
         analysis["htf_ema_trend"] = htf_trend
+
+        fvg = detect_latest_fvg(htf_df)
+        if fvg:
+            analysis["fvg"] = fvg
+            analysis["fvg_label"] = fvg["label"]
+            analysis["fvg_interval"] = HTF_INTERVAL
 
     return analysis
 
@@ -1477,9 +1481,10 @@ def build_pattern_panel_children(metrics: dict) -> list:
         macd_text = "—"
     children.append(kv_row("MACD", macd_text, badge_class=macd_badge_class(macd_hist)))
 
-    children.append(panel_section("Structure"))
+    children.append(panel_section(f"Structure · {HTF_INTERVAL}"))
     fvg = analysis.get("fvg")
     fvg_label = analysis.get("fvg_label", "—")
+    fvg_interval = analysis.get("fvg_interval", HTF_INTERVAL)
     fvg_class = (
         trend_badge_class("BULLISH")
         if fvg and fvg.get("type") == "BULL"
@@ -1487,8 +1492,11 @@ def build_pattern_panel_children(metrics: dict) -> list:
         if fvg
         else "badge badge-neutral"
     )
-    children.append(kv_row("FVG", fvg_label, badge_class=fvg_class if fvg else "badge badge-neutral"))
-    children.append(kv_row("Liquidity", analysis.get("liquidity", "—"), strong=True))
+    children.append(
+        kv_row(f"FVG ({fvg_interval})", fvg_label, badge_class=fvg_class if fvg else "badge badge-neutral")
+    )
+    liquidity_interval = analysis.get("liquidity_interval", INTERVAL)
+    children.append(kv_row(f"Liquidity ({liquidity_interval})", analysis.get("liquidity", "—"), strong=True))
 
     if metrics.get("require_trend_align"):
         children.append(
