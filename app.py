@@ -294,8 +294,15 @@ def build_figure() -> go.Figure:
                 high=df["h"],
                 low=df["l"],
                 close=df["c"],
-                increasing_line_color="#00c176",
-                decreasing_line_color="#ff4d4f",
+                increasing=dict(
+                    line=dict(color="#00c176", width=0.8),
+                    fillcolor="#00c176",
+                ),
+                decreasing=dict(
+                    line=dict(color="#ff4d4f", width=0.8),
+                    fillcolor="#ff4d4f",
+                ),
+                whiskerwidth=0.2,
                 name=SYMBOL.upper(),
             ),
             row=1,
@@ -303,23 +310,34 @@ def build_figure() -> go.Figure:
         )
 
         closed_df = df[df["x"]] if "x" in df.columns else df.iloc[:-1]
+        pattern_x: list = []
+        pattern_y: list = []
+        pattern_text: list = []
+        pattern_hover: list = []
         for _, row in closed_df.iterrows():
             pattern = detect_pattern(row)
             if pattern:
-                fig.add_trace(
-                    go.Scatter(
-                        x=[row["t"]],
-                        y=[row["c"]],
-                        mode="markers+text",
-                        text=[pattern],
-                        textposition="top center",
-                        marker=dict(size=10, color="gold", symbol="diamond"),
-                        showlegend=False,
-                        hovertemplate=f"{pattern}<br>Close: %{{y}}<extra></extra>",
-                    ),
-                    row=1,
-                    col=1,
-                )
+                pattern_x.append(row["t"])
+                pattern_y.append(row["c"])
+                pattern_text.append(pattern)
+                pattern_hover.append(pattern)
+
+        if pattern_x:
+            fig.add_trace(
+                go.Scatter(
+                    x=pattern_x,
+                    y=pattern_y,
+                    mode="markers+text",
+                    text=pattern_text,
+                    textposition="top center",
+                    marker=dict(size=10, color="gold", symbol="diamond"),
+                    showlegend=False,
+                    hovertemplate="%{customdata}<br>Close: %{y}<extra></extra>",
+                    customdata=pattern_hover,
+                ),
+                row=1,
+                col=1,
+            )
 
     bids = ob["bids"]
     asks = ob["asks"]
@@ -384,6 +402,7 @@ def build_figure() -> go.Figure:
         ],
     )
 
+    fig.update_xaxes(type="date", rangeslider_visible=False, row=1, col=1)
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_xaxes(title_text="Quantity", row=2, col=1)
     fig.update_yaxes(title_text="Price level", row=2, col=1)
