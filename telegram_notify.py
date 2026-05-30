@@ -27,6 +27,8 @@ _trading_paused = False
 _pause_lock = threading.Lock()
 _update_offset = 0
 _listener_stop = threading.Event()
+_shutdown_notified = False
+_shutdown_lock = threading.Lock()
 _polling_conflict_warned = False
 
 
@@ -88,6 +90,10 @@ def position_emoji(direction: str) -> str:
 
 def send_bot(message: str) -> None:
     _send_async(f"🤖 {message}")
+
+
+def send_bot_sync(message: str) -> bool:
+    return _send_sync(f"🤖 {message}")
 
 
 def send_position(direction: str, message: str) -> None:
@@ -179,8 +185,21 @@ def notify_started(
     )
 
 
-def notify_stopped() -> None:
-    send_bot("Dashboard stopped")
+def notify_stopped(symbol: str | None = None) -> None:
+    global _shutdown_notified
+    with _shutdown_lock:
+        if _shutdown_notified:
+            return
+        _shutdown_notified = True
+    label = f" · {symbol.upper()}" if symbol else ""
+    if not send_bot_sync(f"Dashboard stopped{label}"):
+        logger.warning("Telegram stop notification was not delivered")
+
+
+def shutdown(symbol: str | None = None) -> None:
+    """Stop command listener and send stop message once (safe to call multiple times)."""
+    stop_command_listener()
+    notify_stopped(symbol)
 
 
 def _telegram_api_get(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:

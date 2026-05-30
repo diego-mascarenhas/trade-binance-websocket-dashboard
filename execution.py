@@ -59,6 +59,8 @@ EXECUTION_ORDER_COOLDOWN = int(os.getenv("EXECUTION_ORDER_COOLDOWN", "180"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 
 _status_lock = threading.Lock()
+_hedge_mode_lock = threading.Lock()
+_hedge_mode: bool | None = None
 _last_execution_monotonic: float | None = None
 _execution_status: dict[str, Any] = {
     "enabled": EXECUTION_ENABLED,
@@ -104,6 +106,54 @@ def _append_orders_log(event: str, **fields: Any) -> None:
 
 def _keys_configured() -> bool:
     return bool(os.getenv("BINANCE_API_KEY")) and bool(os.getenv("BINANCE_SECRET_KEY"))
+
+
+def _position_mode_from_env() -> bool | None:
+    raw = os.getenv("BINANCE_POSITION_MODE", "").strip().lower()
+    if not raw:
+        return None
+    if raw in ("hedge", "dual", "hedged"):
+        return True
+    if raw in ("oneway", "one-way", "single"):
+        return False
+    logger.warning("Invalid BINANCE_POSITION_MODE=%r — detecting via API", raw)
+    return None
+
+
+def is_hedge_mode() -> bool:
+    """True when Binance Futures account uses dual-side (hedge) position mode."""
+    global _hedge_mode
+    with _hedge_mode_lock:
+        if _hedge_mode is not None:
+            return _hedge_mode
+
+        env_mode = _position_mode_from_env()
+        if env_mode is not None:
+            _hedge_mode = env_mode
+            logger.info("Position mode from env: %s", "hedge" if _hedge_mode else "one-way")
+            return _hedge_mode
+
+        if not _keys_configured():
+            _hedge_mode = False
+            return False
+
+        try:
+            resp = _fapi_request("GET", "/fapi/v1/positionSide/dual", {})
+            _hedge_mode = bool(resp.get("dualSidePosition"))
+            logger.info("Position mode detected: %s", "hedge" if _hedge_mode else "one-way")
+        except RuntimeError as exc:
+            logger.warning("Could not detect position mode (%s); assuming one-way", exc)
+            _hedge_mode = False
+        return _hedge_mode
+
+
+def _apply_position_params(params: dict[str, Any], direction: str, *, reduce_only: bool = False) -> dict[str, Any]:
+    out = dict(params)
+    if is_hedge_mode():
+        out["positionSide"] = "LONG" if direction == "LONG" else "SHORT"
+    elif reduce_only:
+        out["reduceOnly"] = "true"
+    return out
 
 
 def _sign_query(params: dict[str, Any]) -> str:
@@ -279,15 +329,18 @@ def _set_leverage(symbol: str) -> int:
 
 def _place_limit_entry(symbol: str, direction: str, price: str, quantity: str) -> dict[str, Any]:
     side = "BUY" if direction == "LONG" else "SELL"
-    params = {
-        "symbol": symbol.upper(),
-        "side": side,
-        "type": "LIMIT",
-        "timeInForce": "GTC",
-        "quantity": quantity,
-        "price": price,
-        "newClientOrderId": f"dash_{int(time.time())}"[:36],
-    }
+    params = _apply_position_params(
+        {
+            "symbol": symbol.upper(),
+            "side": side,
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "quantity": quantity,
+            "price": price,
+            "newClientOrderId": f"dash_{int(time.time())}"[:36],
+        },
+        direction,
+    )
     return _fapi_request("POST", "/fapi/v1/order", params)
 
 
@@ -306,47 +359,56 @@ def _wait_limit_fill(symbol: str, order_id: int, timeout_sec: int) -> str | None
 
 def _place_stop_loss(symbol: str, direction: str, stop_price: str, quantity: str) -> dict[str, Any]:
     side = "SELL" if direction == "LONG" else "BUY"
-    params = {
-        "symbol": symbol.upper(),
-        "algoType": "CONDITIONAL",
-        "side": side,
-        "type": "STOP_MARKET",
-        "triggerPrice": stop_price,
-        "quantity": quantity,
-        "reduceOnly": "true",
-        "workingType": "CONTRACT_PRICE",
-    }
+    params = _apply_position_params(
+        {
+            "symbol": symbol.upper(),
+            "algoType": "CONDITIONAL",
+            "side": side,
+            "type": "STOP_MARKET",
+            "triggerPrice": stop_price,
+            "quantity": quantity,
+            "workingType": "CONTRACT_PRICE",
+        },
+        direction,
+        reduce_only=True,
+    )
     return _fapi_request("POST", "/fapi/v1/algoOrder", params)
 
 
 def _place_take_profit_fixed(symbol: str, direction: str, tp_price: str, quantity: str) -> dict[str, Any]:
     side = "SELL" if direction == "LONG" else "BUY"
-    params = {
-        "symbol": symbol.upper(),
-        "algoType": "CONDITIONAL",
-        "side": side,
-        "type": "TAKE_PROFIT_MARKET",
-        "triggerPrice": tp_price,
-        "quantity": quantity,
-        "reduceOnly": "true",
-        "workingType": "CONTRACT_PRICE",
-    }
+    params = _apply_position_params(
+        {
+            "symbol": symbol.upper(),
+            "algoType": "CONDITIONAL",
+            "side": side,
+            "type": "TAKE_PROFIT_MARKET",
+            "triggerPrice": tp_price,
+            "quantity": quantity,
+            "workingType": "CONTRACT_PRICE",
+        },
+        direction,
+        reduce_only=True,
+    )
     return _fapi_request("POST", "/fapi/v1/algoOrder", params)
 
 
 def _place_trailing_tp(symbol: str, direction: str, activation_price: str, quantity: str) -> dict[str, Any]:
     side = "SELL" if direction == "LONG" else "BUY"
-    params = {
-        "symbol": symbol.upper(),
-        "algoType": "CONDITIONAL",
-        "side": side,
-        "type": "TRAILING_STOP_MARKET",
-        "activatePrice": activation_price,
-        "callbackRate": TP_TRAILING_CALLBACK_RATE,
-        "quantity": quantity,
-        "reduceOnly": "true",
-        "workingType": "CONTRACT_PRICE",
-    }
+    params = _apply_position_params(
+        {
+            "symbol": symbol.upper(),
+            "algoType": "CONDITIONAL",
+            "side": side,
+            "type": "TRAILING_STOP_MARKET",
+            "activatePrice": activation_price,
+            "callbackRate": TP_TRAILING_CALLBACK_RATE,
+            "quantity": quantity,
+            "workingType": "CONTRACT_PRICE",
+        },
+        direction,
+        reduce_only=True,
+    )
     return _fapi_request("POST", "/fapi/v1/algoOrder", params)
 
 
@@ -462,6 +524,7 @@ def _execute_open(
     try:
         applied_lev = _set_leverage(symbol)
         payload["leverage"] = applied_lev
+        payload["hedge_mode"] = is_hedge_mode()
         response = _place_limit_entry(symbol, direction, price_str, qty)
         order_id = response.get("orderId")
         _append_orders_log("live_open", orderId=order_id, **payload)
@@ -484,7 +547,7 @@ def _execute_open(
         if order_id is not None:
             _place_sl_tp_after_fill(symbol, direction, sl, tp, qty, int(order_id))
     except RuntimeError as exc:
-        logger.exception("Order failed for %s", symbol)
+        logger.error("Order failed for %s: %s", symbol, exc)
         _append_orders_log("live_open_failed", symbol=symbol, error=str(exc), **payload)
         _set_status(message=f"Order failed: {exc}", last_event="error")
         telegram.notify_order_failed(symbol, direction)
@@ -500,8 +563,23 @@ def try_execute_valid_entry(
 ) -> None:
     """Fire-and-forget execution when dashboard records a valid entry."""
     if not EXECUTION_ENABLED or telegram.is_trading_paused():
+        _append_orders_log(
+            "skip_disabled",
+            symbol=symbol.upper(),
+            signal=signal,
+            execution_enabled=EXECUTION_ENABLED,
+            trading_paused=telegram.is_trading_paused(),
+        )
         return
     if entry is None or not trade_plan or not trade_plan.get("active"):
+        _append_orders_log(
+            "skip_no_plan",
+            symbol=symbol.upper(),
+            signal=signal,
+            entry=entry,
+            has_trade_plan=trade_plan is not None,
+            trade_plan_active=bool(trade_plan and trade_plan.get("active")),
+        )
         return
 
     global _last_execution_monotonic
@@ -516,6 +594,7 @@ def try_execute_valid_entry(
     sl = float(trade_plan.get("sl", 0))
     tp = float(trade_plan.get("tp1", 0))
     if sl <= 0 or tp <= 0:
+        _append_orders_log("skip_invalid_sl_tp", symbol=symbol.upper(), signal=signal, sl=sl, tp=tp)
         return
 
     legs = trade_plan.get("legs") or []

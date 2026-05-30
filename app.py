@@ -1,8 +1,10 @@
 import argparse
 import asyncio
+import atexit
 import json
 import logging
 import os
+import signal
 import socket
 import time
 from collections import deque
@@ -872,8 +874,26 @@ def apply_signal_debounce(
             trend_bias=trend_bias,
         )
         if is_tradable_signal(candidate, confidence):
+            effective_plan = trade_plan
+            if not effective_plan or not effective_plan.get("active"):
+                closed_rows = [row for row in candles if row.get("x")]
+                htf_closed_rows = [row for row in htf_candles if row.get("x")]
+                price = latest_price or entry
+                analysis = compute_market_analysis(closed_rows, htf_closed_rows, price)
+                effective_plan = compute_trade_plan(
+                    candidate,
+                    confidence,
+                    entry,
+                    support,
+                    resistance,
+                    price,
+                    analysis,
+                    MIN_CONFIDENCE,
+                )
+                if not effective_plan.get("active"):
+                    effective_plan = None
             record_valid_entry(
-                candidate, entry, confidence, reasons, candle_time, trend_bias, trade_plan
+                candidate, entry, confidence, reasons, candle_time, trend_bias, effective_plan
             )
         stable_signal_dir = candidate
 
@@ -1022,7 +1042,7 @@ def update_trading_signal(
     analysis = compute_market_analysis(closed_rows, htf_closed_rows, current_price)
     current_plan = compute_trade_plan(
         candidate if candidate in ("LONG", "SHORT") else stable_signal_dir,
-        confidence if pending_signal_count >= SIGNAL_DEBOUNCE_COUNT else signal_confidence,
+        confidence if pending_signal_count >= SIGNAL_DEBOUNCE_COUNT - 1 else signal_confidence,
         entry if entry is not None else signal_entry,
         support,
         resistance,
@@ -2343,10 +2363,22 @@ def run_server() -> None:
         ui_enabled,
         INTERVAL,
     )
+    if execution.EXECUTION_ENABLED and execution.EXECUTION_MODE == "live":
+        mode = "hedge" if execution.is_hedge_mode() else "one-way"
+        logger.info("Execution live · Binance position mode: %s", mode)
+
+    def _request_shutdown(signum: int | None = None, _frame=None) -> None:
+        if signum is not None:
+            logger.info("Shutdown signal received (%s)", signum)
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _request_shutdown)
+    signal.signal(signal.SIGTERM, _request_shutdown)
+    atexit.register(lambda: telegram.shutdown(SYMBOL))
 
     try:
         if ui_enabled:
-            app.run(debug=False, host=DASH_HOST, port=DASH_PORT)
+            app.run(debug=False, host=DASH_HOST, port=DASH_PORT, use_reloader=False)
         else:
             logger.warning(
                 "Port %s already in use — skipping Dash UI; websocket and execution continue",
@@ -2357,8 +2389,7 @@ def run_server() -> None:
     except KeyboardInterrupt:
         logger.info("Shutting down")
     finally:
-        telegram.stop_command_listener()
-        telegram.notify_stopped()
+        telegram.shutdown(SYMBOL)
 
 
 if __name__ == "__main__":

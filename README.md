@@ -12,14 +12,29 @@ Optional **order execution** sends **Binance Futures** LIMIT entries (with SL/TP
 
 ## Installation
 
+Use a **virtual environment** (`.venv/`). Project dependencies (`pandas`, `dash`, etc.) are installed **inside** that folder, not in the system Python.
+
+| Command | Result |
+| -------- | ------ |
+| `python3 app.py` (no venv) | Often fails with `ModuleNotFoundError: No module named 'pandas'` |
+| `source .venv/bin/activate` then `python app.py` | Correct |
+
 ```bash
 git clone <your-repo> trade-binance-websocket-dashboard
 cd trade-binance-websocket-dashboard
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install --upgrade pip
 pip install -r requirements.txt
 cp .env.example .env
 # Edit .env if needed (`.env` is gitignored; see `.env.example` for all defaults)
+```
+
+Check the venv is active — the prompt should show `(.venv)` and:
+
+```bash
+which python
+# .../trade-binance-websocket-dashboard/.venv/bin/python
 ```
 
 ## Usage
@@ -68,6 +83,57 @@ Telegram commands (same chat as `TELEGRAM_CHAT_ID` only):
 **Note:** Several scripts may **send** alerts with the same `TELEGRAM_BOT_TOKEN` (e.g. this dashboard + order-blocks bot). That is fine. Only **one** process may **poll** `getUpdates` for commands; if you see `409 Conflict`, stop the other poller or use a separate bot token for commands.
 
 The app loads historical klines via REST, then keeps the order book in sync using Binance’s depth snapshot + incremental updates. It also streams `@miniTicker` for 24h change and computes **order-block signal + confidence** (support/resistance walls, zone position, and fallback 24h rules). With `EXECUTION_ENABLED=true`, confirmed valid entries can open **Futures** positions (dry-run or live). The UI refreshes every 1.5s.
+
+## Ubuntu / VPS (e.g. Forge, Sleipnir)
+
+**First time** on the server:
+
+```bash
+cd ~/scripts/trade-binance-websocket-dashboard   # or your deploy path
+
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+
+cp .env.example .env
+nano .env   # TELEGRAM, BINANCE keys, EXECUTION_*, etc.
+```
+
+**Every time** you start the bot (SSH session):
+
+```bash
+cd ~/scripts/trade-binance-websocket-dashboard
+source .venv/bin/activate
+python app.py DOGEUSDT --port 8051
+```
+
+Use `python` from the venv, **not** bare `python3 app.py` from the system.
+
+### Keep running after SSH disconnect
+
+```bash
+source .venv/bin/activate
+screen -S dashboard
+python app.py DOGEUSDT --port 8051
+# Detach: Ctrl+A, then D
+# Reattach later: screen -r dashboard
+```
+
+Headless (no browser needed): the bot still streams data and can place orders; open the UI only if you need charts (`http://your-server-ip:8051`).
+
+### Telegram on the VPS
+
+Alerts use outbound HTTPS to `api.telegram.org`. Test from the server:
+
+```bash
+curl -s --max-time 5 "https://api.telegram.org"
+```
+
+If that times out, fix firewall/DNS — **trades on Binance still work**; only Telegram alerts/commands are affected.
 
 ## Hosting
 
