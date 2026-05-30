@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections import deque
 from threading import Lock, Thread
 
@@ -31,6 +32,18 @@ SIGNAL_ZONE_SHORT_ENTER = float(os.getenv("SIGNAL_ZONE_SHORT_ENTER", "80"))
 SIGNAL_ZONE_SHORT_EXIT = float(os.getenv("SIGNAL_ZONE_SHORT_EXIT", "65"))
 SIGNAL_DEBOUNCE_COUNT = int(os.getenv("SIGNAL_DEBOUNCE_COUNT", "5"))
 MAX_ENTRY_MARKERS = int(os.getenv("MAX_ENTRY_MARKERS", "50"))
+HTF_INTERVAL = os.getenv("HTF_INTERVAL", "15m")
+HTF_CANDLES = int(os.getenv("HTF_CANDLES", "120"))
+REQUIRE_TREND_ALIGN = os.getenv("REQUIRE_TREND_ALIGN", "true").lower() in ("1", "true", "yes")
+SIGNAL_COOLDOWN_SEC = int(os.getenv("SIGNAL_COOLDOWN_SEC", "180"))
+EMA_FAST = int(os.getenv("EMA_FAST", "9"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
+HTF_EMA_TREND = int(os.getenv("HTF_EMA_TREND", "50"))
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+MACD_FAST = int(os.getenv("MACD_FAST", "12"))
+MACD_SLOW = int(os.getenv("MACD_SLOW", "26"))
+MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", "9"))
+SWING_LOOKBACK = int(os.getenv("SWING_LOOKBACK", "20"))
 DASH_HOST = os.getenv("DASH_HOST", "0.0.0.0")
 DASH_PORT = int(os.getenv("DASH_PORT", "8050"))
 
@@ -39,7 +52,10 @@ WS_BASE = "wss://stream.binance.com:9443"
 
 state_lock = Lock()
 candles: deque = deque(maxlen=MAX_CANDLES)
+htf_candles: deque = deque(maxlen=HTF_CANDLES)
 forming_candle: dict | None = None
+htf_forming_candle: dict | None = None
+last_valid_entry_monotonic: float | None = None
 orderbook: dict = {"bids": [], "asks": []}
 analysis_orderbook: dict = {"bids": [], "asks": []}
 latest_pattern = "None"
@@ -189,6 +205,172 @@ def pattern_marker_label(pattern: str, signal_dir: str, confidence: int) -> str:
     return f"{pattern} · {signal_dir} {confidence}%"
 
 
+def compute_ema(values: pd.Series, period: int) -> pd.Series:
+    return values.ewm(span=period, adjust=False).mean()
+
+
+def compute_rsi(closes: pd.Series, period: int = RSI_PERIOD) -> float | None:
+    if len(closes) < period + 1:
+        return None
+    delta = closes.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, 1e-12)
+    rsi = 100 - (100 / (1 + rs))
+    return float(rsi.iloc[-1])
+
+
+def compute_macd_values(
+    closes: pd.Series,
+    fast: int = MACD_FAST,
+    slow: int = MACD_SLOW,
+    signal_period: int = MACD_SIGNAL,
+) -> tuple[float | None, float | None, float | None]:
+    if len(closes) < slow + signal_period:
+        return None, None, None
+    ema_fast = compute_ema(closes, fast)
+    ema_slow = compute_ema(closes, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = compute_ema(macd_line, signal_period)
+    histogram = macd_line - signal_line
+    return float(macd_line.iloc[-1]), float(signal_line.iloc[-1]), float(histogram.iloc[-1])
+
+
+def detect_latest_fvg(closed_df: pd.DataFrame) -> dict | None:
+    if len(closed_df) < 3:
+        return None
+    for index in range(len(closed_df) - 1, 1, -1):
+        first = closed_df.iloc[index - 2]
+        third = closed_df.iloc[index]
+        if float(first["h"]) < float(third["l"]):
+            gap_low = float(first["h"])
+            gap_high = float(third["l"])
+            return {
+                "type": "BULL",
+                "low": gap_low,
+                "high": gap_high,
+                "label": f"Bull {gap_low:,.2f}–{gap_high:,.2f}",
+            }
+        if float(first["l"]) > float(third["h"]):
+            gap_low = float(third["h"])
+            gap_high = float(first["l"])
+            return {
+                "type": "BEAR",
+                "low": gap_low,
+                "high": gap_high,
+                "label": f"Bear {gap_low:,.2f}–{gap_high:,.2f}",
+            }
+    return None
+
+
+def liquidity_label(closed_df: pd.DataFrame, price: float | None, lookback: int = SWING_LOOKBACK) -> str:
+    if closed_df.empty or price is None or len(closed_df) < 3:
+        return "—"
+    window = closed_df.tail(lookback)
+    swing_high = float(window["h"].max())
+    swing_low = float(window["l"].min())
+    tolerance = price * 0.00035
+    if abs(price - swing_high) <= tolerance:
+        return "At swing high"
+    if abs(price - swing_low) <= tolerance:
+        return "At swing low"
+    last = closed_df.iloc[-1]
+    prev = closed_df.iloc[-2]
+    if float(last["l"]) < float(prev["l"]) and float(last["c"]) > float(prev["l"]):
+        return "Sweep low"
+    if float(last["h"]) > float(prev["h"]) and float(last["c"]) < float(prev["h"]):
+        return "Sweep high"
+    return "Mid range"
+
+
+def compute_htf_bias(htf_closed_df: pd.DataFrame) -> tuple[str, float | None, float | None, float | None]:
+    if len(htf_closed_df) < HTF_EMA_TREND + 2:
+        return "NEUTRAL", None, None, None
+    closes = htf_closed_df["c"].astype(float)
+    ema_fast = float(compute_ema(closes, EMA_FAST).iloc[-1])
+    ema_slow = float(compute_ema(closes, EMA_SLOW).iloc[-1])
+    ema_trend = float(compute_ema(closes, HTF_EMA_TREND).iloc[-1])
+    close = float(closes.iloc[-1])
+    if close > ema_trend and ema_fast > ema_slow:
+        return "BULLISH", ema_fast, ema_slow, ema_trend
+    if close < ema_trend and ema_fast < ema_slow:
+        return "BEARISH", ema_fast, ema_slow, ema_trend
+    return "NEUTRAL", ema_fast, ema_slow, ema_trend
+
+
+def signal_aligned_with_trend(signal: str, trend_bias: str) -> bool:
+    if not REQUIRE_TREND_ALIGN or trend_bias == "NEUTRAL":
+        return True
+    if signal == "LONG" and trend_bias == "BULLISH":
+        return True
+    if signal == "SHORT" and trend_bias == "BEARISH":
+        return True
+    return False
+
+
+def compute_market_analysis(
+    closed_rows: list[dict],
+    htf_closed_rows: list[dict],
+    price: float | None,
+) -> dict:
+    analysis = {
+        "htf_interval": HTF_INTERVAL,
+        "htf_bias": "NEUTRAL",
+        "htf_ema_fast": None,
+        "htf_ema_slow": None,
+        "htf_ema_trend": None,
+        "ema_fast": None,
+        "ema_slow": None,
+        "ema_cross": "—",
+        "rsi": None,
+        "macd": None,
+        "macd_signal": None,
+        "macd_hist": None,
+        "fvg": None,
+        "fvg_label": "—",
+        "liquidity": "—",
+    }
+    if not closed_rows:
+        return analysis
+
+    closed_df = pd.DataFrame(closed_rows)
+    closes = closed_df["c"].astype(float)
+
+    if len(closes) >= EMA_SLOW + 2:
+        analysis["ema_fast"] = float(compute_ema(closes, EMA_FAST).iloc[-1])
+        analysis["ema_slow"] = float(compute_ema(closes, EMA_SLOW).iloc[-1])
+        if analysis["ema_fast"] > analysis["ema_slow"]:
+            analysis["ema_cross"] = "Bull cross"
+        elif analysis["ema_fast"] < analysis["ema_slow"]:
+            analysis["ema_cross"] = "Bear cross"
+        else:
+            analysis["ema_cross"] = "Flat"
+
+    analysis["rsi"] = compute_rsi(closes, RSI_PERIOD)
+    macd, macd_signal, macd_hist = compute_macd_values(closes)
+    analysis["macd"] = macd
+    analysis["macd_signal"] = macd_signal
+    analysis["macd_hist"] = macd_hist
+
+    fvg = detect_latest_fvg(closed_df)
+    if fvg:
+        analysis["fvg"] = fvg
+        analysis["fvg_label"] = fvg["label"]
+
+    analysis["liquidity"] = liquidity_label(closed_df, price)
+
+    if htf_closed_rows:
+        htf_bias, htf_fast, htf_slow, htf_trend = compute_htf_bias(pd.DataFrame(htf_closed_rows))
+        analysis["htf_bias"] = htf_bias
+        analysis["htf_ema_fast"] = htf_fast
+        analysis["htf_ema_slow"] = htf_slow
+        analysis["htf_ema_trend"] = htf_trend
+
+    return analysis
+
+
 def format_price(price: float | None) -> str:
     if price is None:
         return "—"
@@ -301,9 +483,22 @@ def record_valid_entry(
     confidence: int,
     reasons: str,
     candle_time,
+    trend_bias: str,
 ) -> None:
+    global last_valid_entry_monotonic
+
     if not is_tradable_signal(signal, confidence) or entry is None or candle_time is None:
         return
+    if not signal_aligned_with_trend(signal, trend_bias):
+        return
+
+    now = time.monotonic()
+    if (
+        last_valid_entry_monotonic is not None
+        and now - last_valid_entry_monotonic < SIGNAL_COOLDOWN_SEC
+    ):
+        return
+
     if valid_entries:
         last = valid_entries[-1]
         if last["t"] == candle_time and last["signal"] == signal:
@@ -311,6 +506,7 @@ def record_valid_entry(
             last["confidence"] = confidence
             last["reasons"] = reasons
             return
+
     valid_entries.append(
         {
             "t": candle_time,
@@ -320,6 +516,7 @@ def record_valid_entry(
             "reasons": reasons,
         }
     )
+    last_valid_entry_monotonic = now
 
 
 def apply_signal_debounce(
@@ -328,6 +525,7 @@ def apply_signal_debounce(
     reasons: str,
     entry: float | None,
     candle_time,
+    trend_bias: str,
 ) -> None:
     global stable_signal_dir, pending_signal, pending_signal_count
     global signal_dir, signal_confidence, signal_reasons, signal_entry
@@ -340,7 +538,7 @@ def apply_signal_debounce(
 
     if pending_signal_count >= SIGNAL_DEBOUNCE_COUNT and candidate != stable_signal_dir:
         if is_tradable_signal(candidate, confidence):
-            record_valid_entry(candidate, entry, confidence, reasons, candle_time)
+            record_valid_entry(candidate, entry, confidence, reasons, candle_time, trend_bias)
         stable_signal_dir = candidate
 
     signal_dir = stable_signal_dir
@@ -483,7 +681,17 @@ def update_trading_signal(
         zone_position_pct = None
 
     candle_time = forming_candle["t"] if forming_candle else None
-    apply_signal_debounce(candidate, confidence, reasons, entry, candle_time)
+    closed_rows = [row for row in candles if row.get("x")]
+    htf_closed_rows = [row for row in htf_candles if row.get("x")]
+    analysis = compute_market_analysis(closed_rows, htf_closed_rows, current_price)
+    apply_signal_debounce(
+        candidate,
+        confidence,
+        reasons,
+        entry,
+        candle_time,
+        analysis.get("htf_bias", "NEUTRAL"),
+    )
 
 
 def update_metrics(
@@ -542,12 +750,17 @@ async def fetch_24h_ticker(session: aiohttp.ClientSession) -> float | None:
         return None
 
 
-async def fetch_historical_klines(session: aiohttp.ClientSession) -> list[dict]:
+async def fetch_historical_klines(
+    session: aiohttp.ClientSession,
+    interval: str = INTERVAL,
+    limit: int | None = None,
+) -> list[dict]:
     url = f"{REST_BASE}/api/v3/klines"
+    candle_limit = limit if limit is not None else min(MAX_CANDLES, 500)
     params = {
         "symbol": SYMBOL.upper(),
-        "interval": INTERVAL,
-        "limit": min(MAX_CANDLES, 500),
+        "interval": interval,
+        "limit": candle_limit,
     }
     async with session.get(url, params=params, timeout=10) as resp:
         resp.raise_for_status()
@@ -596,19 +809,22 @@ async def sync_orderbook(session: aiohttp.ClientSession, depth_buffer: list[dict
 
 
 async def ws_loop() -> None:
-    global forming_candle, latest_price, orderbook, ws_status, change_24h
+    global forming_candle, htf_forming_candle, latest_price, orderbook, ws_status, change_24h
 
     depth_buffer: list[dict] = []
     stream_url = (
         f"{WS_BASE}/stream?streams="
-        f"{SYMBOL}@kline_{INTERVAL}/{SYMBOL}@depth@100ms/{SYMBOL}@miniTicker"
+        f"{SYMBOL}@kline_{INTERVAL}/{SYMBOL}@kline_{HTF_INTERVAL}/"
+        f"{SYMBOL}@depth@100ms/{SYMBOL}@miniTicker"
     )
 
     async with aiohttp.ClientSession() as session:
-        history = await fetch_historical_klines(session)
+        history = await fetch_historical_klines(session, INTERVAL, min(MAX_CANDLES, 500))
+        htf_history = await fetch_historical_klines(session, HTF_INTERVAL, min(HTF_CANDLES, 500))
         initial_change = await fetch_24h_ticker(session)
         with state_lock:
             candles.extend(history)
+            htf_candles.extend(htf_history)
             if initial_change is not None:
                 change_24h = initial_change
 
@@ -642,19 +858,28 @@ async def ws_loop() -> None:
                         if "k" in data:
                             k = data["k"]
                             row = kline_row(k)
-                            latest_price = row["c"]
+                            interval = k.get("i", INTERVAL)
 
                             with state_lock:
-                                forming_candle = row
-                                if row["x"]:
-                                    candles.append(row)
-                                if orderbook.get("bids") and orderbook.get("asks"):
-                                    update_metrics(
-                                        orderbook["bids"],
-                                        orderbook["asks"],
-                                        analysis_orderbook.get("bids"),
-                                        analysis_orderbook.get("asks"),
-                                    )
+                                if interval == HTF_INTERVAL:
+                                    htf_forming_candle = row
+                                    if row["x"]:
+                                        if htf_candles and htf_candles[-1]["t"] == row["t"]:
+                                            htf_candles[-1] = row
+                                        else:
+                                            htf_candles.append(row)
+                                elif interval == INTERVAL:
+                                    latest_price = row["c"]
+                                    forming_candle = row
+                                    if row["x"]:
+                                        candles.append(row)
+                                    if orderbook.get("bids") and orderbook.get("asks"):
+                                        update_metrics(
+                                            orderbook["bids"],
+                                            orderbook["asks"],
+                                            analysis_orderbook.get("bids"),
+                                            analysis_orderbook.get("asks"),
+                                        )
 
                         elif data.get("e") == "24hrMiniTicker" or msg.get("stream", "").endswith("@miniTicker"):
                             pct_raw = data.get("P")
@@ -717,8 +942,10 @@ def get_candles_df() -> pd.DataFrame:
             rows = rows[:-1] + [forming_candle.copy()]
 
         closed_rows = [row for row in candles if row.get("x")]
+        htf_closed_rows = [row for row in htf_candles if row.get("x")]
         confirmed = resolve_confirmed_pattern(closed_rows)
         latest_pattern = confirmed or "None"
+        market_analysis = compute_market_analysis(closed_rows, htf_closed_rows, latest_price)
 
         ob = {
             "bids": list(orderbook.get("bids", [])),
@@ -752,6 +979,9 @@ def get_candles_df() -> pd.DataFrame:
             "pending_signal": pending_signal,
             "pending_signal_count": pending_signal_count,
             "signal_debounce_count": SIGNAL_DEBOUNCE_COUNT,
+            "market_analysis": market_analysis,
+            "require_trend_align": REQUIRE_TREND_ALIGN,
+            "signal_cooldown_sec": SIGNAL_COOLDOWN_SEC,
         }
 
     return pd.DataFrame(rows), ob, metrics
@@ -1157,6 +1387,166 @@ def build_figure() -> go.Figure:
     return fig
 
 
+def trend_badge_class(bias: str) -> str:
+    if bias == "BULLISH":
+        return "badge badge-bull"
+    if bias == "BEARISH":
+        return "badge badge-bear"
+    return "badge badge-neutral"
+
+
+def rsi_badge_class(rsi: float | None) -> str:
+    if rsi is None:
+        return "badge badge-neutral"
+    if rsi >= 70:
+        return "badge badge-bear"
+    if rsi <= 30:
+        return "badge badge-bull"
+    return "badge badge-neutral"
+
+
+def macd_badge_class(histogram: float | None) -> str:
+    if histogram is None:
+        return "badge badge-neutral"
+    if histogram > 0:
+        return "badge badge-bull"
+    if histogram < 0:
+        return "badge badge-bear"
+    return "badge badge-neutral"
+
+
+def build_pattern_panel_children(metrics: dict) -> list:
+    analysis = metrics.get("market_analysis") or {}
+    children: list = [
+        html.Div(
+            [
+                html.Span("Confirmed pattern", className="panel-label"),
+                html.Span(metrics["pattern"], className=pattern_badge_class(metrics["pattern"])),
+            ],
+            className="analysis-row",
+        ),
+    ]
+
+    if metrics["pattern"] == "None":
+        children.append(
+            html.P(
+                f"Hammer→LONG · Star→SHORT · conf≥{metrics.get('min_confidence', MIN_CONFIDENCE)}%",
+                className="panel-hint",
+            )
+        )
+    else:
+        children.append(
+            html.Div(
+                [
+                    html.Span(
+                        f"{metrics.get('signal')} {metrics.get('confidence')}%",
+                        className=confidence_badge_class(
+                            metrics.get("confidence", 0),
+                            metrics.get("min_confidence", MIN_CONFIDENCE),
+                        ),
+                    ),
+                ],
+                className="analysis-row",
+            )
+        )
+
+    children.append(html.Div(className="analysis-divider"))
+    children.append(
+        html.Span(f"Market context · {INTERVAL}", className="panel-label analysis-heading")
+    )
+
+    htf_interval = analysis.get("htf_interval", HTF_INTERVAL)
+    htf_bias = analysis.get("htf_bias", "NEUTRAL")
+    children.append(
+        html.Div(
+            [
+                html.Span(f"HTF ({htf_interval})", className="panel-label"),
+                html.Span(htf_bias, className=trend_badge_class(htf_bias)),
+            ],
+            className="analysis-row",
+        )
+    )
+
+    ema_fast = analysis.get("ema_fast")
+    ema_slow = analysis.get("ema_slow")
+    ema_text = (
+        f"{format_price(ema_fast)} / {format_price(ema_slow)}"
+        if ema_fast is not None and ema_slow is not None
+        else "—"
+    )
+    children.append(
+        html.Div(
+            [
+                html.Span(f"EMA {EMA_FAST}/{EMA_SLOW}", className="panel-label"),
+                html.Strong(ema_text, className="analysis-value"),
+                html.Span(analysis.get("ema_cross", "—"), className="panel-hint"),
+            ],
+            className="analysis-row",
+        )
+    )
+
+    rsi = analysis.get("rsi")
+    rsi_text = f"{rsi:.1f}" if rsi is not None else "—"
+    children.append(
+        html.Div(
+            [
+                html.Span(f"RSI ({RSI_PERIOD})", className="panel-label"),
+                html.Span(rsi_text, className=rsi_badge_class(rsi)),
+            ],
+            className="analysis-row",
+        )
+    )
+
+    macd = analysis.get("macd")
+    macd_hist = analysis.get("macd_hist")
+    if macd is not None and macd_hist is not None:
+        macd_text = f"{macd:.2f} · hist {macd_hist:+.2f}"
+    else:
+        macd_text = "—"
+    children.append(
+        html.Div(
+            [
+                html.Span("MACD", className="panel-label"),
+                html.Span(macd_text, className=macd_badge_class(macd_hist)),
+            ],
+            className="analysis-row",
+        )
+    )
+
+    fvg = analysis.get("fvg")
+    fvg_label = analysis.get("fvg_label", "—")
+    fvg_class = trend_badge_class("BULLISH" if fvg and fvg.get("type") == "BULL" else "BEARISH" if fvg else "NEUTRAL")
+    children.append(
+        html.Div(
+            [
+                html.Span("FVG", className="panel-label"),
+                html.Span(fvg_label, className=fvg_class if fvg else "badge badge-neutral"),
+            ],
+            className="analysis-row",
+        )
+    )
+
+    children.append(
+        html.Div(
+            [
+                html.Span("Liquidity", className="panel-label"),
+                html.Strong(analysis.get("liquidity", "—"), className="analysis-value"),
+            ],
+            className="analysis-row",
+        )
+    )
+
+    if metrics.get("require_trend_align"):
+        children.append(
+            html.P(
+                f"Valid entries need HTF trend · cooldown {metrics.get('signal_cooldown_sec', SIGNAL_COOLDOWN_SEC)}s",
+                className="panel-hint",
+            )
+        )
+
+    return children
+
+
 def pattern_badge_class(pattern: str) -> str:
     if pattern == "Hammer":
         return "badge badge-bull"
@@ -1205,7 +1595,7 @@ app.layout = html.Div(
         ),
         html.Div(
             [
-                html.Div(id="pattern-panel", className="panel"),
+                html.Div(id="pattern-panel", className="panel panel-pattern"),
                 html.Div(id="signal-panel", className="panel panel-signal"),
                 html.Div(id="metrics-panel", className="panel panel-metrics"),
             ],
@@ -1250,30 +1640,7 @@ def update_dashboard(_: int):
         ),
     ]
 
-    pattern_children = [
-        html.Span("Confirmed pattern", className="panel-label"),
-        html.Span(
-            metrics["pattern"],
-            className=pattern_badge_class(metrics["pattern"]),
-        ),
-    ]
-    if metrics["pattern"] == "None":
-        pattern_children.append(
-            html.Span(
-                f"Hammer→LONG · Star→SHORT · conf≥{metrics.get('min_confidence', MIN_CONFIDENCE)}%",
-                className="panel-hint",
-            )
-        )
-    else:
-        pattern_children.append(
-            html.Span(
-                f"{metrics.get('signal')} {metrics.get('confidence')}%",
-                className=confidence_badge_class(
-                    metrics.get("confidence", 0),
-                    metrics.get("min_confidence", MIN_CONFIDENCE),
-                ),
-            )
-        )
+    pattern_children = build_pattern_panel_children(metrics)
 
     signal = metrics.get("signal", "NEUTRAL")
     confidence = metrics.get("confidence", 0)

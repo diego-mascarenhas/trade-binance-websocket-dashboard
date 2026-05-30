@@ -98,7 +98,7 @@
 
 .panels {
     display: grid;
-    grid-template-columns: 220px minmax(320px, 1.2fr) minmax(280px, 1fr);
+    grid-template-columns: minmax(240px, 260px) minmax(320px, 1.2fr) minmax(280px, 1fr);
     gap: 12px;
     margin-bottom: 12px;
 }
@@ -112,6 +112,37 @@
     align-items: center;
     gap: 10px;
     flex-wrap: wrap;
+}
+
+.panel-pattern {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+}
+
+.analysis-heading {
+    width: 100%;
+    margin-top: 2px;
+}
+
+.analysis-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    flex-wrap: wrap;
+}
+
+.analysis-value {
+    font-size: 0.85rem;
+    color: #ffffff;
+}
+
+.analysis-divider {
+    width: 100%;
+    border-top: 1px solid #2a2f3a;
+    margin: 4px 0 2px;
 }
 
 .panel-signal {
