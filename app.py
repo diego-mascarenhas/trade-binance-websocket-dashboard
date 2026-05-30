@@ -22,6 +22,7 @@ SYMBOL = os.getenv("SYMBOL", "btcusdt").lower()
 INTERVAL = os.getenv("INTERVAL", "1m")
 DEPTH_LEVELS = int(os.getenv("DEPTH_LEVELS", "20"))
 MAX_CANDLES = int(os.getenv("MAX_CANDLES", "200"))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "50"))
 DASH_HOST = os.getenv("DASH_HOST", "0.0.0.0")
 DASH_PORT = int(os.getenv("DASH_PORT", "8050"))
 
@@ -40,6 +41,14 @@ volume_delta: float | None = None
 bid_volume: float = 0.0
 ask_volume: float = 0.0
 ws_status = "connecting"
+support: float | None = None
+resistance: float | None = None
+signal_dir = "NEUTRAL"
+signal_confidence = 0
+signal_reasons = ""
+signal_entry: float | None = None
+zone_position_pct: float | None = None
+change_24h: float | None = None
 
 
 def detect_pattern(row: pd.Series) -> str | None:
@@ -99,6 +108,125 @@ def trim_orderbook(bids: dict[float, float], asks: dict[float, float]) -> tuple[
     return [[p, q] for p, q in top_bids], [[p, q] for p, q in top_asks]
 
 
+def analyze_order_book(
+    bids: list[list[float]], asks: list[list[float]]
+) -> tuple[float, float, float, float]:
+    best_bid = bids[0][0] if bids else 0.0
+    best_ask = asks[0][0] if asks else 0.0
+    support_level = max(bids, key=lambda level: level[1])[0] if bids else 0.0
+    resistance_level = max(asks, key=lambda level: level[1])[0] if asks else 0.0
+    return support_level, resistance_level, best_bid, best_ask
+
+
+def determine_signal(
+    current_price: float | None,
+    support_level: float,
+    resistance_level: float,
+    best_bid: float,
+    best_ask: float,
+    change_24h_pct: float | None,
+) -> tuple[str, int, str, float | None]:
+    signal = "NEUTRAL"
+    confidence = 0
+    reasons = ""
+    entry = current_price
+
+    if (
+        current_price
+        and current_price > 0
+        and support_level > 0
+        and resistance_level > 0
+    ):
+        price_range = resistance_level - support_level
+        if price_range > 0:
+            position = (current_price - support_level) * 100 / price_range
+
+            if position < 25:
+                signal = "LONG"
+                confidence = 65
+                entry = support_level * 1.001
+                if best_bid > 0 and entry > best_bid:
+                    entry = best_bid
+                reasons = "OB: near support"
+                if change_24h_pct is not None and change_24h_pct < -3:
+                    confidence += 15
+                    reasons += " + reversal"
+
+            elif position > 75:
+                signal = "SHORT"
+                confidence = 65
+                entry = resistance_level * 0.999
+                if best_ask > 0 and entry < best_ask:
+                    entry = best_ask
+                reasons = "OB: near resistance"
+                if change_24h_pct is not None and change_24h_pct > 3:
+                    confidence += 15
+                    reasons += " + reversal"
+
+    if signal == "NEUTRAL" and current_price and current_price > 0 and change_24h_pct is not None:
+        if change_24h_pct > 5:
+            signal = "SHORT"
+            confidence = 50
+            entry = current_price * 0.998
+            reasons = f"24h extreme gain (+{change_24h_pct:.2f}%)"
+        elif change_24h_pct < -5:
+            signal = "LONG"
+            confidence = 50
+            entry = current_price * 1.002
+            reasons = f"24h extreme loss ({change_24h_pct:.2f}%)"
+        elif change_24h_pct > 2:
+            signal = "LONG"
+            confidence = 40
+            entry = current_price * 1.001
+            reasons = f"uptrend (+{change_24h_pct:.2f}%)"
+        elif change_24h_pct < -2:
+            signal = "SHORT"
+            confidence = 40
+            entry = current_price * 0.999
+            reasons = f"downtrend ({change_24h_pct:.2f}%)"
+
+    return signal, confidence, reasons, entry
+
+
+def update_trading_signal(
+    bids: list[list[float]],
+    asks: list[list[float]],
+    current_price: float | None,
+    change_24h_pct: float | None,
+) -> None:
+    global support, resistance, signal_dir, signal_confidence, signal_reasons
+    global signal_entry, zone_position_pct
+
+    if not bids or not asks:
+        return
+
+    support_level, resistance_level, best_bid, best_ask = analyze_order_book(bids, asks)
+    signal, confidence, reasons, entry = determine_signal(
+        current_price,
+        support_level,
+        resistance_level,
+        best_bid,
+        best_ask,
+        change_24h_pct,
+    )
+
+    support = support_level
+    resistance = resistance_level
+    signal_dir = signal
+    signal_confidence = confidence
+    signal_reasons = reasons
+    signal_entry = entry
+
+    if (
+        current_price
+        and support_level > 0
+        and resistance_level > support_level
+    ):
+        zone_position_pct = (current_price - support_level) * 100 / (resistance_level - support_level)
+    else:
+        zone_position_pct = None
+
+
 def update_metrics(bids: list[list[float]], asks: list[list[float]]) -> None:
     global spread, spread_pct, volume_delta, bid_volume, ask_volume, latest_price
 
@@ -114,6 +242,8 @@ def update_metrics(bids: list[list[float]], asks: list[list[float]]) -> None:
         spread_pct = (spread / mid) * 100 if mid else None
         latest_price = latest_price or (bids[0][0] + asks[0][0]) / 2
 
+    update_trading_signal(bids, asks, latest_price, change_24h)
+
 
 async def fetch_depth_snapshot(session: aiohttp.ClientSession) -> dict:
     url = f"{REST_BASE}/api/v3/depth"
@@ -121,6 +251,18 @@ async def fetch_depth_snapshot(session: aiohttp.ClientSession) -> dict:
     async with session.get(url, params=params, timeout=10) as resp:
         resp.raise_for_status()
         return await resp.json()
+
+
+async def fetch_24h_ticker(session: aiohttp.ClientSession) -> float | None:
+    url = f"{REST_BASE}/api/v3/ticker/24hr"
+    params = {"symbol": SYMBOL.upper()}
+    async with session.get(url, params=params, timeout=10) as resp:
+        resp.raise_for_status()
+        data = await resp.json()
+    try:
+        return float(data["priceChangePercent"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 async def fetch_historical_klines(session: aiohttp.ClientSession) -> list[dict]:
@@ -177,15 +319,21 @@ async def sync_orderbook(session: aiohttp.ClientSession, depth_buffer: list[dict
 
 
 async def ws_loop() -> None:
-    global forming_candle, latest_pattern, latest_price, orderbook, ws_status
+    global forming_candle, latest_pattern, latest_price, orderbook, ws_status, change_24h
 
     depth_buffer: list[dict] = []
-    stream_url = f"{WS_BASE}/stream?streams={SYMBOL}@kline_{INTERVAL}/{SYMBOL}@depth@100ms"
+    stream_url = (
+        f"{WS_BASE}/stream?streams="
+        f"{SYMBOL}@kline_{INTERVAL}/{SYMBOL}@depth@100ms/{SYMBOL}@miniTicker"
+    )
 
     async with aiohttp.ClientSession() as session:
         history = await fetch_historical_klines(session)
+        initial_change = await fetch_24h_ticker(session)
         with state_lock:
             candles.extend(history)
+            if initial_change is not None:
+                change_24h = initial_change
 
         while True:
             try:
@@ -226,6 +374,14 @@ async def ws_loop() -> None:
                                 if row["x"]:
                                     candles.append(row)
                                     latest_pattern = detect_pattern(pd.Series(row)) or "None"
+                                if orderbook.get("bids") and orderbook.get("asks"):
+                                    update_metrics(orderbook["bids"], orderbook["asks"])
+
+                        elif data.get("e") == "24hrMiniTicker":
+                            with state_lock:
+                                change_24h = float(data["P"])
+                                if orderbook.get("bids") and orderbook.get("asks"):
+                                    update_metrics(orderbook["bids"], orderbook["asks"])
 
                         elif "U" in data and "u" in data:
                             if data["u"] <= last_update_id:
@@ -269,6 +425,15 @@ def get_candles_df() -> pd.DataFrame:
             "bid_volume": bid_volume,
             "ask_volume": ask_volume,
             "status": ws_status,
+            "signal": signal_dir,
+            "confidence": signal_confidence,
+            "signal_reasons": signal_reasons,
+            "signal_entry": signal_entry,
+            "support": support,
+            "resistance": resistance,
+            "zone_position_pct": zone_position_pct,
+            "change_24h": change_24h,
+            "min_confidence": MIN_CONFIDENCE,
         }
 
     return pd.DataFrame(rows), ob, metrics
@@ -339,6 +504,30 @@ def build_figure() -> go.Figure:
                 col=1,
             )
 
+        if metrics.get("support"):
+            fig.add_hline(
+                y=metrics["support"],
+                line_dash="dot",
+                line_color="rgba(0,193,118,0.85)",
+                line_width=1,
+                annotation_text="Support",
+                annotation_position="right",
+                row=1,
+                col=1,
+            )
+
+        if metrics.get("resistance"):
+            fig.add_hline(
+                y=metrics["resistance"],
+                line_dash="dot",
+                line_color="rgba(255,77,79,0.85)",
+                line_width=1,
+                annotation_text="Resistance",
+                annotation_position="right",
+                row=1,
+                col=1,
+            )
+
     bids = ob["bids"]
     asks = ob["asks"]
 
@@ -372,11 +561,19 @@ def build_figure() -> go.Figure:
     spread_text = f"{metrics['spread']:.4f}" if metrics["spread"] is not None else "—"
     spread_pct_text = f"{metrics['spread_pct']:.4f}%" if metrics["spread_pct"] is not None else "—"
     delta_text = f"{metrics['volume_delta']:.4f}" if metrics["volume_delta"] is not None else "—"
+    signal_text = metrics.get("signal", "NEUTRAL")
+    confidence_text = f"{metrics.get('confidence', 0)}%"
+    change_text = (
+        f"{metrics['change_24h']:+.2f}%"
+        if metrics.get("change_24h") is not None
+        else "—"
+    )
 
     fig.update_layout(
         title=(
             f"Live Binance {SYMBOL.upper()} ({INTERVAL}) | "
-            f"Price: {price_text} | Pattern: {metrics['pattern']} | Status: {metrics['status']}"
+            f"Price: {price_text} | Signal: {signal_text} {confidence_text} | "
+            f"24h: {change_text} | Status: {metrics['status']}"
         ),
         template="plotly_dark",
         height=900,
@@ -390,7 +587,15 @@ def build_figure() -> go.Figure:
                     f"Spread: {spread_text} ({spread_pct_text}) | "
                     f"Bid vol: {metrics['bid_volume']:.4f} | "
                     f"Ask vol: {metrics['ask_volume']:.4f} | "
-                    f"Delta: {delta_text}"
+                    f"Delta: {delta_text} | "
+                    f"Zone: {metrics['zone_position_pct']:.1f}%"
+                    if metrics.get("zone_position_pct") is not None
+                    else (
+                        f"Spread: {spread_text} ({spread_pct_text}) | "
+                        f"Bid vol: {metrics['bid_volume']:.4f} | "
+                        f"Ask vol: {metrics['ask_volume']:.4f} | "
+                        f"Delta: {delta_text}"
+                    )
                 ),
                 xref="paper",
                 yref="paper",
@@ -418,6 +623,22 @@ def pattern_badge_class(pattern: str) -> str:
     return "badge badge-neutral"
 
 
+def signal_badge_class(signal: str) -> str:
+    if signal == "LONG":
+        return "badge badge-bull"
+    if signal == "SHORT":
+        return "badge badge-bear"
+    return "badge badge-neutral"
+
+
+def confidence_badge_class(confidence: int, min_confidence: int) -> str:
+    if confidence >= min_confidence and confidence > 0:
+        return "badge badge-trade"
+    if confidence > 0:
+        return "badge badge-watch"
+    return "badge badge-neutral"
+
+
 app = Dash(__name__)
 app.title = f"Binance Live | {SYMBOL.upper()}"
 
@@ -427,7 +648,8 @@ app.layout = html.Div(
             [
                 html.H2("Binance Live Dashboard", className="title"),
                 html.P(
-                    f"Streaming {SYMBOL.upper()} · interval {INTERVAL} · depth {DEPTH_LEVELS} levels",
+                    f"Streaming {SYMBOL.upper()} · interval {INTERVAL} · depth {DEPTH_LEVELS} levels · "
+                    f"min confidence {MIN_CONFIDENCE}%",
                     className="subtitle",
                 ),
             ],
@@ -436,7 +658,8 @@ app.layout = html.Div(
         html.Div(
             [
                 html.Div(id="pattern-panel", className="panel"),
-                html.Div(id="metrics-panel", className="panel"),
+                html.Div(id="signal-panel", className="panel panel-signal"),
+                html.Div(id="metrics-panel", className="panel panel-metrics"),
             ],
             className="panels",
         ),
@@ -450,6 +673,7 @@ app.layout = html.Div(
 @app.callback(
     Output("live-chart", "figure"),
     Output("pattern-panel", "children"),
+    Output("signal-panel", "children"),
     Output("metrics-panel", "children"),
     Input("interval", "n_intervals"),
 )
@@ -460,6 +684,69 @@ def update_dashboard(_: int):
     pattern_children = [
         html.Span("Last closed pattern", className="panel-label"),
         html.Span(metrics["pattern"], className=pattern_badge_class(metrics["pattern"])),
+    ]
+
+    signal = metrics.get("signal", "NEUTRAL")
+    confidence = metrics.get("confidence", 0)
+    min_conf = metrics.get("min_confidence", MIN_CONFIDENCE)
+    action_label = "TRADE" if signal != "NEUTRAL" and confidence >= min_conf else "WATCH"
+    entry_text = (
+        f"{metrics['signal_entry']:.2f}"
+        if metrics.get("signal_entry") is not None
+        else "—"
+    )
+    support_text = f"{metrics['support']:.2f}" if metrics.get("support") else "—"
+    resistance_text = f"{metrics['resistance']:.2f}" if metrics.get("resistance") else "—"
+    zone_text = (
+        f"{metrics['zone_position_pct']:.1f}%"
+        if metrics.get("zone_position_pct") is not None
+        else "—"
+    )
+    change_text = (
+        f"{metrics['change_24h']:+.2f}%"
+        if metrics.get("change_24h") is not None
+        else "—"
+    )
+    reasons = metrics.get("signal_reasons") or "No active setup"
+
+    signal_children = [
+        html.Div(
+            [
+                html.Span("Signal", className="panel-label"),
+                html.Span(signal, className=signal_badge_class(signal)),
+                html.Span(action_label, className=confidence_badge_class(confidence, min_conf)),
+            ],
+            className="signal-row",
+        ),
+        html.Div(
+            [
+                html.Span("Confidence", className="panel-label"),
+                html.Strong(f"{confidence}%"),
+                html.Span(f"need {min_conf}%", className="panel-hint"),
+            ],
+            className="signal-row",
+        ),
+        html.Div(
+            [
+                html.Span("Entry", className="panel-label"),
+                html.Strong(entry_text),
+            ],
+            className="signal-row",
+        ),
+        html.Div(
+            [
+                html.Span("Support", className="panel-label"),
+                html.Strong(support_text),
+                html.Span("Resistance", className="panel-label"),
+                html.Strong(resistance_text),
+                html.Span("Zone", className="panel-label"),
+                html.Strong(zone_text),
+                html.Span("24h", className="panel-label"),
+                html.Strong(change_text),
+            ],
+            className="signal-row",
+        ),
+        html.P(reasons, className="signal-reasons"),
     ]
 
     metrics_children = [
@@ -515,7 +802,7 @@ def update_dashboard(_: int):
         ),
     ]
 
-    return figure, pattern_children, metrics_children
+    return figure, pattern_children, signal_children, metrics_children
 
 
 def start_ws() -> None:

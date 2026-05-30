@@ -39,10 +39,11 @@ Open the dashboard at `http://127.0.0.1:8050` (or the host/port set in `.env`).
 | `INTERVAL`     | Kline interval (e.g. `1m`, `5m`)     | `1m`      |
 | `DEPTH_LEVELS` | Order book levels shown in the chart | `20`      |
 | `MAX_CANDLES`  | Max candles kept in memory           | `200`     |
+| `MIN_CONFIDENCE` | Minimum confidence to highlight a **TRADE** setup (same logic as order-blocks bot) | `50` |
 | `DASH_HOST`    | Dash bind address                    | `0.0.0.0` |
 | `DASH_PORT`    | Dash HTTP port                       | `8050`    |
 
-The app loads historical klines via REST, then keeps the order book in sync using Binance’s depth snapshot + incremental updates. The UI refreshes every 1.5s.
+The app loads historical klines via REST, then keeps the order book in sync using Binance’s depth snapshot + incremental updates. It also streams `@miniTicker` for 24h change and computes **order-block signal + confidence** (support/resistance walls, zone position, and fallback 24h rules — informational only, no orders). The UI refreshes every 1.5s.
 
 ## Hosting
 
