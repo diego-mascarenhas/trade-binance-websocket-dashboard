@@ -24,6 +24,13 @@ DEPTH_LEVELS = int(os.getenv("DEPTH_LEVELS", "20"))
 MAX_CANDLES = int(os.getenv("MAX_CANDLES", "200"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "50"))
 MIN_PATTERN_RANGE_PCT = float(os.getenv("MIN_PATTERN_RANGE_PCT", "0.02"))
+OB_WALL_RANGE_PCT = float(os.getenv("OB_WALL_RANGE_PCT", "0.6"))
+SIGNAL_ZONE_LONG_ENTER = float(os.getenv("SIGNAL_ZONE_LONG_ENTER", "20"))
+SIGNAL_ZONE_LONG_EXIT = float(os.getenv("SIGNAL_ZONE_LONG_EXIT", "35"))
+SIGNAL_ZONE_SHORT_ENTER = float(os.getenv("SIGNAL_ZONE_SHORT_ENTER", "80"))
+SIGNAL_ZONE_SHORT_EXIT = float(os.getenv("SIGNAL_ZONE_SHORT_EXIT", "65"))
+SIGNAL_DEBOUNCE_COUNT = int(os.getenv("SIGNAL_DEBOUNCE_COUNT", "5"))
+MAX_ENTRY_MARKERS = int(os.getenv("MAX_ENTRY_MARKERS", "50"))
 DASH_HOST = os.getenv("DASH_HOST", "0.0.0.0")
 DASH_PORT = int(os.getenv("DASH_PORT", "8050"))
 
@@ -34,6 +41,7 @@ state_lock = Lock()
 candles: deque = deque(maxlen=MAX_CANDLES)
 forming_candle: dict | None = None
 orderbook: dict = {"bids": [], "asks": []}
+analysis_orderbook: dict = {"bids": [], "asks": []}
 latest_pattern = "None"
 latest_price: float | None = None
 spread: float | None = None
@@ -44,12 +52,18 @@ ask_volume: float = 0.0
 ws_status = "connecting"
 support: float | None = None
 resistance: float | None = None
+ob_support_qty: float = 0.0
+ob_resistance_qty: float = 0.0
 signal_dir = "NEUTRAL"
+stable_signal_dir = "NEUTRAL"
+pending_signal = "NEUTRAL"
+pending_signal_count = 0
 signal_confidence = 0
 signal_reasons = ""
 signal_entry: float | None = None
 zone_position_pct: float | None = None
 change_24h: float | None = None
+valid_entries: deque = deque(maxlen=MAX_ENTRY_MARKERS)
 
 
 def _immediate_bullish_run(prior_rows: pd.DataFrame | None, lookback: int = 4) -> bool:
@@ -229,20 +243,128 @@ def snapshot_to_levels(snapshot: dict) -> tuple[list[list[float]], list[list[flo
     return bids, asks
 
 
+def map_to_levels(
+    bid_map: dict[float, float],
+    ask_map: dict[float, float],
+    limit: int | None = None,
+) -> tuple[list[list[float]], list[list[float]]]:
+    bids = sorted(bid_map.items(), key=lambda item: item[0], reverse=True)
+    asks = sorted(ask_map.items(), key=lambda item: item[0])
+    if limit is not None:
+        bids = bids[:limit]
+        asks = asks[:limit]
+    return [[price, qty] for price, qty in bids], [[price, qty] for price, qty in asks]
+
+
 def trim_orderbook(bids: dict[float, float], asks: dict[float, float]) -> tuple[list[list[float]], list[list[float]]]:
-    top_bids = sorted(bids.items(), key=lambda x: x[0], reverse=True)[:DEPTH_LEVELS]
-    top_asks = sorted(asks.items(), key=lambda x: x[0])[:DEPTH_LEVELS]
-    return [[p, q] for p, q in top_bids], [[p, q] for p, q in top_asks]
+    return map_to_levels(bids, asks, DEPTH_LEVELS)
+
+
+def filter_levels_near_mid(
+    bids: list[list[float]],
+    asks: list[list[float]],
+    mid: float,
+    range_pct: float = OB_WALL_RANGE_PCT,
+) -> tuple[list[list[float]], list[list[float]]]:
+    if mid <= 0:
+        return bids, asks
+    lower = mid * (1 - range_pct / 100)
+    upper = mid * (1 + range_pct / 100)
+    near_bids = [level for level in bids if lower <= level[0] <= upper]
+    near_asks = [level for level in asks if lower <= level[0] <= upper]
+    if not near_bids:
+        near_bids = bids[: max(DEPTH_LEVELS, 1)]
+    if not near_asks:
+        near_asks = asks[: max(DEPTH_LEVELS, 1)]
+    return near_bids, near_asks
+
+
+def is_tradable_signal(signal: str, confidence: int, min_confidence: int = MIN_CONFIDENCE) -> bool:
+    return signal in ("LONG", "SHORT") and confidence >= min_confidence
+
+
+def zone_signal_with_hysteresis(position: float, stable_signal: str) -> str:
+    if stable_signal == "LONG":
+        return "NEUTRAL" if position > SIGNAL_ZONE_LONG_EXIT else "LONG"
+    if stable_signal == "SHORT":
+        return "NEUTRAL" if position < SIGNAL_ZONE_SHORT_EXIT else "SHORT"
+    if position < SIGNAL_ZONE_LONG_ENTER:
+        return "LONG"
+    if position > SIGNAL_ZONE_SHORT_ENTER:
+        return "SHORT"
+    return "NEUTRAL"
+
+
+def record_valid_entry(
+    signal: str,
+    entry: float | None,
+    confidence: int,
+    reasons: str,
+    candle_time,
+) -> None:
+    if not is_tradable_signal(signal, confidence) or entry is None or candle_time is None:
+        return
+    if valid_entries:
+        last = valid_entries[-1]
+        if last["t"] == candle_time and last["signal"] == signal:
+            last["entry"] = entry
+            last["confidence"] = confidence
+            last["reasons"] = reasons
+            return
+    valid_entries.append(
+        {
+            "t": candle_time,
+            "entry": entry,
+            "signal": signal,
+            "confidence": confidence,
+            "reasons": reasons,
+        }
+    )
+
+
+def apply_signal_debounce(
+    candidate: str,
+    confidence: int,
+    reasons: str,
+    entry: float | None,
+    candle_time,
+) -> None:
+    global stable_signal_dir, pending_signal, pending_signal_count
+    global signal_dir, signal_confidence, signal_reasons, signal_entry
+
+    if candidate == pending_signal:
+        pending_signal_count += 1
+    else:
+        pending_signal = candidate
+        pending_signal_count = 1
+
+    if pending_signal_count >= SIGNAL_DEBOUNCE_COUNT and candidate != stable_signal_dir:
+        if is_tradable_signal(candidate, confidence):
+            record_valid_entry(candidate, entry, confidence, reasons, candle_time)
+        stable_signal_dir = candidate
+
+    signal_dir = stable_signal_dir
+    if pending_signal_count >= SIGNAL_DEBOUNCE_COUNT:
+        signal_confidence = confidence
+        signal_reasons = reasons
+        signal_entry = entry
 
 
 def analyze_order_book(
     bids: list[list[float]], asks: list[list[float]]
-) -> tuple[float, float, float, float]:
+) -> tuple[float, float, float, float, float, float]:
     best_bid = bids[0][0] if bids else 0.0
     best_ask = asks[0][0] if asks else 0.0
-    support_level = max(bids, key=lambda level: level[1])[0] if bids else 0.0
-    resistance_level = max(asks, key=lambda level: level[1])[0] if asks else 0.0
-    return support_level, resistance_level, best_bid, best_ask
+    support_wall = max(bids, key=lambda level: level[1]) if bids else [0.0, 0.0]
+    resistance_wall = max(asks, key=lambda level: level[1]) if asks else [0.0, 0.0]
+    return (
+        support_wall[0],
+        resistance_wall[0],
+        best_bid,
+        best_ask,
+        support_wall[1],
+        resistance_wall[1],
+    )
 
 
 def determine_signal(
@@ -252,6 +374,7 @@ def determine_signal(
     best_bid: float,
     best_ask: float,
     change_24h_pct: float | None,
+    stable_signal: str = "NEUTRAL",
 ) -> tuple[str, int, str, float | None]:
     signal = "NEUTRAL"
     confidence = 0
@@ -267,8 +390,9 @@ def determine_signal(
         price_range = resistance_level - support_level
         if price_range > 0:
             position = (current_price - support_level) * 100 / price_range
+            zone_signal = zone_signal_with_hysteresis(position, stable_signal)
 
-            if position < 25:
+            if zone_signal == "LONG":
                 signal = "LONG"
                 confidence = 65
                 entry = support_level * 1.001
@@ -279,7 +403,7 @@ def determine_signal(
                     confidence += 15
                     reasons += " + reversal"
 
-            elif position > 75:
+            elif zone_signal == "SHORT":
                 signal = "SHORT"
                 confidence = 65
                 entry = resistance_level * 0.999
@@ -321,28 +445,33 @@ def update_trading_signal(
     current_price: float | None,
     change_24h_pct: float | None,
 ) -> None:
-    global support, resistance, signal_dir, signal_confidence, signal_reasons
-    global signal_entry, zone_position_pct
+    global support, resistance, zone_position_pct, ob_support_qty, ob_resistance_qty
 
     if not bids or not asks:
         return
 
-    support_level, resistance_level, best_bid, best_ask = analyze_order_book(bids, asks)
-    signal, confidence, reasons, entry = determine_signal(
+    mid = current_price
+    if mid is None:
+        mid = (bids[0][0] + asks[0][0]) / 2
+    bids, asks = filter_levels_near_mid(bids, asks, mid)
+
+    support_level, resistance_level, best_bid, best_ask, support_qty, resistance_qty = analyze_order_book(
+        bids, asks
+    )
+    candidate, confidence, reasons, entry = determine_signal(
         current_price,
         support_level,
         resistance_level,
         best_bid,
         best_ask,
         change_24h_pct,
+        stable_signal_dir,
     )
 
     support = support_level
     resistance = resistance_level
-    signal_dir = signal
-    signal_confidence = confidence
-    signal_reasons = reasons
-    signal_entry = entry
+    ob_support_qty = support_qty
+    ob_resistance_qty = resistance_qty
 
     if (
         current_price
@@ -353,23 +482,44 @@ def update_trading_signal(
     else:
         zone_position_pct = None
 
+    candle_time = forming_candle["t"] if forming_candle else None
+    apply_signal_debounce(candidate, confidence, reasons, entry, candle_time)
 
-def update_metrics(bids: list[list[float]], asks: list[list[float]]) -> None:
+
+def update_metrics(
+    display_bids: list[list[float]],
+    display_asks: list[list[float]],
+    analysis_bids: list[list[float]] | None = None,
+    analysis_asks: list[list[float]] | None = None,
+) -> None:
     global spread, spread_pct, volume_delta, bid_volume, ask_volume, latest_price
 
-    bid_volume = sum(q for _, q in bids)
-    ask_volume = sum(q for _, q in asks)
+    ob_bids = analysis_bids or display_bids
+    ob_asks = analysis_asks or display_asks
+
+    bid_volume = sum(q for _, q in display_bids)
+    ask_volume = sum(q for _, q in display_asks)
     volume_delta = bid_volume - ask_volume
 
-    if bids and asks:
-        best_bid = bids[0][0]
-        best_ask = asks[0][0]
+    if display_bids and display_asks:
+        best_bid = display_bids[0][0]
+        best_ask = display_asks[0][0]
         spread = best_ask - best_bid
         mid = (best_bid + best_ask) / 2
         spread_pct = (spread / mid) * 100 if mid else None
-        latest_price = latest_price or (bids[0][0] + asks[0][0]) / 2
+        latest_price = latest_price or (display_bids[0][0] + display_asks[0][0]) / 2
 
-    update_trading_signal(bids, asks, latest_price, change_24h)
+    update_trading_signal(ob_bids, ob_asks, latest_price, change_24h)
+
+
+def sync_orderbook_state(bid_map: dict[float, float], ask_map: dict[float, float]) -> None:
+    global orderbook, analysis_orderbook
+
+    display_bids, display_asks = map_to_levels(bid_map, ask_map, DEPTH_LEVELS)
+    full_bids, full_asks = map_to_levels(bid_map, ask_map)
+    orderbook = {"bids": display_bids, "asks": display_asks}
+    analysis_orderbook = {"bids": full_bids, "asks": full_asks}
+    update_metrics(display_bids, display_asks, full_bids, full_asks)
 
 
 async def fetch_depth_snapshot(session: aiohttp.ClientSession) -> dict:
@@ -478,11 +628,9 @@ async def ws_loop() -> None:
                             depth_buffer.append(data)
 
                     bid_map, ask_map, last_update_id = await sync_orderbook(session, depth_buffer)
-                    bids, asks = trim_orderbook(bid_map, ask_map)
 
                     with state_lock:
-                        orderbook = {"bids": bids, "asks": asks}
-                        update_metrics(bids, asks)
+                        sync_orderbook_state(bid_map, ask_map)
 
                     ws_status = "live"
                     logger.info("Order book synced at updateId=%s", last_update_id)
@@ -501,7 +649,12 @@ async def ws_loop() -> None:
                                 if row["x"]:
                                     candles.append(row)
                                 if orderbook.get("bids") and orderbook.get("asks"):
-                                    update_metrics(orderbook["bids"], orderbook["asks"])
+                                    update_metrics(
+                                        orderbook["bids"],
+                                        orderbook["asks"],
+                                        analysis_orderbook.get("bids"),
+                                        analysis_orderbook.get("asks"),
+                                    )
 
                         elif data.get("e") == "24hrMiniTicker" or msg.get("stream", "").endswith("@miniTicker"):
                             pct_raw = data.get("P")
@@ -510,7 +663,12 @@ async def ws_loop() -> None:
                                     with state_lock:
                                         change_24h = float(pct_raw)
                                         if orderbook.get("bids") and orderbook.get("asks"):
-                                            update_metrics(orderbook["bids"], orderbook["asks"])
+                                            update_metrics(
+                                                orderbook["bids"],
+                                                orderbook["asks"],
+                                                analysis_orderbook.get("bids"),
+                                                analysis_orderbook.get("asks"),
+                                            )
                                 except (TypeError, ValueError):
                                     logger.warning("Invalid miniTicker change pct: %r", pct_raw)
                             else:
@@ -525,11 +683,9 @@ async def ws_loop() -> None:
 
                             apply_depth_update(data, bid_map, ask_map)
                             last_update_id = data["u"]
-                            bids, asks = trim_orderbook(bid_map, ask_map)
 
                             with state_lock:
-                                orderbook = {"bids": bids, "asks": asks}
-                                update_metrics(bids, asks)
+                                sync_orderbook_state(bid_map, ask_map)
 
             except Exception:
                 logger.exception("WebSocket loop error, reconnecting in 3s")
@@ -587,24 +743,219 @@ def get_candles_df() -> pd.DataFrame:
             "signal_entry": signal_entry,
             "support": support,
             "resistance": resistance,
+            "support_qty": ob_support_qty,
+            "resistance_qty": ob_resistance_qty,
             "zone_position_pct": zone_position_pct,
             "change_24h": change_24h,
             "min_confidence": MIN_CONFIDENCE,
+            "valid_entries": list(valid_entries),
+            "pending_signal": pending_signal,
+            "pending_signal_count": pending_signal_count,
+            "signal_debounce_count": SIGNAL_DEBOUNCE_COUNT,
         }
 
     return pd.DataFrame(rows), ob, metrics
 
 
-def build_depth_bar_data(
-    bids: list[list[float]], asks: list[list[float]]
-) -> tuple[list[str], list[float | None], list[float | None]]:
-    bid_map = {price: qty for price, qty in bids}
-    ask_map = {price: qty for price, qty in asks}
-    all_prices = sorted(set(bid_map) | set(ask_map))
-    labels = [f"{price:.2f}" for price in all_prices]
-    bid_values = [-bid_map[price] if price in bid_map else None for price in all_prices]
-    ask_values = [ask_map[price] if price in ask_map else None for price in all_prices]
-    return labels, bid_values, ask_values
+def depth_category_labels(bids: list[list[float]], asks: list[list[float]]) -> list[str]:
+    prices = sorted({price for price, _ in bids} | {price for price, _ in asks})
+    return [f"{price:.2f}" for price in prices]
+
+
+def side_bar_colors(
+    levels: list[list[float]],
+    wall_price: float | None,
+    base_color: str,
+    wall_color: str,
+) -> list[str]:
+    wall_label = f"{wall_price:.2f}" if wall_price else None
+    return [wall_color if f"{price:.2f}" == wall_label else base_color for price, _ in levels]
+
+
+def add_order_block_overlays(
+    fig: go.Figure,
+    metrics: dict,
+    row: int = 1,
+    col: int = 1,
+) -> None:
+    support = metrics.get("support")
+    resistance = metrics.get("resistance")
+    if not support or not resistance or resistance <= support:
+        return
+
+    current_price = metrics.get("price")
+    if current_price:
+        max_dist = current_price * (OB_WALL_RANGE_PCT / 100) * 1.5
+        if abs(float(support) - current_price) > max_dist or abs(float(resistance) - current_price) > max_dist:
+            return
+
+    price_range = resistance - support
+    spread = metrics.get("spread") or 0
+    wall_band = max(price_range * 0.012, spread * 2, support * 0.00005)
+    support_qty = metrics.get("support_qty", 0)
+    resistance_qty = metrics.get("resistance_qty", 0)
+
+    fig.add_hrect(
+        y0=support,
+        y1=support + price_range * 0.25,
+        fillcolor="rgba(0,193,118,0.07)",
+        line_width=0,
+        row=row,
+        col=col,
+    )
+    fig.add_hrect(
+        y0=resistance - price_range * 0.25,
+        y1=resistance,
+        fillcolor="rgba(255,77,79,0.07)",
+        line_width=0,
+        row=row,
+        col=col,
+    )
+    fig.add_hrect(
+        y0=support - wall_band,
+        y1=support + wall_band,
+        fillcolor="rgba(0,193,118,0.24)",
+        line_width=0,
+        row=row,
+        col=col,
+    )
+    fig.add_hrect(
+        y0=resistance - wall_band,
+        y1=resistance + wall_band,
+        fillcolor="rgba(255,77,79,0.24)",
+        line_width=0,
+        row=row,
+        col=col,
+    )
+
+    fig.add_hline(
+        y=support,
+        line_color="rgba(0,193,118,0.95)",
+        line_width=2,
+        annotation_text=f"OB Support · {format_price(support)} · qty {support_qty:.4f}",
+        annotation_position="right",
+        row=row,
+        col=col,
+    )
+    fig.add_hline(
+        y=resistance,
+        line_color="rgba(255,77,79,0.95)",
+        line_width=2,
+        annotation_text=f"OB Resistance · {format_price(resistance)} · qty {resistance_qty:.4f}",
+        annotation_position="right",
+        row=row,
+        col=col,
+    )
+
+    current_price = metrics.get("price")
+    if current_price:
+        fig.add_hline(
+            y=current_price,
+            line_dash="dash",
+            line_color="rgba(255,193,7,0.85)",
+            line_width=1,
+            row=row,
+            col=col,
+        )
+
+
+def candle_chart_y_range(df: pd.DataFrame, metrics: dict) -> tuple[float, float]:
+    y_min = float(df["l"].min())
+    y_max = float(df["h"].max())
+    mid = metrics.get("price") or (y_min + y_max) / 2
+    max_dist = mid * (OB_WALL_RANGE_PCT / 100) * 1.5
+
+    for key in ("support", "resistance"):
+        value = metrics.get(key)
+        if value is not None and abs(float(value) - mid) <= max_dist:
+            y_min = min(y_min, float(value))
+            y_max = max(y_max, float(value))
+
+    for entry in metrics.get("valid_entries") or []:
+        y_min = min(y_min, float(entry["entry"]))
+        y_max = max(y_max, float(entry["entry"]))
+
+    active_entry = metrics.get("signal_entry")
+    signal = metrics.get("signal", "NEUTRAL")
+    confidence = metrics.get("confidence", 0)
+    if active_entry is not None and is_tradable_signal(signal, confidence, metrics.get("min_confidence", MIN_CONFIDENCE)):
+        y_min = min(y_min, float(active_entry))
+        y_max = max(y_max, float(active_entry))
+
+    padding = max((y_max - y_min) * 0.06, mid * 0.0005)
+    return y_min - padding, y_max + padding
+
+
+def add_valid_entry_markers(
+    fig: go.Figure,
+    metrics: dict,
+    row: int = 1,
+    col: int = 1,
+) -> None:
+    entries = metrics.get("valid_entries") or []
+    long_entries = [entry for entry in entries if entry["signal"] == "LONG"]
+    short_entries = [entry for entry in entries if entry["signal"] == "SHORT"]
+
+    if long_entries:
+        fig.add_trace(
+            go.Scatter(
+                x=[entry["t"] for entry in long_entries],
+                y=[entry["entry"] for entry in long_entries],
+                mode="markers+text",
+                name="Valid LONG",
+                text=[f"L {format_price(entry['entry'])}" for entry in long_entries],
+                textposition="bottom center",
+                textfont=dict(size=10, color="#00c176"),
+                marker=dict(size=11, color="#00c176", symbol="triangle-up", line=dict(width=1, color="#ffffff")),
+                hovertemplate=(
+                    "Valid LONG entry<br>Price: %{y}<br>Conf: %{customdata[0]}%<br>%{customdata[1]}<extra></extra>"
+                ),
+                customdata=[
+                    [entry["confidence"], entry["reasons"]] for entry in long_entries
+                ],
+            ),
+            row=row,
+            col=col,
+        )
+
+    if short_entries:
+        fig.add_trace(
+            go.Scatter(
+                x=[entry["t"] for entry in short_entries],
+                y=[entry["entry"] for entry in short_entries],
+                mode="markers+text",
+                name="Valid SHORT",
+                text=[f"S {format_price(entry['entry'])}" for entry in short_entries],
+                textposition="top center",
+                textfont=dict(size=10, color="#ff4d4f"),
+                marker=dict(size=11, color="#ff4d4f", symbol="triangle-down", line=dict(width=1, color="#ffffff")),
+                hovertemplate=(
+                    "Valid SHORT entry<br>Price: %{y}<br>Conf: %{customdata[0]}%<br>%{customdata[1]}<extra></extra>"
+                ),
+                customdata=[
+                    [entry["confidence"], entry["reasons"]] for entry in short_entries
+                ],
+            ),
+            row=row,
+            col=col,
+        )
+
+    signal = metrics.get("signal", "NEUTRAL")
+    confidence = metrics.get("confidence", 0)
+    min_conf = metrics.get("min_confidence", MIN_CONFIDENCE)
+    entry_price = metrics.get("signal_entry")
+    if is_tradable_signal(signal, confidence, min_conf) and entry_price:
+        line_color = "rgba(0,193,118,0.55)" if signal == "LONG" else "rgba(255,77,79,0.55)"
+        fig.add_hline(
+            y=entry_price,
+            line_dash="dot",
+            line_color=line_color,
+            line_width=1.5,
+            annotation_text=f"Active {signal} entry · {format_price(entry_price)}",
+            annotation_position="right",
+            row=row,
+            col=col,
+        )
 
 
 def build_figure() -> go.Figure:
@@ -616,7 +967,7 @@ def build_figure() -> go.Figure:
         shared_xaxes=False,
         vertical_spacing=0.1,
         row_heights=[0.72, 0.28],
-        subplot_titles=("OHLC + Confirmed Patterns", "Order Book Depth"),
+        subplot_titles=("OHLC + Order Blocks", "Order Book Depth"),
     )
 
     if not df.empty:
@@ -678,58 +1029,54 @@ def build_figure() -> go.Figure:
                 col=1,
             )
 
-        if metrics.get("support"):
-            fig.add_hline(
-                y=metrics["support"],
-                line_dash="dot",
-                line_color="rgba(0,193,118,0.85)",
-                line_width=1,
-                annotation_text="Support",
-                annotation_position="right",
-                row=1,
-                col=1,
-            )
-
-        if metrics.get("resistance"):
-            fig.add_hline(
-                y=metrics["resistance"],
-                line_dash="dot",
-                line_color="rgba(255,77,79,0.85)",
-                line_width=1,
-                annotation_text="Resistance",
-                annotation_position="right",
-                row=1,
-                col=1,
-            )
+        add_order_block_overlays(fig, metrics, row=1, col=1)
+        add_valid_entry_markers(fig, metrics, row=1, col=1)
+        y_min, y_max = candle_chart_y_range(df, metrics)
+        fig.update_yaxes(range=[y_min, y_max], row=1, col=1)
 
     bids = ob["bids"]
     asks = ob["asks"]
-    depth_labels, depth_bids, depth_asks = build_depth_bar_data(bids, asks)
+    depth_labels = depth_category_labels(bids, asks)
 
-    if depth_labels:
+    if bids:
         fig.add_trace(
             go.Bar(
-                x=depth_bids,
-                y=depth_labels,
+                x=[-qty for _, qty in bids],
+                y=[f"{price:.2f}" for price, _ in bids],
                 orientation="h",
                 name="Bids",
-                marker_color="rgba(0,193,118,0.65)",
+                marker=dict(
+                    color=side_bar_colors(
+                        bids,
+                        metrics.get("support"),
+                        "rgba(0,193,118,0.45)",
+                        "rgba(0,193,118,0.95)",
+                    )
+                ),
                 hovertemplate="Bid<br>Price: %{y}<br>Qty: %{customdata}<extra></extra>",
-                customdata=[abs(v) if v is not None else 0 for v in depth_bids],
+                customdata=[qty for _, qty in bids],
             ),
             row=2,
             col=1,
         )
 
+    if asks:
         fig.add_trace(
             go.Bar(
-                x=depth_asks,
-                y=depth_labels,
+                x=[qty for _, qty in asks],
+                y=[f"{price:.2f}" for price, _ in asks],
                 orientation="h",
                 name="Asks",
-                marker_color="rgba(255,77,79,0.65)",
+                marker=dict(
+                    color=side_bar_colors(
+                        asks,
+                        metrics.get("resistance"),
+                        "rgba(255,77,79,0.45)",
+                        "rgba(255,77,79,0.95)",
+                    )
+                ),
                 hovertemplate="Ask<br>Price: %{y}<br>Qty: %{customdata}<extra></extra>",
-                customdata=[v if v is not None else 0 for v in depth_asks],
+                customdata=[qty for _, qty in asks],
             ),
             row=2,
             col=1,
@@ -931,7 +1278,15 @@ def update_dashboard(_: int):
     signal = metrics.get("signal", "NEUTRAL")
     confidence = metrics.get("confidence", 0)
     min_conf = metrics.get("min_confidence", MIN_CONFIDENCE)
-    action_label = "TRADE" if signal != "NEUTRAL" and confidence >= min_conf else "WATCH"
+    action_label = "TRADE" if is_tradable_signal(signal, confidence, min_conf) else "WATCH"
+    pending = metrics.get("pending_signal", "NEUTRAL")
+    pending_count = metrics.get("pending_signal_count", 0)
+    debounce_target = metrics.get("signal_debounce_count", SIGNAL_DEBOUNCE_COUNT)
+    pending_text = (
+        f"Confirming {pending} ({pending_count}/{debounce_target})"
+        if pending != signal and pending_count > 0
+        else None
+    )
     entry_text = (
         f"{metrics['signal_entry']:.2f}"
         if metrics.get("signal_entry") is not None
@@ -990,15 +1345,14 @@ def update_dashboard(_: int):
         ),
         html.P(reasons, className="signal-reasons"),
     ]
+    if pending_text:
+        signal_children.append(html.P(pending_text, className="signal-pending"))
+    valid_count = len(metrics.get("valid_entries") or [])
+    signal_children.append(
+        html.P(f"Valid entries on chart: {valid_count}", className="signal-pending")
+    )
 
     metrics_children = [
-        html.Div(
-            [
-                html.Span("Current price", className="metric-label"),
-                html.Strong(format_price(metrics.get("price")), className="metric-price"),
-            ],
-            className="metric metric-price-block",
-        ),
         html.Div(
             [
                 html.Span("Spread", className="metric-label"),

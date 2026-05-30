@@ -139,6 +139,12 @@
     line-height: 1.35;
 }
 
+.signal-pending {
+    margin: 4px 0 0;
+    color: #7d848f;
+    font-size: 0.8rem;
+}
+
 .panel-hint {
     color: #7d848f;
     font-size: 0.8rem;
@@ -197,15 +203,6 @@
 .metric strong {
     font-size: 1rem;
     color: #ffffff;
-}
-
-.metric-price-block {
-    min-width: 130px;
-}
-
-.metric-price {
-    font-size: 1.25rem !important;
-    font-weight: 700;
 }
 
 #live-chart {
