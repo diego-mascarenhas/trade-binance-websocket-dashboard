@@ -2234,7 +2234,7 @@ def confidence_badge_class(confidence: int, min_confidence: int) -> str:
     return "badge badge-neutral"
 
 
-app = Dash(__name__)
+app = Dash(__name__, update_title=False)
 app.title = f"Binance Live | {SYMBOL.upper()}"
 
 app.layout = html.Div(
