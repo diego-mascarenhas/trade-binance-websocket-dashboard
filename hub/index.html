@@ -11,7 +11,7 @@
         <header class="header">
             <div>
                 <h1>Binance Live Dashboards</h1>
-                <p class="subtitle">Select a pair to open its live chart, order book, and signals.</p>
+                <p class="subtitle">Live signal, trend, and position per pair.</p>
             </div>
             <div class="meta" id="meta"></div>
         </header>
@@ -22,21 +22,138 @@
         const grid = document.getElementById("grid");
         const meta = document.getElementById("meta");
         const footer = document.getElementById("footer");
+        const host = window.location.hostname || "127.0.0.1";
+        const REFRESH_MS = 3000;
 
-        function card(pair) {
-            const host = window.location.hostname || "127.0.0.1";
+        function signalBadge(signal) {
+            if (signal === "LONG") return "badge badge-bull";
+            if (signal === "SHORT") return "badge badge-bear";
+            return "badge badge-neutral";
+        }
+
+        function actionBadge(action) {
+            return action === "TRADE" ? "badge badge-trade" : "badge badge-watch";
+        }
+
+        function trendBadge(trend) {
+            if (trend === "BULLISH") return "badge badge-bull";
+            if (trend === "BEARISH") return "badge badge-bear";
+            return "badge badge-neutral";
+        }
+
+        function changeClass(value) {
+            if (value == null) return "stat-value";
+            if (value > 0) return "stat-value change-up";
+            if (value < 0) return "stat-value change-down";
+            return "stat-value";
+        }
+
+        function statRow(label, value, valueClass = "stat-value") {
+            return `
+                <div class="stat-row">
+                    <span class="stat-label">${label}</span>
+                    <span class="${valueClass}">${value}</span>
+                </div>
+            `;
+        }
+
+        function cardShell(pair) {
             const url = `http://${host}:${pair.port}/`;
             const article = document.createElement("article");
             article.className = "card";
+            article.dataset.port = String(pair.port);
             article.innerHTML = `
                 <div class="card-head">
                     <span class="symbol">${pair.symbol}</span>
                     <span class="port">:${pair.port}</span>
                 </div>
-                <p class="card-copy">Live OHLC, depth, signals, and optional execution.</p>
+                <div class="badge-row">
+                    <span class="badge badge-neutral card-signal">—</span>
+                    <span class="badge badge-neutral card-action">—</span>
+                </div>
+                <div class="card-stats">
+                    ${statRow("Price", "—")}
+                    ${statRow("24h", "—")}
+                    ${statRow("Confidence", "—")}
+                    ${statRow("Trend", "—")}
+                    ${statRow("Pattern", "—")}
+                    ${statRow("Position", "—")}
+                </div>
+                <p class="card-status">Connecting…</p>
                 <a class="card-link" href="${url}" target="_blank" rel="noopener noreferrer">Open dashboard</a>
             `;
             return article;
+        }
+
+        function renderSummary(article, data) {
+            const signalEl = article.querySelector(".card-signal");
+            const actionEl = article.querySelector(".card-action");
+            signalEl.textContent = data.signal || "NEUTRAL";
+            signalEl.className = signalBadge(data.signal);
+            actionEl.textContent = data.action || "WATCH";
+            actionEl.className = actionBadge(data.action);
+
+            const stats = article.querySelector(".card-stats");
+            const trendValue = data.trend || "NEUTRAL";
+            stats.innerHTML = [
+                statRow("Price", data.price_display || "—", "stat-value strong"),
+                statRow("24h", data.change_display || "—", changeClass(data.change_24h)),
+                statRow("Confidence", `${data.confidence ?? 0}%`, "stat-value strong"),
+                statRow("Trend", trendValue, trendBadge(trendValue)),
+                statRow("Pattern", data.pattern || "None", "stat-value"),
+                statRow(
+                    "Position",
+                    data.position || "None",
+                    data.position_open ? "stat-value strong position-open" : "stat-value"
+                ),
+            ].join("");
+
+            const statusEl = article.querySelector(".card-status");
+            const exec = data.execution_enabled ? data.execution_mode.toUpperCase() : "OFF";
+            statusEl.textContent = `${data.ws_status || "—"} · exec ${exec}`;
+            statusEl.className = "card-status";
+        }
+
+        function renderOffline(article) {
+            const signalEl = article.querySelector(".card-signal");
+            const actionEl = article.querySelector(".card-action");
+            signalEl.textContent = "OFFLINE";
+            signalEl.className = "badge badge-neutral";
+            actionEl.textContent = "—";
+            actionEl.className = "badge badge-neutral";
+            const statusEl = article.querySelector(".card-status");
+            statusEl.textContent = "Dashboard not reachable";
+            statusEl.className = "card-status card-status-offline";
+        }
+
+        async function fetchSummary(pair) {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 2500);
+            try {
+                const response = await fetch(`http://${host}:${pair.port}/api/hub-summary`, {
+                    mode: "cors",
+                    signal: controller.signal,
+                });
+                if (!response.ok) {
+                    throw new Error(String(response.status));
+                }
+                return await response.json();
+            } finally {
+                clearTimeout(timeout);
+            }
+        }
+
+        async function refreshCards(pairs, cards) {
+            await Promise.all(
+                pairs.map(async (pair, index) => {
+                    try {
+                        const data = await fetchSummary(pair);
+                        renderSummary(cards[index], data);
+                    } catch {
+                        renderOffline(cards[index]);
+                    }
+                })
+            );
         }
 
         fetch("pairs.json")
@@ -50,9 +167,15 @@
                 if (!Array.isArray(pairs) || pairs.length === 0) {
                     throw new Error("No pairs configured");
                 }
-                meta.textContent = `${pairs.length} pair${pairs.length === 1 ? "" : "s"} · hub :${window.location.port || "8050"}`;
-                pairs.forEach((pair) => grid.appendChild(card(pair)));
-                footer.textContent = "Start dashboards with ./run-all.sh · Hub links use this host automatically.";
+                meta.textContent = `${pairs.length} pairs · hub :${window.location.port || "8050"}`;
+                const cards = pairs.map((pair) => {
+                    const article = cardShell(pair);
+                    grid.appendChild(article);
+                    return article;
+                });
+                footer.textContent = "Updates every 3s · Start with ./run-all.sh";
+                refreshCards(pairs, cards);
+                setInterval(() => refreshCards(pairs, cards), REFRESH_MS);
             })
             .catch((error) => {
                 meta.textContent = "Hub idle";

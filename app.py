@@ -16,6 +16,7 @@ import plotly.graph_objects as go
 import websockets
 from dash import Dash, Input, Output, dcc, html
 from dotenv import load_dotenv
+from flask import jsonify
 from plotly.subplots import make_subplots
 
 load_dotenv()
@@ -2296,6 +2297,13 @@ app.layout = html.Div(
 )
 
 
+@app.server.route("/api/hub-summary")
+def hub_summary_route():
+    response = jsonify(build_hub_summary())
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+
 @app.callback(
     Output("live-chart", "figure"),
     Output("price-header", "children"),
@@ -2371,6 +2379,47 @@ def build_telegram_status() -> str:
     if ex.get("message"):
         lines.append(f"Last: {ex['message']}")
     return "\n".join(lines)
+
+
+def build_hub_summary() -> dict:
+    """Compact snapshot for the multi-pair hub cards."""
+    _, _, metrics = get_candles_df()
+    signal = metrics.get("signal", "NEUTRAL")
+    confidence = int(metrics.get("confidence", 0))
+    min_conf = int(metrics.get("min_confidence", MIN_CONFIDENCE))
+    analysis = metrics.get("market_analysis") or {}
+    ex = metrics.get("execution") or {}
+    pos = ex.get("position") or {}
+
+    if pos.get("open"):
+        vol = pos.get("volume_usdt")
+        vol_text = f"{vol:.2f} USDT" if vol is not None else ""
+        position = f"{pos.get('direction', '—')} · {vol_text}".strip(" · ")
+    elif pos.get("pending"):
+        position = f"Pending {pos.get('direction', '—')}"
+    else:
+        position = "None"
+
+    change = metrics.get("change_24h")
+    return {
+        "symbol": SYMBOL.upper(),
+        "interval": INTERVAL,
+        "price": metrics.get("price"),
+        "price_display": format_price(metrics.get("price")),
+        "change_24h": change,
+        "change_display": f"{change:+.2f}%" if change is not None else "—",
+        "signal": signal,
+        "confidence": confidence,
+        "min_confidence": min_conf,
+        "action": "TRADE" if is_tradable_signal(signal, confidence, min_conf) else "WATCH",
+        "trend": analysis.get("htf_bias", "NEUTRAL"),
+        "pattern": metrics.get("pattern", "None"),
+        "ws_status": metrics.get("status", "—"),
+        "position": position,
+        "position_open": bool(pos.get("open")),
+        "execution_enabled": bool(ex.get("enabled")),
+        "execution_mode": ex.get("mode", "dry"),
+    }
 
 
 def start_ws() -> None:
