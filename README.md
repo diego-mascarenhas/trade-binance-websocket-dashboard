@@ -32,10 +32,13 @@ python app.py
 
 # Single symbol (overrides SYMBOL in .env — same as trade-binance-websocket-order-blocks)
 python app.py BNBUSDT
-python app.py etcusdt
+python app.py etcusdt --port 8051
+
+# If the port is already in use, the web UI is skipped (no error); websocket + execution keep running
+python app.py ETCUSDT --port 8050
 ```
 
-Open the dashboard at `http://127.0.0.1:8050` (or the host/port set in `.env`).
+Open the dashboard at `http://127.0.0.1:8050` (or the host/port from `.env` / `--port`).
 
 ### Main variables (`.env`)
 
@@ -47,7 +50,7 @@ Open the dashboard at `http://127.0.0.1:8050` (or the host/port set in `.env`).
 | `MAX_CANDLES`  | Max candles kept in memory           | `200`     |
 | `MIN_CONFIDENCE` | Minimum confidence to highlight a **TRADE** setup (same logic as order-blocks bot) | `50` |
 | `DASH_HOST`    | Dash bind address                    | `0.0.0.0` |
-| `DASH_PORT`    | Dash HTTP port                       | `8050`    |
+| `DASH_PORT`    | Dash HTTP port — default when no `--port` | `8050`    |
 | `EXECUTION_ENABLED` | Enable order execution on valid entries | `false` |
 | `EXECUTION_MODE` | `dry` (log only) or `live` (Binance Futures REST) | `dry` |
 | `BINANCE_API_KEY` / `BINANCE_SECRET_KEY` | Required for `live` mode | — |

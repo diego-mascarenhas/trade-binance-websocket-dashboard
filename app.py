@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import time
 from collections import deque
 from threading import Lock, Thread
@@ -35,7 +36,8 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Examples:\n"
             "  python app.py\n"
             "  python app.py BNBUSDT\n"
-            "  python app.py etcusdt"
+            "  python app.py etcusdt --port 8051\n"
+            "  python app.py --port 8051 ETCUSDT"
         ),
     )
     parser.add_argument(
@@ -44,7 +46,34 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="SYMBOL",
         help="Trading pair (e.g. BTCUSDT). Overrides SYMBOL in .env",
     )
+    parser.add_argument(
+        "-p",
+        "--port",
+        type=int,
+        metavar="PORT",
+        help="Dash HTTP port. Overrides DASH_PORT in .env (default: 8050)",
+    )
     return parser.parse_args(argv)
+
+
+def resolve_dash_port(cli_port: int | None) -> int:
+    env_port = int(os.getenv("DASH_PORT", "8050"))
+    if cli_port is not None:
+        if cli_port != env_port:
+            logger.info("Port %s (CLI overrides .env DASH_PORT=%s)", cli_port, env_port)
+        return cli_port
+    return env_port
+
+
+def is_port_available(host: str, port: int) -> bool:
+    bind_host = "" if host in ("", "0.0.0.0") else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((bind_host, port))
+            return True
+        except OSError:
+            return False
 
 
 _cli_args = parse_cli_args()
@@ -87,7 +116,7 @@ TRADE_PLAN_TRAIL_PCT = float(os.getenv("TRADE_PLAN_TRAIL_PCT", "0.25"))
 TRADE_PLAN_INITIAL_SIZE_PCT = float(os.getenv("TRADE_PLAN_INITIAL_SIZE_PCT", "50"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 DASH_HOST = os.getenv("DASH_HOST", "0.0.0.0")
-DASH_PORT = int(os.getenv("DASH_PORT", "8050"))
+DASH_PORT = resolve_dash_port(_cli_args.port)
 
 REST_BASE = "https://api.binance.com"
 WS_BASE = "wss://stream.binance.com:9443"
@@ -2207,4 +2236,16 @@ def start_ws() -> None:
 
 if __name__ == "__main__":
     Thread(target=start_ws, daemon=True).start()
-    app.run(debug=False, host=DASH_HOST, port=DASH_PORT)
+
+    if is_port_available(DASH_HOST, DASH_PORT):
+        app.run(debug=False, host=DASH_HOST, port=DASH_PORT)
+    else:
+        logger.warning(
+            "Port %s already in use — skipping Dash UI; websocket and execution continue",
+            DASH_PORT,
+        )
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            logger.info("Shutting down")
