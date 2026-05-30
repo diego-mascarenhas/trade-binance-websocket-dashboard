@@ -463,6 +463,18 @@ def get_candles_df() -> pd.DataFrame:
     return pd.DataFrame(rows), ob, metrics
 
 
+def build_depth_bar_data(
+    bids: list[list[float]], asks: list[list[float]]
+) -> tuple[list[str], list[float | None], list[float | None]]:
+    bid_map = {price: qty for price, qty in bids}
+    ask_map = {price: qty for price, qty in asks}
+    all_prices = sorted(set(bid_map) | set(ask_map), reverse=True)
+    labels = [f"{price:.2f}" for price in all_prices]
+    bid_values = [-bid_map[price] if price in bid_map else None for price in all_prices]
+    ask_values = [ask_map[price] if price in ask_map else None for price in all_prices]
+    return labels, bid_values, ask_values
+
+
 def build_figure() -> go.Figure:
     df, ob, metrics = get_candles_df()
 
@@ -554,28 +566,32 @@ def build_figure() -> go.Figure:
 
     bids = ob["bids"]
     asks = ob["asks"]
+    depth_labels, depth_bids, depth_asks = build_depth_bar_data(bids, asks)
 
-    if bids:
+    if depth_labels:
         fig.add_trace(
             go.Bar(
-                x=[q for _, q in bids],
-                y=[f"{p:.2f}" for p, _ in bids],
+                x=depth_bids,
+                y=depth_labels,
                 orientation="h",
                 name="Bids",
                 marker_color="rgba(0,193,118,0.65)",
+                hovertemplate="Bid<br>Price: %{y}<br>Qty: %{customdata}<extra></extra>",
+                customdata=[abs(v) if v is not None else 0 for v in depth_bids],
             ),
             row=2,
             col=1,
         )
 
-    if asks:
         fig.add_trace(
             go.Bar(
-                x=[-q for _, q in asks],
-                y=[f"{p:.2f}" for p, _ in asks],
+                x=depth_asks,
+                y=depth_labels,
                 orientation="h",
                 name="Asks",
                 marker_color="rgba(255,77,79,0.65)",
+                hovertemplate="Ask<br>Price: %{y}<br>Qty: %{customdata}<extra></extra>",
+                customdata=[v if v is not None else 0 for v in depth_asks],
             ),
             row=2,
             col=1,
@@ -633,8 +649,25 @@ def build_figure() -> go.Figure:
 
     fig.update_xaxes(type="date", rangeslider_visible=False, row=1, col=1)
     fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_xaxes(title_text="Quantity", row=2, col=1)
-    fig.update_yaxes(title_text="Price level", row=2, col=1)
+    fig.update_xaxes(
+        title_text="Quantity (← Bids | Asks →)",
+        zeroline=True,
+        zerolinewidth=1,
+        zerolinecolor="rgba(255,255,255,0.25)",
+        row=2,
+        col=1,
+    )
+    if depth_labels:
+        fig.update_yaxes(
+            title_text="Price level",
+            type="category",
+            categoryorder="array",
+            categoryarray=depth_labels,
+            row=2,
+            col=1,
+        )
+    else:
+        fig.update_yaxes(title_text="Price level", row=2, col=1)
 
     return fig
 
