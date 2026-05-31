@@ -25,6 +25,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TELEGRAM_POLL_INTERVAL = float(os.getenv("TELEGRAM_POLL_INTERVAL", "2"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 
+STOP_NOTIFY_COOLDOWN_SEC = 30.0
 _pause_lock = threading.Lock()
 _update_offset = 0
 _listener_stop = threading.Event()
@@ -82,7 +83,10 @@ def set_trading_paused(paused: bool, *, updated_by: str = "telegram") -> None:
 
 
 def set_fleet_running(running: bool, *, updated_by: str = "run-all") -> None:
-    write_fleet_state(fleet_running=running, updated_by=updated_by)
+    fields: dict[str, Any] = {"fleet_running": running}
+    if running:
+        fields["stop_notified_at"] = None
+    write_fleet_state(updated_by=updated_by, **fields)
 
 
 def trading_state_label() -> str:
@@ -99,12 +103,15 @@ def commands_enabled() -> bool:
     return os.getenv("TELEGRAM_COMMANDS_ENABLED", "").lower() in ("1", "true", "yes")
 
 
-def _send_sync(text: str, chat_id: str | None = None) -> bool:
+def _send_sync(text: str, chat_id: str | None = None, parse_mode: str | None = None) -> bool:
     if not is_configured():
         return False
     target_chat = chat_id or TELEGRAM_CHAT_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = json.dumps({"chat_id": target_chat, "text": text}).encode()
+    body: dict[str, Any] = {"chat_id": target_chat, "text": text}
+    if parse_mode:
+        body["parse_mode"] = parse_mode
+    payload = json.dumps(body).encode()
     request = urllib.request.Request(
         url,
         data=payload,
@@ -119,10 +126,16 @@ def _send_sync(text: str, chat_id: str | None = None) -> bool:
         return False
 
 
-def _send_async(text: str) -> None:
+def _send_async(text: str, parse_mode: str | None = None) -> None:
     if not is_configured():
         return
-    thread = threading.Thread(target=_send_sync, args=(text,), daemon=True, name="telegram-send")
+    thread = threading.Thread(
+        target=_send_sync,
+        args=(text,),
+        kwargs={"parse_mode": parse_mode},
+        daemon=True,
+        name="telegram-send",
+    )
     thread.start()
 
 
@@ -138,6 +151,11 @@ def position_emoji(direction: str) -> str:
 
 def send_bot(message: str) -> None:
     _send_async(f"🤖 {message}")
+
+
+def send_status(message: str) -> None:
+    """Fleet /status report with HTML formatting."""
+    _send_async(f"📊 {message}", parse_mode="HTML")
 
 
 def send_bot_sync(message: str) -> bool:
@@ -184,6 +202,8 @@ def notify_valid_entry(
     sl: str | None = None,
     tp1: str | None = None,
 ) -> None:
+    if os.getenv("TELEGRAM_NOTIFY_VALID_ENTRY", "").lower() not in ("1", "true", "yes"):
+        return
     lines = [
         f"{symbol.upper()} futures",
         f"Valid entry {direction} · {confidence}%",
@@ -275,9 +295,24 @@ def notify_fleet_stopped() -> None:
     with _shutdown_lock:
         if _shutdown_notified:
             return
+        state = read_fleet_state()
+        last = state.get("stop_notified_at")
+        if last is not None:
+            try:
+                if time.time() - float(last) < STOP_NOTIFY_COOLDOWN_SEC:
+                    _shutdown_notified = True
+                    return
+            except (TypeError, ValueError):
+                pass
         _shutdown_notified = True
+
     if not send_bot_sync("Fleet stopped — all dashboards offline"):
+        with _shutdown_lock:
+            _shutdown_notified = False
         logger.warning("Telegram fleet stop notification was not delivered")
+        return
+
+    write_fleet_state(updated_by="telegram", stop_notified_at=time.time(), fleet_running=False)
 
 
 def notify_stopped(symbol: str | None = None) -> None:
@@ -291,13 +326,6 @@ def shutdown_fleet() -> None:
     set_fleet_running(False, updated_by="run-all")
     stop_command_listener()
     notify_fleet_stopped()
-
-
-def shutdown(symbol: str | None = None) -> None:
-    """Per-pair shutdown hook — fleet stop is handled by shutdown_fleet()."""
-    if symbol:
-        return
-    shutdown_fleet()
 
 
 def _telegram_api_get(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -355,7 +383,7 @@ def _handle_command(command: str, status_provider: Callable[[], str]) -> None:
         send_bot("Fleet trading resumed — orders enabled on all pairs")
         return
     if command == "/status":
-        send_bot(status_provider())
+        send_status(status_provider())
         return
 
 
@@ -406,6 +434,7 @@ def start_command_listener(status_provider: Callable[[], str]) -> None:
     if not is_configured() or not commands_enabled():
         return
     global _update_offset
+    _listener_stop.clear()
     _prepare_command_polling()
     try:
         bootstrap = _telegram_api_get("getUpdates", {"offset": -1, "limit": 1})

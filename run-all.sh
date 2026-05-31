@@ -40,13 +40,6 @@ log() {
 }
 
 stop_all() {
-    if [[ -x "$VENV_PYTHON" && -f "$SCRIPT_DIR/telegram_fleet.py" ]]; then
-        TELEGRAM_COMMANDS_ENABLED=true "$VENV_PYTHON" -c "
-import telegram_notify as t
-t.shutdown_fleet()
-" 2>/dev/null || true
-    fi
-
     if [[ ! -f "$PID_FILE" ]]; then
         log "No pid file ($PID_FILE). Nothing to stop."
         return 0
@@ -70,6 +63,14 @@ t.shutdown_fleet()
     done < "$PID_FILE"
 
     rm -f "$PID_FILE"
+
+    if [[ -x "$VENV_PYTHON" && -f "$SCRIPT_DIR/telegram_notify.py" ]]; then
+        "$VENV_PYTHON" -c "
+import telegram_notify as t
+t.set_fleet_running(False, updated_by='run-all')
+" 2>/dev/null || true
+    fi
+
     log "Stopped."
 }
 

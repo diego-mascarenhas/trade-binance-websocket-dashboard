@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -25,6 +26,9 @@ PAIRS_FILE = SCRIPT_DIR / "hub" / "pairs.json"
 HUB_PORT = int(os.getenv("HUB_PORT", "8050"))
 FLEET_STATUS_HOST = os.getenv("FLEET_STATUS_HOST", "127.0.0.1")
 FLEET_STATUS_TIMEOUT = float(os.getenv("FLEET_STATUS_TIMEOUT", "2.5"))
+
+SEP_SECTION = "────────"
+SEP_SYMBOL = "· · ·"
 
 
 def _load_pairs() -> list[dict]:
@@ -49,23 +53,73 @@ def _fetch_pair_summary(port: int) -> dict | None:
         return None
 
 
-def _setup_line(data: dict) -> str:
+def _esc(value: object) -> str:
+    return html.escape(str(value), quote=False)
+
+
+def _signal_emoji(signal: str) -> str:
+    if signal == "LONG":
+        return "🟢"
+    if signal == "SHORT":
+        return "🔴"
+    return "⚪"
+
+
+def _trading_emoji() -> str:
+    label = telegram.trading_state_label()
+    if label == "active":
+        return "▶️"
+    if label == "paused":
+        return "⏸️"
+    return "⏹️"
+
+
+def _pnl_badge(pct: float | None) -> str:
+    if pct is None:
+        return ""
+    return f"<b>{_esc(f'{pct:+.2f}%')}</b>"
+
+
+def _section_header(emoji: str, title: str, count: int) -> str:
+    return f"{emoji} <b>{title}</b> ({count})\n{SEP_SECTION}"
+
+
+def _join_symbol_blocks(blocks: list[str]) -> str:
+    if not blocks:
+        return ""
+    return f"\n{SEP_SYMBOL}\n".join(blocks)
+
+
+def _setup_block(data: dict) -> str:
     signal = data.get("signal", "NEUTRAL")
     confidence = int(data.get("confidence", 0))
     smc = data.get("smc_pattern") or data.get("smc_state_short") or "—"
-    return f"{data.get('symbol', '—')}: {signal} {confidence}% · SMC {smc}"
+    symbol = _esc(data.get("symbol", "—"))
+    return (
+        f"{_signal_emoji(signal)} <b>{symbol}</b>\n"
+        f"   {_esc(signal)} <b>{confidence}%</b> · <i>{_esc(smc)}</i>"
+    )
+
+
+def _open_block(data: dict) -> str:
+    symbol = _esc(data.get("symbol", "—"))
+    pos = _esc(data.get("position") or "Open")
+    pct = data.get("position_pnl_pct")
+    pnl = _pnl_badge(pct)
+    head = f"<b>{symbol}</b>  {pnl}" if pnl else f"<b>{symbol}</b>"
+    return f"{head}\n   {pos}"
 
 
 def build_fleet_status() -> str:
     pairs = _load_pairs()
-    lines = [
-        f"Fleet · {len(pairs)} pairs",
-        f"Trading: {telegram.trading_state_label()}",
+    parts = [
+        f"<b>Fleet</b> · {len(pairs)} pairs",
+        f"{_trading_emoji()} Trading: <b>{_esc(telegram.trading_state_label())}</b>",
     ]
 
-    trade_rows: list[str] = []
-    watch_rows: list[str] = []
-    position_rows: list[str] = []
+    trade_blocks: list[str] = []
+    watch_blocks: list[str] = []
+    open_blocks: list[str] = []
     offline = 0
 
     for pair in pairs:
@@ -77,31 +131,32 @@ def build_fleet_status() -> str:
 
         action = data.get("action", "WATCH")
         if data.get("position_open"):
-            pos = data.get("position") or "Open"
-            pct = data.get("position_pnl_pct")
-            if pct is not None:
-                pos = f"{pos} · {pct:+.2f}%"
-            position_rows.append(f"{data.get('symbol')}: {pos}")
+            open_blocks.append(_open_block(data))
         if action == "TRADE":
-            trade_rows.append(_setup_line(data))
+            trade_blocks.append(_setup_block(data))
         elif action == "WATCH":
-            watch_rows.append(_setup_line(data))
+            watch_blocks.append(_setup_block(data))
 
-    if trade_rows:
-        lines.append("TRADE:")
-        lines.extend(trade_rows[:10])
-    if watch_rows:
-        lines.append("WATCH:")
-        lines.extend(watch_rows[:15])
-    if position_rows:
-        lines.append("Open:")
-        lines.extend(position_rows[:10])
+    has_content = False
+    if trade_blocks:
+        has_content = True
+        parts.append(_section_header("🔥", "TRADE", len(trade_blocks)))
+        parts.append(_join_symbol_blocks(trade_blocks[:10]))
+    if watch_blocks:
+        has_content = True
+        parts.append(_section_header("👀", "WATCH", len(watch_blocks)))
+        parts.append(_join_symbol_blocks(watch_blocks[:15]))
+    if open_blocks:
+        has_content = True
+        parts.append(_section_header("💼", "OPEN", len(open_blocks)))
+        parts.append(_join_symbol_blocks(open_blocks[:10]))
     if offline:
-        lines.append(f"Offline: {offline}")
+        parts.append(SEP_SECTION)
+        parts.append(f"⚠️ Offline: <b>{offline}</b>")
+    if not has_content:
+        parts.append(f"{SEP_SECTION}\n<i>All pairs idle · no setups or positions</i>")
 
-    if len(lines) == 2:
-        lines.append("All pairs idle · no open positions")
-    return "\n".join(lines)
+    return "\n".join(parts)
 
 
 def main() -> None:
