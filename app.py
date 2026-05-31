@@ -455,8 +455,10 @@ def compute_htf_bias(htf_closed_df: pd.DataFrame) -> tuple[str, float | None, fl
 
 
 def signal_aligned_with_trend(signal: str, trend_bias: str) -> bool:
-    if not REQUIRE_TREND_ALIGN or trend_bias == "NEUTRAL":
+    if not REQUIRE_TREND_ALIGN:
         return True
+    if trend_bias == "NEUTRAL":
+        return False
     if signal == "LONG" and trend_bias == "BULLISH":
         return True
     if signal == "SHORT" and trend_bias == "BEARISH":
