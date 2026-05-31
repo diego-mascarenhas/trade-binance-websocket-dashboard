@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Binance Live Dashboards</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="shell">
+        <header class="header">
+            <div>
+                <h1>Binance Live Dashboards</h1>
+                <p class="subtitle">Live signal, SMC structure, trend, and position per pair.</p>
+            </div>
+            <div class="meta" id="meta"></div>
+        </header>
+        <main id="grid" class="grid"></main>
+        <p class="footer" id="footer"></p>
+    </div>
+    <script>
+        const grid = document.getElementById("grid");
+        const meta = document.getElementById("meta");
+        const footer = document.getElementById("footer");
+        const host = window.location.hostname || "127.0.0.1";
+        const REFRESH_MS = 3000;
+
+        function signalBadge(signal) {
+            if (signal === "LONG") return "badge badge-bull";
+            if (signal === "SHORT") return "badge badge-bear";
+            return "badge badge-neutral";
+        }
+
+        function actionBadge(action) {
+            return action === "TRADE" ? "badge badge-trade" : "badge badge-watch";
+        }
+
+        function trendBadge(trend) {
+            if (trend === "BULLISH") return "badge badge-bull";
+            if (trend === "BEARISH") return "badge badge-bear";
+            return "badge badge-neutral";
+        }
+
+        function changeClass(value) {
+            if (value == null) return "stat-value";
+            if (value > 0) return "stat-value change-up";
+            if (value < 0) return "stat-value change-down";
+            return "stat-value";
+        }
+
+        function statRow(label, value, valueClass = "stat-value") {
+            return `
+                <div class="stat-row">
+                    <span class="stat-label">${label}</span>
+                    <span class="${valueClass}">${value}</span>
+                </div>
+            `;
+        }
+
+        function obClass(obNear) {
+            if (obNear === "support" || obNear === "support-side") {
+                return "stat-value near-support";
+            }
+            if (obNear === "resistance" || obNear === "resistance-side") {
+                return "stat-value near-resistance";
+            }
+            return "stat-value";
+        }
+
+        function smcPatternClass(bias) {
+            if (bias === "bull") return "stat-value smc-trend-bull";
+            if (bias === "bear") return "stat-value smc-trend-bear";
+            return "stat-value smc-trend-range";
+        }
+
+        function pnlClass(value) {
+            if (value == null) return "stat-value";
+            if (value > 0) return "stat-value change-up";
+            if (value < 0) return "stat-value change-down";
+            return "stat-value";
+        }
+
+        function cardShell(pair) {
+            const url = `http://${host}:${pair.port}/`;
+            const article = document.createElement("article");
+            article.className = "card";
+            article.dataset.port = String(pair.port);
+            article.innerHTML = `
+                <div class="card-head">
+                    <span class="symbol">${pair.symbol}</span>
+                    <span class="head-pnl"></span>
+                </div>
+                <div class="badge-row">
+                    <span class="badge badge-neutral card-signal">—</span>
+                    <span class="badge badge-neutral card-action">—</span>
+                </div>
+                <div class="card-stats">
+                    ${statRow("Price", "—")}
+                    ${statRow("24h", "—")}
+                    ${statRow("Confidence", "—")}
+                    ${statRow("Trend", "—")}
+                    ${statRow("SMC", "—")}
+                    ${statRow("OB zone", "—")}
+                    ${statRow("Position", "—")}
+                </div>
+                <p class="card-status">Connecting…</p>
+                <a class="card-link" href="${url}" target="_blank" rel="noopener noreferrer">Open dashboard</a>
+            `;
+            return article;
+        }
+
+        function formatPnlPct(value) {
+            if (value == null) return "";
+            const sign = value > 0 ? "+" : "";
+            return `${sign}${Number(value).toFixed(2)}%`;
+        }
+
+        function renderSummary(article, data) {
+            const signalEl = article.querySelector(".card-signal");
+            const actionEl = article.querySelector(".card-action");
+            signalEl.textContent = data.signal || "NEUTRAL";
+            signalEl.className = signalBadge(data.signal);
+            actionEl.textContent = data.action || "WATCH";
+            actionEl.className = actionBadge(data.action);
+
+            const headPnl = article.querySelector(".head-pnl");
+            if (data.position_open && data.position_pnl_pct != null) {
+                headPnl.textContent = formatPnlPct(data.position_pnl_pct);
+                headPnl.className = `head-pnl ${pnlClass(data.position_pnl_pct).replace("stat-value ", "")}`;
+            } else {
+                headPnl.textContent = "";
+                headPnl.className = "head-pnl";
+            }
+
+            const stats = article.querySelector(".card-stats");
+            const trendValue = data.trend || "NEUTRAL";
+            stats.innerHTML = [
+                statRow("Price", data.price_display || "—", "stat-value strong"),
+                statRow("24h", data.change_display || "—", changeClass(data.change_24h)),
+                statRow("Confidence", `${data.confidence ?? 0}%`, "stat-value strong"),
+                statRow("Trend", trendValue, trendBadge(trendValue)),
+                statRow(
+                    "SMC",
+                    data.smc_pattern || data.smc_state_short || "—",
+                    `${smcPatternClass(data.smc_pattern_bias)} smc-oneline`
+                ),
+                statRow("OB zone", data.ob_proximity || "—", obClass(data.ob_near)),
+                statRow(
+                    "Position",
+                    data.position || "None",
+                    data.position_open ? "stat-value strong" : "stat-value"
+                ),
+            ].join("");
+
+            const statusEl = article.querySelector(".card-status");
+            const exec = data.execution_enabled ? data.execution_mode.toUpperCase() : "OFF";
+            statusEl.textContent = `${data.ws_status || "—"} · exec ${exec}`;
+            statusEl.className = "card-status";
+        }
+
+        function renderOffline(article) {
+            const signalEl = article.querySelector(".card-signal");
+            const actionEl = article.querySelector(".card-action");
+            signalEl.textContent = "OFFLINE";
+            signalEl.className = "badge badge-neutral";
+            actionEl.textContent = "—";
+            actionEl.className = "badge badge-neutral";
+            const headPnl = article.querySelector(".head-pnl");
+            if (headPnl) {
+                headPnl.textContent = "";
+                headPnl.className = "head-pnl";
+            }
+            const statusEl = article.querySelector(".card-status");
+            statusEl.textContent = "Dashboard not reachable";
+            statusEl.className = "card-status card-status-offline";
+        }
+
+        async function fetchSummary(pair) {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 2500);
+            try {
+                const response = await fetch(`http://${host}:${pair.port}/api/hub-summary`, {
+                    mode: "cors",
+                    signal: controller.signal,
+                });
+                if (!response.ok) {
+                    throw new Error(String(response.status));
+                }
+                return await response.json();
+            } finally {
+                clearTimeout(timeout);
+            }
+        }
+
+        async function refreshCards(pairs, cards) {
+            const results = await Promise.all(
+                pairs.map(async (pair, index) => {
+                    try {
+                        const data = await fetchSummary(pair);
+                        renderSummary(cards[index], data);
+                        return data;
+                    } catch {
+                        renderOffline(cards[index]);
+                        return null;
+                    }
+                })
+            );
+            renderHubMeta(aggregateHubCounts(results), pairs.length);
+        }
+
+        function aggregateHubCounts(results) {
+            const counts = {
+                trade: 0,
+                watch: 0,
+                open: 0,
+                pending: 0,
+                offline: 0,
+                tradeAligned: 0,
+                htfMismatch: 0,
+                lowSignal: 0,
+                fleetPaused: false,
+                executeAuto: false,
+            };
+
+            for (const data of results) {
+                if (!data) {
+                    counts.offline += 1;
+                    continue;
+                }
+                if (data.action === "TRADE") {
+                    counts.trade += 1;
+                } else {
+                    counts.watch += 1;
+                }
+                if (data.position_open) {
+                    counts.open += 1;
+                }
+                if (data.position_pending) {
+                    counts.pending += 1;
+                }
+                if (data.signal === "NEUTRAL" || (data.confidence ?? 0) === 0) {
+                    counts.lowSignal += 1;
+                }
+                if (data.action === "TRADE") {
+                    if (data.trend_aligned === true) {
+                        counts.tradeAligned += 1;
+                    } else if (data.trend_aligned === false) {
+                        counts.htfMismatch += 1;
+                    }
+                }
+                counts.fleetPaused = Boolean(data.trading_paused);
+                counts.executeAuto = Boolean(data.execution_auto);
+            }
+            return counts;
+        }
+
+        function renderHubMeta(counts, totalPairs) {
+            const parts = [`${totalPairs} pairs`];
+            if (counts.offline) {
+                parts.push(`${counts.offline} offline`);
+            }
+            parts.push(`${counts.trade} TRADE`, `${counts.watch} WATCH`);
+            if (counts.open) {
+                parts.push(`${counts.open} open`);
+            }
+            if (counts.pending) {
+                parts.push(`${counts.pending} pending`);
+            }
+
+            const blocks = [];
+            if (counts.htfMismatch) {
+                blocks.push(`HTF mismatch ${counts.htfMismatch}`);
+            }
+            if (counts.tradeAligned) {
+                blocks.push(`aligned ${counts.tradeAligned}`);
+            }
+            if (counts.lowSignal) {
+                blocks.push(`low signal ${counts.lowSignal}`);
+            }
+            if (!counts.executeAuto) {
+                blocks.push("auto exec off");
+            }
+            if (counts.fleetPaused) {
+                blocks.push("fleet paused");
+            }
+
+            meta.innerHTML = `
+                <div class="meta-primary">${parts.join(" · ")}</div>
+                ${blocks.length ? `<div class="meta-blocks">Blocked: ${blocks.join(" · ")}</div>` : ""}
+            `;
+        }
+
+        fetch("pairs.json")
+            .then((response) => {
+                if (!response.ok) {
+                    throw new Error("pairs.json not found");
+                }
+                return response.json();
+            })
+            .then((pairs) => {
+                if (!Array.isArray(pairs) || pairs.length === 0) {
+                    throw new Error("No pairs configured");
+                }
+                meta.innerHTML = `<div class="meta-primary">${pairs.length} pairs</div>`;
+                const cards = pairs.map((pair) => {
+                    const article = cardShell(pair);
+                    grid.appendChild(article);
+                    return article;
+                });
+                footer.textContent = "Updates every 3s · Start with ./run-all.sh";
+                refreshCards(pairs, cards);
+                setInterval(() => refreshCards(pairs, cards), REFRESH_MS);
+            })
+            .catch((error) => {
+                meta.innerHTML = `<div class="meta-primary">Hub idle</div>`;
+                grid.innerHTML = `<div class="empty">Run <code>./run-all.sh</code> to generate pairs.json and start the dashboards.<br><small>${error.message}</small></div>`;
+            });
+    </script>
+</body>
+</html>

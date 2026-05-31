@@ -1,0 +1,283 @@
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #0f1117;
+    color: #f5f5f5;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.shell {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 24px 20px 40px;
+}
+
+.header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+h1 {
+    margin: 0 0 8px;
+    font-size: 1.75rem;
+    font-weight: 700;
+}
+
+.subtitle {
+    margin: 0;
+    color: #9aa4b2;
+    font-size: 0.95rem;
+}
+
+.meta {
+    padding: 10px 14px;
+    background: #171a21;
+    border: 1px solid #2a2f3a;
+    border-radius: 10px;
+    color: #c7d0db;
+    font-size: 0.85rem;
+    white-space: normal;
+    min-width: 220px;
+    max-width: 440px;
+    text-align: right;
+    line-height: 1.35;
+}
+
+.meta-primary {
+    font-weight: 600;
+    color: #e8ecf1;
+}
+
+.meta-blocks {
+    margin-top: 6px;
+    font-size: 0.78rem;
+    color: #ffc107;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 14px;
+}
+
+.card {
+    background: #171a21;
+    border: 1px solid #2a2f3a;
+    border-radius: 12px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.card-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.symbol {
+    font-size: 1.05rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+}
+
+.head-pnl {
+    margin-left: auto;
+    font-size: 0.9rem;
+    font-weight: 600;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+
+.head-pnl.change-up {
+    color: #00c176;
+}
+
+.head-pnl.change-down {
+    color: #ff4d4f;
+}
+
+.port {
+    color: #6b7280;
+    font-size: 0.82rem;
+}
+
+.badge-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.badge {
+    display: inline-block;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-weight: 600;
+    font-size: 0.72rem;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+
+.badge-neutral {
+    background: #2a2f3a;
+    color: #d0d4dc;
+}
+
+.badge-bull {
+    background: rgba(0, 193, 118, 0.18);
+    color: #00c176;
+    border: 1px solid rgba(0, 193, 118, 0.45);
+}
+
+.badge-bear {
+    background: rgba(255, 77, 79, 0.18);
+    color: #ff4d4f;
+    border: 1px solid rgba(255, 77, 79, 0.45);
+}
+
+.badge-trade {
+    background: rgba(88, 166, 255, 0.16);
+    color: #58a6ff;
+    border: 1px solid rgba(88, 166, 255, 0.45);
+}
+
+.badge-watch {
+    background: rgba(255, 193, 7, 0.14);
+    color: #ffc107;
+    border: 1px solid rgba(255, 193, 7, 0.4);
+}
+
+.card-stats {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.stat-row {
+    display: grid;
+    grid-template-columns: minmax(72px, 42%) 1fr;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 0;
+}
+
+.stat-label {
+    color: #9aa0a6;
+    font-size: 0.78rem;
+}
+
+.stat-value {
+    color: #ffffff;
+    font-size: 0.82rem;
+    text-align: right;
+    line-height: 1.3;
+    word-break: break-word;
+}
+
+.stat-value.strong {
+    font-weight: 600;
+}
+
+.stat-value.change-up {
+    color: #00c176;
+    font-weight: 600;
+}
+
+.stat-value.change-down {
+    color: #ff4d4f;
+    font-weight: 600;
+}
+
+.stat-value.position-open {
+    color: #58a6ff;
+}
+
+.stat-value.near-support {
+    color: #00c176;
+    font-weight: 600;
+}
+
+.stat-value.near-resistance {
+    color: #ff4d4f;
+    font-weight: 600;
+}
+
+.stat-value.smc-trend-bull {
+    color: #00c176;
+    font-weight: 600;
+}
+
+.stat-value.smc-trend-bear {
+    color: #ff4d4f;
+    font-weight: 600;
+}
+
+.stat-value.smc-trend-range {
+    color: #9aa0a6;
+    font-weight: 600;
+}
+
+.stat-value.smc-oneline {
+    font-size: 0.75rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.card-status {
+    margin: 0;
+    color: #6b7280;
+    font-size: 0.74rem;
+    line-height: 1.35;
+}
+
+.card-status-offline {
+    color: #ff4d4f;
+}
+
+.card-link {
+    display: inline-block;
+    text-align: center;
+    margin-top: 2px;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: #2563eb;
+    color: #fff;
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 0.85rem;
+}
+
+.card-link:hover {
+    background: #1d4ed8;
+}
+
+.empty {
+    grid-column: 1 / -1;
+    padding: 24px;
+    background: #171a21;
+    border: 1px dashed #2a2f3a;
+    border-radius: 12px;
+    color: #9aa4b2;
+    line-height: 1.6;
+}
+
+.empty code {
+    color: #f5f5f5;
+}
+
+.footer {
+    margin: 28px 0 0;
+    color: #6b7280;
+    font-size: 0.82rem;
+    text-align: center;
+}
