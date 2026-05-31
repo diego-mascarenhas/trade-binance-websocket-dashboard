@@ -42,7 +42,28 @@ h1 {
     border-radius: 10px;
     color: #c7d0db;
     font-size: 0.85rem;
-    white-space: nowrap;
+    white-space: normal;
+    min-width: 220px;
+    max-width: 440px;
+    text-align: right;
+    line-height: 1.35;
+}
+
+.meta-primary {
+    font-weight: 600;
+    color: #e8ecf1;
+}
+
+.meta-blocks {
+    margin-top: 6px;
+    font-size: 0.78rem;
+    color: #ffc107;
+}
+
+.meta-foot {
+    margin-top: 6px;
+    font-size: 0.74rem;
+    color: #6b7280;
 }
 
 .grid {

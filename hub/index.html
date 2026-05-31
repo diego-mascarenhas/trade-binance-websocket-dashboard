@@ -193,16 +193,108 @@
         }
 
         async function refreshCards(pairs, cards) {
-            await Promise.all(
+            const results = await Promise.all(
                 pairs.map(async (pair, index) => {
                     try {
                         const data = await fetchSummary(pair);
                         renderSummary(cards[index], data);
+                        return data;
                     } catch {
                         renderOffline(cards[index]);
+                        return null;
                     }
                 })
             );
+            renderHubMeta(aggregateHubCounts(results), pairs.length);
+        }
+
+        function aggregateHubCounts(results) {
+            const counts = {
+                trade: 0,
+                watch: 0,
+                open: 0,
+                pending: 0,
+                offline: 0,
+                tradeAligned: 0,
+                htfMismatch: 0,
+                lowSignal: 0,
+                fleetPaused: false,
+                executeAuto: false,
+                executionMode: "off",
+            };
+
+            for (const data of results) {
+                if (!data) {
+                    counts.offline += 1;
+                    continue;
+                }
+                if (data.action === "TRADE") {
+                    counts.trade += 1;
+                } else {
+                    counts.watch += 1;
+                }
+                if (data.position_open) {
+                    counts.open += 1;
+                }
+                if (data.position_pending) {
+                    counts.pending += 1;
+                }
+                if (data.signal === "NEUTRAL" || (data.confidence ?? 0) === 0) {
+                    counts.lowSignal += 1;
+                }
+                if (data.action === "TRADE") {
+                    if (data.trend_aligned === true) {
+                        counts.tradeAligned += 1;
+                    } else if (data.trend_aligned === false) {
+                        counts.htfMismatch += 1;
+                    }
+                }
+                counts.fleetPaused = Boolean(data.trading_paused);
+                counts.executeAuto = Boolean(data.execution_auto);
+                counts.executionMode = data.execution_mode || "off";
+            }
+            return counts;
+        }
+
+        function renderHubMeta(counts, totalPairs) {
+            const parts = [`${totalPairs} pairs`];
+            if (counts.offline) {
+                parts.push(`${counts.offline} offline`);
+            }
+            parts.push(`${counts.trade} TRADE`, `${counts.watch} WATCH`);
+            if (counts.open) {
+                parts.push(`${counts.open} open`);
+            }
+            if (counts.pending) {
+                parts.push(`${counts.pending} pending`);
+            }
+
+            const blocks = [];
+            if (counts.htfMismatch) {
+                blocks.push(`HTF mismatch ${counts.htfMismatch}`);
+            }
+            if (counts.tradeAligned) {
+                blocks.push(`aligned ${counts.tradeAligned}`);
+            }
+            if (counts.lowSignal) {
+                blocks.push(`low signal ${counts.lowSignal}`);
+            }
+            if (!counts.executeAuto) {
+                blocks.push("auto exec off");
+            }
+            if (counts.fleetPaused) {
+                blocks.push("fleet paused");
+            }
+
+            const execLabel = counts.executeAuto
+                ? `exec ${String(counts.executionMode).toUpperCase()}`
+                : "exec manual";
+
+            meta.innerHTML = `
+                <div class="meta-primary">${parts.join(" · ")}</div>
+                ${blocks.length ? `<div class="meta-blocks">Blocked: ${blocks.join(" · ")}</div>` : ""}
+                <div class="meta-foot">${execLabel} · updates ${REFRESH_MS / 1000}s</div>
+            `;
         }
 
         fetch("pairs.json")
@@ -216,7 +308,7 @@
                 if (!Array.isArray(pairs) || pairs.length === 0) {
                     throw new Error("No pairs configured");
                 }
-                meta.textContent = `${pairs.length} pairs`;
+                meta.innerHTML = `<div class="meta-primary">${pairs.length} pairs</div>`;
                 const cards = pairs.map((pair) => {
                     const article = cardShell(pair);
                     grid.appendChild(article);
@@ -227,7 +319,7 @@
                 setInterval(() => refreshCards(pairs, cards), REFRESH_MS);
             })
             .catch((error) => {
-                meta.textContent = "Hub idle";
+                meta.innerHTML = `<div class="meta-primary">Hub idle</div>`;
                 grid.innerHTML = `<div class="empty">Run <code>./run-all.sh</code> to generate pairs.json and start the dashboards.<br><small>${error.message}</small></div>`;
             });
     </script>

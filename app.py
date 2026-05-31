@@ -2929,6 +2929,10 @@ def build_hub_summary() -> dict:
     change = metrics.get("change_24h")
     ob_proximity, ob_near = format_ob_proximity(metrics)
     smc = analysis.get("smc") or {}
+    trend = analysis.get("htf_bias", "NEUTRAL")
+    trend_aligned = None
+    if signal in ("LONG", "SHORT"):
+        trend_aligned = signal_aligned_with_trend(signal, trend)
     return {
         "symbol": SYMBOL.upper(),
         "interval": INTERVAL,
@@ -2940,7 +2944,7 @@ def build_hub_summary() -> dict:
         "confidence": confidence,
         "min_confidence": min_conf,
         "action": "TRADE" if is_tradable_signal(signal, confidence, min_conf) else "WATCH",
-        "trend": analysis.get("htf_bias", "NEUTRAL"),
+        "trend": trend,
         "smc_state": smc.get("state", "—"),
         "smc_pattern": smc.get("pattern", "—"),
         "smc_pattern_bias": smc.get("pattern_bias", "neutral"),
@@ -2953,8 +2957,12 @@ def build_hub_summary() -> dict:
         "ws_status": metrics.get("status", "—"),
         "position": position,
         "position_open": bool(pos.get("open")),
+        "position_pending": bool(pos.get("pending")),
         "position_pnl": position_pnl,
         "position_pnl_pct": position_pnl_pct,
+        "trend_aligned": trend_aligned,
+        "require_trend_align": REQUIRE_TREND_ALIGN,
+        "trading_paused": telegram.is_trading_paused(),
         "execution_enabled": bool(ex.get("enabled")),
         "execution_auto": bool(ex.get("auto_execute")),
         "execution_mode": ex.get("mode", "dry"),
