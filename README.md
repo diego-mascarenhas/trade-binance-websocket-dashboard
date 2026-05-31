@@ -123,6 +123,10 @@ Export for notebooks:
 curl -o features.csv "http://127.0.0.1:8050/api/export/features.csv?days=30"
 ```
 
+### DeepSeek config suggestions
+
+With `DEEPSEEK_ENABLED=true` and `DEEPSEEK_API_KEY` in `.env`, open **Analytics → Analyze** to get AI tuning advice from your `decision_events` (ADX/RSI thresholds, cooldown, per-symbol overrides). Responses are cached (`DEEPSEEK_SUGGESTIONS_COOLDOWN`, default 300s). API key stays on the server only.
+
 ### Telegram commands
 
 Fleet commands (same chat as `TELEGRAM_CHAT_ID` only). With `./run-all.sh`, **one** fleet listener handles commands for all pairs (avoids 409 Conflict):

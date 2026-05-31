@@ -401,3 +401,179 @@ def features_to_csv(rows: list[dict[str, Any]]) -> str:
     for row in rows:
         writer.writerow(row)
     return buffer.getvalue()
+
+
+def _where_parts(days: int | None, symbol: str | None) -> tuple[str, list[Any]]:
+    where_parts: list[str] = []
+    params: list[Any] = []
+    where_extra, day_params = _days_clause(days)
+    if where_extra:
+        where_parts.append(where_extra.lstrip(" AND "))
+        params.extend(day_params)
+    if symbol:
+        where_parts.append("symbol = %s")
+        params.append(symbol.upper())
+    where_sql = " AND ".join(where_parts) if where_parts else "1=1"
+    return where_sql, params
+
+
+def get_block_indicator_stats(
+    days: int | None = 7,
+    symbol: str | None = None,
+) -> list[dict[str, Any]]:
+    """Average RSI/ADX at block time, grouped by block_reason."""
+    if not db_store.is_enabled():
+        return []
+
+    where_sql, params = _where_parts(days, symbol)
+    try:
+        conn = db_store.connect()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT
+                        COALESCE(block_reason, '(none)') AS block_reason,
+                        COUNT(*) AS count,
+                        AVG(CAST(JSON_UNQUOTE(JSON_EXTRACT(market_snapshot, '$.rsi')) AS DECIMAL(12,4))) AS avg_rsi,
+                        AVG(CAST(JSON_UNQUOTE(JSON_EXTRACT(market_snapshot, '$.adx')) AS DECIMAL(12,4))) AS avg_adx,
+                        AVG(CAST(JSON_UNQUOTE(JSON_EXTRACT(market_snapshot, '$.htf_adx')) AS DECIMAL(12,4))) AS avg_htf_adx,
+                        AVG(CAST(JSON_UNQUOTE(JSON_EXTRACT(market_snapshot, '$.confidence')) AS DECIMAL(12,4))) AS avg_confidence
+                    FROM decision_events
+                    WHERE {where_sql}
+                      AND block_reason IS NOT NULL
+                    GROUP BY block_reason
+                    ORDER BY count DESC
+                    LIMIT 20
+                    """,
+                    params,
+                )
+                rows = cursor.fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return []
+
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        item = {"block_reason": row["block_reason"], "count": int(row["count"] or 0)}
+        for key in ("avg_rsi", "avg_adx", "avg_htf_adx", "avg_confidence"):
+            value = row.get(key)
+            item[key] = float(value) if value is not None else None
+        result.append(item)
+    return result
+
+
+def get_symbol_event_stats(days: int | None = 7) -> list[dict[str, Any]]:
+    if not db_store.is_enabled():
+        return []
+
+    where_sql, params = _where_parts(days, None)
+    try:
+        conn = db_store.connect()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT
+                        symbol,
+                        COUNT(*) AS total,
+                        SUM(event_type = 'valid_entry') AS valid_entries,
+                        SUM(event_type = 'indicator_blocked') AS indicator_blocked,
+                        SUM(event_type = 'valid_entry_blocked') AS valid_entry_blocked
+                    FROM decision_events
+                    WHERE {where_sql}
+                    GROUP BY symbol
+                    ORDER BY total DESC
+                    LIMIT 20
+                    """,
+                    params,
+                )
+                rows = cursor.fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return []
+
+    return [
+        {
+            "symbol": row["symbol"],
+            "total": int(row["total"] or 0),
+            "valid_entries": int(row["valid_entries"] or 0),
+            "indicator_blocked": int(row["indicator_blocked"] or 0),
+            "valid_entry_blocked": int(row["valid_entry_blocked"] or 0),
+        }
+        for row in rows
+    ]
+
+
+def get_latest_config_snapshot() -> dict[str, Any]:
+    if not db_store.is_enabled():
+        return {}
+
+    try:
+        conn = db_store.connect()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT config_snapshot
+                    FROM decision_events
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    """
+                )
+                row = cursor.fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+
+    if not row:
+        return {}
+    return _parse_json(row.get("config_snapshot"))
+
+
+def build_suggestion_context(
+    days: int | None = 7,
+    symbol: str | None = None,
+) -> dict[str, Any]:
+    """Compact payload for DeepSeek config suggestions."""
+    days_filter = None if days is not None and days <= 0 else days
+    return {
+        "range_days": days_filter,
+        "symbol_filter": symbol.upper() if symbol else None,
+        "overview": get_overview(days_filter),
+        "event_types": get_breakdown("event_type", days=days_filter, symbol=symbol),
+        "block_reasons": get_breakdown("block_reason", days=days_filter, symbol=symbol),
+        "symbols": get_symbol_event_stats(days_filter),
+        "block_indicator_stats": get_block_indicator_stats(days_filter, symbol),
+        "recent_valid_entries": [
+            row
+            for row in get_recent_events(30, symbol)
+            if row.get("event_type") == "valid_entry"
+        ][:10],
+        "recent_indicator_blocks": [
+            row
+            for row in get_recent_events(30, symbol)
+            if row.get("event_type") == "indicator_blocked"
+        ][:10],
+        "active_config": get_latest_config_snapshot(),
+        "overridable_keys": sorted(
+            [
+                "MIN_CONFIDENCE",
+                "HTF_INTERVAL",
+                "REQUIRE_TREND_ALIGN",
+                "SIGNAL_COOLDOWN_SEC",
+                "RSI_LONG_MAX",
+                "RSI_SHORT_MIN",
+                "ADX_MIN_TREND",
+                "ADX_USE_HTF",
+                "INDICATOR_FILTERS_ENABLED",
+                "RSI_FILTER_ENABLED",
+                "ADX_FILTER_ENABLED",
+                "symbol_trading_enabled",
+            ]
+        ),
+    }
+

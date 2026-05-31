@@ -52,6 +52,19 @@
 
         <section class="kpi-grid" id="kpi-grid"></section>
 
+        <section class="panel panel-wide suggestions-panel" id="suggestions-panel">
+            <div class="panel-head">
+                <h2>DeepSeek suggestions</h2>
+                <div class="panel-actions">
+                    <button class="btn btn-primary" id="suggestions-btn" type="button">Analyze</button>
+                </div>
+            </div>
+            <p class="note" id="suggestions-note">
+                AI config advice from your decision_events (filters, cooldown, per-symbol tuning).
+            </p>
+            <div id="suggestions-content"></div>
+        </section>
+
         <section class="panel panel-wide">
             <h2>Events over time</h2>
             <div id="timeline-chart" class="chart"></div>

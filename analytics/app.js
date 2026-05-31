@@ -11,6 +11,10 @@ const kpiGrid = document.getElementById("kpi-grid");
 const footer = document.getElementById("footer");
 const exportBtn = document.getElementById("export-btn");
 const refreshBtn = document.getElementById("refresh-btn");
+const suggestionsBtn = document.getElementById("suggestions-btn");
+const suggestionsNote = document.getElementById("suggestions-note");
+const suggestionsContent = document.getElementById("suggestions-content");
+let deepseekAvailable = false;
 
 const PLOTLY_LAYOUT = {
     paper_bgcolor: "#171a21",
@@ -172,9 +176,96 @@ function renderFeatureColumns(columns) {
         .join("");
 }
 
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+}
+
+function renderSuggestions(payload) {
+    if (!payload || payload.error) {
+        suggestionsContent.innerHTML = "";
+        suggestionsNote.className = "note warn";
+        suggestionsNote.textContent = payload?.error || "Could not load suggestions.";
+        return;
+    }
+
+    const cacheHint = payload.cached
+        ? ` (cached ${payload.cached_seconds_ago}s ago — use Analyze to refresh after cooldown)`
+        : "";
+    suggestionsNote.className = "note";
+    suggestionsNote.textContent = `Model ${payload.model || "deepseek"} · ${payload.context_events || 0} events analyzed · ${payload.generated_at || ""}${cacheHint}`;
+
+    const cards = (payload.suggestions || [])
+        .map((item) => {
+            const priority = (item.priority || "medium").toLowerCase();
+            const symbol = item.symbol ? ` · ${escapeHtml(item.symbol)}` : "";
+            const config = item.config_changes
+                ? `<div class="suggestion-config">${escapeHtml(JSON.stringify(item.config_changes))}</div>`
+                : "";
+            return `
+                <article class="suggestion-card priority-${priority}">
+                    <div class="suggestion-title-row">
+                        <span class="suggestion-badge">${escapeHtml(item.area || "GENERAL")}</span>
+                        <span class="suggestion-badge">${escapeHtml(priority)}</span>
+                        <span class="suggestion-title">${escapeHtml(item.title || "Suggestion")}${symbol}</span>
+                    </div>
+                    <div class="suggestion-detail">${escapeHtml(item.detail || "")}</div>
+                    ${config}
+                </article>
+            `;
+        })
+        .join("");
+
+    const warnings = (payload.warnings || []).length
+        ? `<div class="warning-list"><strong>Warnings</strong><ul>${payload.warnings
+              .map((w) => `<li>${escapeHtml(w)}</li>`)
+              .join("")}</ul></div>`
+        : "";
+
+    suggestionsContent.innerHTML = `
+        <div class="suggestion-summary">${escapeHtml(payload.summary || "No summary returned.")}</div>
+        <div class="suggestion-list">${cards || '<div class="note">No suggestions returned.</div>'}</div>
+        ${warnings}
+    `;
+}
+
+async function loadSuggestions(force = false) {
+    if (!deepseekAvailable) {
+        suggestionsNote.className = "note warn";
+        suggestionsNote.textContent =
+            "DeepSeek disabled — set DEEPSEEK_ENABLED=true and DEEPSEEK_API_KEY in .env, then restart ./run-all.sh";
+        return;
+    }
+
+    suggestionsBtn.disabled = true;
+    suggestionsBtn.textContent = "Analyzing…";
+    suggestionsNote.className = "note";
+    suggestionsNote.textContent = "Calling DeepSeek with your decision_events summary…";
+
+    try {
+        const params = queryParams();
+        if (force) {
+            params.set("force", "1");
+        }
+        const response = await fetch(`/api/suggestions?${params.toString()}`);
+        const payload = await response.json();
+        renderSuggestions(payload);
+    } catch (error) {
+        suggestionsNote.className = "note warn";
+        suggestionsNote.textContent = `Suggestions failed: ${error.message}`;
+    } finally {
+        suggestionsBtn.disabled = false;
+        suggestionsBtn.textContent = "Analyze";
+    }
+}
+
 async function refresh() {
     try {
         const health = await fetchJson("/api/health");
+        deepseekAvailable = Boolean(health.deepseek_enabled);
         if (!health.db_enabled) {
             statusNote.className = "note warn";
             statusNote.textContent =
@@ -216,8 +307,27 @@ async function refresh() {
 
         statusNote.className = "note";
         const rangeLabel = daysEl.options[daysEl.selectedIndex].text.toLowerCase();
-        statusNote.textContent = `Showing ${formatNumber(overview.total_events)} events (${rangeLabel}). Data grows as the fleet runs with DB_ENABLED=true.`;
+        const total = overview.total_events || 0;
+        const symbols = overview.symbols_seen || 0;
+        const lastEvent = overview.last_event
+            ? ` · last event ${overview.last_event.replace("T", " ").replace("+00:00", " UTC")}`
+            : "";
+        if (total > 0) {
+            statusNote.textContent = `MySQL connected · ${formatNumber(total)} events (${rangeLabel}) · ${formatNumber(symbols)} symbol(s)${lastEvent}.`;
+        } else {
+            statusNote.textContent = `MySQL connected · no events in ${rangeLabel} yet. Keep the fleet running to collect decision_events.`;
+        }
         footer.textContent = `Last refresh ${new Date().toLocaleString()} · Export up to 50k rows for ML pipelines.`;
+
+        if (!deepseekAvailable) {
+            suggestionsNote.className = "note";
+            suggestionsNote.textContent =
+                "Optional: set DEEPSEEK_ENABLED=true and DEEPSEEK_API_KEY in .env, then restart ./run-all.sh to enable AI suggestions.";
+        } else if (!suggestionsContent.innerHTML) {
+            suggestionsNote.className = "note";
+            suggestionsNote.textContent =
+                "Click Analyze to get DeepSeek config suggestions from your decision_events.";
+        }
     } catch (error) {
         statusNote.className = "note warn";
         statusNote.textContent = `Failed to load analytics: ${error.message}`;
@@ -229,6 +339,7 @@ exportBtn.addEventListener("click", () => {
 });
 
 refreshBtn.addEventListener("click", refresh);
+suggestionsBtn.addEventListener("click", () => loadSuggestions(true));
 daysEl.addEventListener("change", refresh);
 symbolEl.addEventListener("change", refresh);
 granularityEl.addEventListener("change", refresh);

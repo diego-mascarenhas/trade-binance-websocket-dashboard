@@ -11,6 +11,7 @@ from flask import Flask, Response, abort, jsonify, redirect, request, send_from_
 
 import db_analytics
 import db_store
+import deepseek_advisor
 
 load_dotenv()
 
@@ -65,6 +66,8 @@ def health():
         "ok": True,
         "db_enabled": db_store.is_enabled(),
         "db_ready": db_store.ensure_schema() if db_store.is_enabled() else False,
+        "deepseek_enabled": deepseek_advisor.is_enabled(),
+        "deepseek_configured": deepseek_advisor.is_configured(),
     }
     return _cors(jsonify(payload))
 
@@ -112,6 +115,20 @@ def features():
         offset=offset,
     )
     return _cors(jsonify({"rows": rows, "total": total, "columns": list(db_analytics.ML_FEATURE_KEYS)}))
+
+
+@app.route("/api/suggestions")
+def suggestions():
+    days = _int_arg("days", 7, minimum=0, maximum=365)
+    days_filter = None if days == 0 else days
+    force = request.args.get("force", "").lower() in ("1", "true", "yes")
+    result = deepseek_advisor.generate_suggestions(
+        days=days_filter,
+        symbol=_optional_symbol(),
+        force=force,
+    )
+    status = 200 if not result.get("error") or result.get("suggestions") else 503
+    return _cors(jsonify(result)), status
 
 
 @app.route("/api/export/features.csv")
