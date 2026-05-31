@@ -59,6 +59,8 @@ TP_TRAILING_CALLBACK_RATE = float(os.getenv("TP_TRAILING_CALLBACK_RATE", "0.5"))
 EXECUTION_ORDER_COOLDOWN = int(os.getenv("EXECUTION_ORDER_COOLDOWN", "180"))
 EXECUTION_BLOCK_IF_OPEN = _env_bool("EXECUTION_BLOCK_IF_OPEN", "true")
 EXECUTION_POSITION_CACHE_SEC = float(os.getenv("EXECUTION_POSITION_CACHE_SEC", "5"))
+BE_EXIT_PNL_MAX_USDT = float(os.getenv("BE_EXIT_PNL_MAX_USDT", "0.15"))
+BE_EXIT_PRICE_PCT = float(os.getenv("BE_EXIT_PRICE_PCT", "0.12"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 
 _status_lock = threading.Lock()
@@ -94,6 +96,195 @@ _filters_lock = threading.Lock()
 _leverage_lock = threading.Lock()
 _position_snapshot_lock = threading.Lock()
 _position_snapshot_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_trade_context_lock = threading.Lock()
+_trade_context: dict[str, dict[str, Any]] = {}
+
+
+def _trade_context_path() -> str:
+    return os.path.join(LOG_DIR, "trade_context.json")
+
+
+def _load_trade_context_store() -> dict[str, dict[str, Any]]:
+    global _trade_context
+    path = _trade_context_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read trade_context.json: %s", exc)
+        return {}
+
+
+def _persist_trade_context_store() -> None:
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(_trade_context_path(), "w", encoding="utf-8") as handle:
+            json.dump(_trade_context, handle, indent=2, default=str)
+    except OSError:
+        logger.exception("Failed writing trade_context.json")
+
+
+def _get_trade_context(symbol: str) -> dict[str, Any]:
+    symbol = symbol.upper()
+    with _trade_context_lock:
+        if not _trade_context:
+            _trade_context.update(_load_trade_context_store())
+        return dict(_trade_context.get(symbol, {}))
+
+
+def _update_trade_context(symbol: str, **fields: Any) -> dict[str, Any]:
+    symbol = symbol.upper()
+    with _trade_context_lock:
+        if not _trade_context:
+            _trade_context.update(_load_trade_context_store())
+        current = dict(_trade_context.get(symbol, {}))
+        current.update(fields)
+        _trade_context[symbol] = current
+        _persist_trade_context_store()
+        return dict(current)
+
+
+def record_trade_context(
+    symbol: str,
+    direction: str,
+    *,
+    entry: str | float | None = None,
+    sl: str | float | None = None,
+    tp: str | float | None = None,
+    tp_type: str | None = None,
+) -> None:
+    _update_trade_context(
+        symbol,
+        direction=direction.upper(),
+        entry=str(entry) if entry is not None else None,
+        sl=str(sl) if sl is not None else None,
+        tp=str(tp) if tp is not None else None,
+        tp_type=(tp_type or TP_ORDER_TYPE).lower(),
+        was_open=False,
+        exit_notified=False,
+    )
+
+
+def _format_realized_pnl(pnl: float) -> str:
+    sign = "+" if pnl >= 0 else ""
+    return f"{sign}{pnl:.2f} USDT"
+
+
+def _fetch_last_realized_trade(symbol: str) -> dict[str, Any] | None:
+    if not _keys_configured():
+        return None
+    try:
+        resp = _fapi_request("GET", "/fapi/v1/userTrades", {"symbol": symbol.upper(), "limit": 30})
+    except RuntimeError as exc:
+        logger.warning("userTrades failed for %s: %s", symbol, exc)
+        return None
+    if not isinstance(resp, list):
+        return None
+    for row in reversed(resp):
+        try:
+            pnl = float(row.get("realizedPnl", 0) or 0)
+        except (TypeError, ValueError):
+            pnl = 0.0
+        if pnl == 0:
+            continue
+        try:
+            price = float(row.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price <= 0:
+            continue
+        return {"price": price, "qty": row.get("qty"), "realized_pnl": pnl}
+    return None
+
+
+def _is_breakeven_exit(entry: float | None, exit_price: float, pnl: float) -> bool:
+    if entry is None or entry <= 0:
+        return False
+    price_ok = abs(exit_price - entry) / entry * 100 <= BE_EXIT_PRICE_PCT
+    pnl_ok = abs(pnl) <= BE_EXIT_PNL_MAX_USDT
+    return price_ok and pnl_ok
+
+
+def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
+    if not _keys_configured() or not telegram.is_configured():
+        return
+
+    symbol = symbol.upper()
+    is_active = bool(snapshot.get("open") or snapshot.get("pending"))
+    ctx = _get_trade_context(symbol)
+
+    if snapshot.get("open"):
+        _update_trade_context(
+            symbol,
+            was_open=True,
+            direction=snapshot.get("direction") or ctx.get("direction"),
+            exit_notified=False,
+        )
+        return
+
+    if is_active or not ctx.get("was_open") or ctx.get("exit_notified"):
+        return
+
+    direction = str(ctx.get("direction") or "LONG")
+    sl = ctx.get("sl")
+    tp = ctx.get("tp")
+    tp_type = str(ctx.get("tp_type") or TP_ORDER_TYPE).lower()
+    entry_raw = ctx.get("entry")
+    entry = float(entry_raw) if entry_raw not in (None, "") else None
+
+    trade = _fetch_last_realized_trade(symbol)
+    if not trade:
+        _update_trade_context(symbol, was_open=False, exit_notified=True)
+        return
+
+    exit_price = float(trade["price"])
+    pnl = float(trade["realized_pnl"])
+    pnl_label = _format_realized_pnl(pnl)
+
+    _update_trade_context(symbol, was_open=False, exit_notified=True)
+    _append_orders_log(
+        "position_closed",
+        symbol=symbol,
+        direction=direction,
+        exit_price=exit_price,
+        realized_pnl=pnl,
+        sl=sl,
+        tp=tp,
+        tp_type=tp_type,
+    )
+
+    if _is_breakeven_exit(entry, exit_price, pnl):
+        msg = f"BREAK_EVEN #BE @ {exit_price} | PnL: {pnl_label}"
+        if entry is not None:
+            msg = f"BREAK_EVEN #BE @ {exit_price} (entry {entry}) | PnL: {pnl_label}"
+        telegram.notify_be_exit(symbol, msg)
+        return
+
+    if pnl > 0:
+        if tp_type == "trailing":
+            msg = (
+                f"TRAILING_TP @ {exit_price} (activate {tp}, trail {TP_TRAILING_CALLBACK_RATE}%)"
+                f" | PnL: {pnl_label}"
+            )
+            telegram.notify_tp_exit(symbol, msg, trailing=True)
+        else:
+            msg = f"TAKE_PROFIT #TP @ {exit_price} | PnL: {pnl_label}"
+            if tp:
+                msg = f"TAKE_PROFIT #TP @ {exit_price} (TP {tp}) | PnL: {pnl_label}"
+            telegram.notify_tp_exit(symbol, msg)
+        return
+
+    if pnl < 0:
+        msg = f"STOP_MARKET #SL @ {exit_price} | PnL: {pnl_label}"
+        if sl:
+            msg = f"STOP_MARKET #SL @ {exit_price} (SL {sl}) | PnL: {pnl_label}"
+        telegram.notify_sl_exit(symbol, msg)
+        return
+
+    telegram.notify_position_closed(symbol, f"#CLOSED {direction} @ {exit_price} | PnL: {pnl_label}")
 
 
 def get_execution_status() -> dict[str, Any]:
@@ -332,7 +523,7 @@ def _fetch_exchange_exposure(symbol: str) -> dict[str, Any]:
 def get_exchange_exposure(symbol: str) -> dict[str, Any]:
     """Open position or pending entry LIMIT on Binance Futures (cached for dashboard)."""
     symbol = symbol.upper()
-    if not EXECUTION_ENABLED or not _keys_configured():
+    if not _keys_configured():
         return {
             "open": False,
             "pending": False,
@@ -342,7 +533,7 @@ def get_exchange_exposure(symbol: str) -> dict[str, Any]:
             "volume_usdt": None,
             "unrealized_pnl": None,
             "mark_price": None,
-            "source": "disabled" if not EXECUTION_ENABLED else "no_keys",
+            "source": "no_keys",
         }
 
     now = time.monotonic()
@@ -352,6 +543,11 @@ def get_exchange_exposure(symbol: str) -> dict[str, Any]:
             return dict(cached[1])
 
     snapshot = _fetch_exchange_exposure(symbol)
+    _maybe_notify_position_exit(symbol, snapshot)
+    if not EXECUTION_ENABLED:
+        snapshot = dict(snapshot)
+        if snapshot.get("source") == "binance":
+            snapshot["source"] = "monitoring"
     with _position_snapshot_lock:
         _position_snapshot_cache[symbol] = (now, snapshot)
     return dict(snapshot)
@@ -848,6 +1044,14 @@ def _execute_open(
             TP_TRAILING_CALLBACK_RATE,
         )
         telegram.notify_live_open(symbol, direction, price_str, payload["sl"], tp_label, vol_usdt)
+        record_trade_context(
+            symbol,
+            direction,
+            entry=price_str,
+            sl=payload["sl"],
+            tp=payload["tp"],
+            tp_type=TP_ORDER_TYPE,
+        )
         if order_id is not None:
             _place_sl_tp_after_fill(symbol, direction, sl, tp, qty, int(order_id))
     except RuntimeError as exc:

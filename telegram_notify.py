@@ -152,8 +152,16 @@ def send_tp(message: str) -> None:
     _send_async(f"🥳 {message}")
 
 
+def send_trailing(message: str) -> None:
+    _send_async(f"🏄 {message}")
+
+
 def send_sl(message: str) -> None:
     _send_async(f"😢 {message}")
+
+
+def send_shield(message: str) -> None:
+    _send_async(f"🛡️ {message}")
 
 
 def send_raw(message: str) -> None:
@@ -182,7 +190,7 @@ def notify_valid_entry(
         f"Entry: {entry} | HTF: {trend_bias}",
     ]
     if sl and tp1:
-        lines.append(f"Plan SL: {sl} | TP1: {tp1}")
+        lines.append(f"SL: {sl} | TP: {tp1}")
     if reasons:
         lines.append(reasons)
     send_position(direction, "\n".join(lines))
@@ -210,6 +218,26 @@ def notify_live_open(
 
 def notify_order_failed(symbol: str, direction: str) -> None:
     send_raw(f"❌ {symbol.upper()} futures — ORDER FAILED ({direction})")
+
+
+def notify_tp_exit(symbol: str, message: str, *, trailing: bool = False) -> None:
+    body = f"{symbol.upper()} futures\n{message}"
+    if trailing:
+        send_trailing(body)
+    else:
+        send_tp(body)
+
+
+def notify_sl_exit(symbol: str, message: str) -> None:
+    send_sl(f"{symbol.upper()} futures\n{message}")
+
+
+def notify_be_exit(symbol: str, message: str) -> None:
+    send_shield(f"{symbol.upper()} futures\n{message}")
+
+
+def notify_position_closed(symbol: str, message: str) -> None:
+    send_bot(f"{symbol.upper()} futures\n{message}")
 
 
 def notify_fleet_started(pair_count: int, hub_port: int) -> None:
