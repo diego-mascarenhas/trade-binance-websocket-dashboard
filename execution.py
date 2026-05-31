@@ -29,6 +29,7 @@ def _env_bool(name: str, default: str = "false") -> bool:
 
 
 EXECUTION_ENABLED = _env_bool("EXECUTION_ENABLED")
+EXECUTE_ON_VALID_ENTRY = _env_bool("EXECUTE_ON_VALID_ENTRY")
 EXECUTION_MODE = os.getenv("EXECUTION_MODE", "dry").lower()
 FAPI_BASE = os.getenv("FAPI_BASE", "https://fapi.binance.com").rstrip("/")
 POSITION_SIZE_USDT = float(os.getenv("POSITION_SIZE_USDT", "25"))
@@ -64,10 +65,22 @@ _status_lock = threading.Lock()
 _hedge_mode_lock = threading.Lock()
 _hedge_mode: bool | None = None
 _last_execution_monotonic: float | None = None
+
+
+def _execution_status_message() -> str:
+    if not EXECUTION_ENABLED:
+        return "Execution disabled"
+    if not EXECUTE_ON_VALID_ENTRY:
+        return f"Valid entries off · {EXECUTION_MODE} ready"
+    return f"Auto on valid entry · {EXECUTION_MODE}"
+
+
 _execution_status: dict[str, Any] = {
     "enabled": EXECUTION_ENABLED,
+    "execute_on_valid_entry": EXECUTE_ON_VALID_ENTRY,
+    "auto_execute": EXECUTION_ENABLED and EXECUTE_ON_VALID_ENTRY,
     "mode": EXECUTION_MODE,
-    "message": "Execution disabled" if not EXECUTION_ENABLED else f"Ready ({EXECUTION_MODE})",
+    "message": _execution_status_message(),
     "last_event": None,
     "last_at": None,
     "last_order_id": None,
@@ -85,7 +98,12 @@ _position_snapshot_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
 def get_execution_status() -> dict[str, Any]:
     with _status_lock:
-        return dict(_execution_status)
+        status = dict(_execution_status)
+    status["execute_on_valid_entry"] = EXECUTE_ON_VALID_ENTRY
+    status["auto_execute"] = EXECUTION_ENABLED and EXECUTE_ON_VALID_ENTRY
+    if status.get("message") in (None, "", "Execution disabled", "Ready (dry)", "Ready (live)"):
+        status["message"] = _execution_status_message()
+    return status
 
 
 def _set_status(**fields: Any) -> None:
@@ -848,6 +866,14 @@ def try_execute_valid_entry(
     trend_bias: str,
 ) -> None:
     """Fire-and-forget execution when dashboard records a valid entry."""
+    if not EXECUTE_ON_VALID_ENTRY:
+        _append_orders_log(
+            "skip_valid_entry_auto",
+            symbol=symbol.upper(),
+            signal=signal,
+            execute_on_valid_entry=False,
+        )
+        return
     if not EXECUTION_ENABLED or telegram.is_trading_paused():
         _append_orders_log(
             "skip_disabled",

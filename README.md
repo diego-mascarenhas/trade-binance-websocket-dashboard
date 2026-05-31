@@ -66,7 +66,8 @@ Open the dashboard at `http://127.0.0.1:8050` (or the host/port from `.env` / `-
 | `MIN_CONFIDENCE` | Minimum confidence to highlight a **TRADE** setup (same logic as order-blocks bot) | `50` |
 | `DASH_HOST`    | Dash bind address                    | `0.0.0.0` |
 | `DASH_PORT`    | Dash HTTP port — default when no `--port` | `8050`    |
-| `EXECUTION_ENABLED` | Enable order execution on valid entries | `false` |
+| `EXECUTION_ENABLED` | Enable Binance Futures execution module | `false` |
+| `EXECUTE_ON_VALID_ENTRY` | Auto-send orders when a valid entry is confirmed | `false` |
 | `EXECUTION_MODE` | `dry` (log only) or `live` (Binance Futures REST) | `dry` |
 | `BINANCE_API_KEY` / `BINANCE_SECRET_KEY` | Required for `live` mode | — |
 | `POSITION_SIZE_USDT` | Notional per entry (Futures) | `25` |
@@ -82,7 +83,7 @@ Telegram commands (same chat as `TELEGRAM_CHAT_ID` only):
 
 **Note:** Several scripts may **send** alerts with the same `TELEGRAM_BOT_TOKEN` (e.g. this dashboard + order-blocks bot). That is fine. Only **one** process may **poll** `getUpdates` for commands; if you see `409 Conflict`, stop the other poller or use a separate bot token for commands.
 
-The app loads historical klines via REST, then keeps the order book in sync using Binance’s depth snapshot + incremental updates. It also streams `@miniTicker` for 24h change and computes **order-block signal + confidence** (support/resistance walls, zone position, and fallback 24h rules). With `EXECUTION_ENABLED=true`, confirmed valid entries can open **Futures** positions (dry-run or live). The UI refreshes every 1.5s.
+The app loads historical klines via REST, then keeps the order book in sync using Binance’s depth snapshot + incremental updates. It also streams `@miniTicker` for 24h change and computes **order-block signal + confidence** (support/resistance walls, zone position, and fallback 24h rules). With `EXECUTE_ON_VALID_ENTRY=true` and `EXECUTION_ENABLED=true`, confirmed valid entries can open **Futures** positions (dry-run or live). The UI refreshes every 1.5s.
 
 ## Ubuntu / VPS (e.g. Forge, Sleipnir)
 

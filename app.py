@@ -2579,16 +2579,22 @@ def execution_badge_class(mode: str, enabled: bool) -> str:
 def build_execution_panel_section(metrics: dict) -> list:
     ex = metrics.get("execution") or {}
     enabled = ex.get("enabled", False)
+    auto_execute = ex.get("auto_execute", False)
     mode = (ex.get("mode") or "dry").upper()
     pos = ex.get("position") or {}
+    badge_label = "Off"
+    if enabled and auto_execute:
+        badge_label = f"{mode} · Auto"
+    elif enabled:
+        badge_label = f"{mode} · Manual"
 
     children: list = [
         panel_section("Execution"),
         html.Div(
             [
                 html.Span(
-                    f"{mode} · Futures" if enabled else "Off",
-                    className=execution_badge_class(ex.get("mode", "dry"), enabled),
+                    badge_label,
+                    className=execution_badge_class(ex.get("mode", "dry"), enabled and auto_execute),
                 ),
             ],
             className="badge-row",
@@ -2863,13 +2869,16 @@ def build_telegram_status() -> str:
         change = change_24h
     ex = execution.get_execution_status()
     exec_enabled = ex.get("enabled", False)
+    auto_execute = ex.get("auto_execute", False)
     exec_mode = ex.get("mode", "dry").upper() if exec_enabled else "OFF"
     if telegram.is_trading_paused():
         trading = "paused (/start to resume)"
     elif not exec_enabled:
         trading = "off (EXECUTION_ENABLED=false)"
+    elif not auto_execute:
+        trading = "valid entries off (EXECUTE_ON_VALID_ENTRY=false)"
     else:
-        trading = "active"
+        trading = f"auto · {exec_mode.lower()}"
     price_text = format_price(price) if price else "—"
     change_text = f"{change:+.2f}%" if change is not None else "—"
     lines = [
@@ -2930,6 +2939,7 @@ def build_hub_summary() -> dict:
         "position": position,
         "position_open": bool(pos.get("open")),
         "execution_enabled": bool(ex.get("enabled")),
+        "execution_auto": bool(ex.get("auto_execute")),
         "execution_mode": ex.get("mode", "dry"),
     }
 
