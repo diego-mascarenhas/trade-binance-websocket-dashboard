@@ -220,6 +220,7 @@
                 lowSignal: 0,
                 fleetPaused: false,
                 executeAuto: false,
+                dbEnabled: false,
             };
 
             for (const data of results) {
@@ -250,6 +251,9 @@
                 }
                 counts.fleetPaused = Boolean(data.trading_paused);
                 counts.executeAuto = Boolean(data.execution_auto);
+                if (data.db_enabled) {
+                    counts.dbEnabled = true;
+                }
             }
             return counts;
         }
@@ -282,6 +286,9 @@
             }
             if (counts.fleetPaused) {
                 blocks.push("fleet paused");
+            }
+            if (counts.dbEnabled) {
+                blocks.push("DB on");
             }
 
             meta.innerHTML = `

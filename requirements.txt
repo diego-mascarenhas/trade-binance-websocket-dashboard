@@ -4,3 +4,4 @@ pandas>=2.2.0
 websockets>=12.0
 aiohttp>=3.9.0
 python-dotenv>=1.0.0
+pymysql>=1.1.0

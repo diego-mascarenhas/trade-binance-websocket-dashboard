@@ -74,8 +74,41 @@ Open the dashboard at `http://127.0.0.1:8050` (or the host/port from `.env` / `-
 | `LEVERAGE_MODE` | `max` = max per symbol via API, `fixed` = use `LEVERAGE` | `fixed` |
 | `LEVERAGE` | Fixed leverage, or fallback when `LEVERAGE_MODE=max` / API fails | `4` |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Optional Telegram alerts + commands `/status` `/stop` `/start` | — |
+| `INDICATOR_FILTERS_ENABLED` | RSI/ADX/MACD filters before valid entry | `true` |
+| `ADX_MIN_TREND` | Minimum ADX (HTF by default) to allow valid entry | `25` |
+| `DB_ENABLED` | Optional MySQL for per-symbol config + decision audit | `false` |
 
-Telegram commands (same chat as `TELEGRAM_CHAT_ID` only). With `./run-all.sh`, **one** fleet listener handles commands for all pairs (avoids 409 Conflict):
+### Indicator filters
+
+Before a **valid entry**, optional filters run on top of the order-book signal:
+
+- **RSI** — block LONG above `RSI_LONG_MAX`, SHORT below `RSI_SHORT_MIN`
+- **ADX** — block when trend strength is low (`ADX_MIN_TREND`; uses HTF when `ADX_USE_HTF=true`)
+- **MACD** — optional histogram confirmation (`MACD_FILTER_ENABLED=false` by default)
+
+All filters are shown in the dashboard panel (RSI, ADX LTF/HTF, MACD).
+
+### Optional MySQL (DeepSeek-ready)
+
+When `DB_ENABLED=true`, the app connects to a **local** MySQL database (`DB_HOST=127.0.0.1`):
+
+- `symbol_config` — per-pair JSON overrides (`MIN_CONFIDENCE`, `HTF_INTERVAL`, etc.)
+- `decision_events` — config + market snapshot on valid entries, indicator blocks, order skips
+
+With `DB_ENABLED=false` (default), nothing connects to MySQL.
+
+```bash
+mysql -u root -p < db/grants.example.sql   # edit password first
+pip install pymysql
+python scripts/migrate_db.py                 # apply pending migrations
+python scripts/migrate_db.py --status        # list applied / pending
+```
+
+Migrations live in `db/migrations/` (e.g. `001_initial_schema.sql`). `./run-all.sh` runs them automatically when `DB_ENABLED=true`. Add new files as `002_description.sql`, `003_...`, etc.
+
+### Telegram commands
+
+Fleet commands (same chat as `TELEGRAM_CHAT_ID` only). With `./run-all.sh`, **one** fleet listener handles commands for all pairs (avoids 409 Conflict):
 
 - `/status` — fleet overview: TRADE setups, open positions, offline count
 - `/stop` — pause trading on **all** pairs (shared `logs/fleet.state`)

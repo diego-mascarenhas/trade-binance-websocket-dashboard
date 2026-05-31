@@ -15,11 +15,12 @@ import urllib.request
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
+import db_store
+import symbol_config
+import telegram_notify as telegram
 from dotenv import load_dotenv
 
 load_dotenv()
-
-import telegram_notify as telegram
 
 logger = logging.getLogger(__name__)
 
@@ -665,6 +666,25 @@ def can_place_new_order(symbol: str, direction: str, entry: float) -> tuple[bool
     return True, ""
 
 
+def _log_execution_decision(
+    symbol: str,
+    event_type: str,
+    *,
+    block_reason: str | None = None,
+    outcome: str = "skipped",
+    market_snapshot: dict[str, Any] | None = None,
+) -> None:
+    db_store.log_decision_event(
+        symbol,
+        event_type,
+        outcome=outcome,
+        block_reason=block_reason,
+        config_snapshot=symbol_config.get_config_snapshot(),
+        market_snapshot=market_snapshot,
+        config_version=symbol_config.config_version(),
+    )
+
+
 def _log_skip_order(symbol: str, signal: str, reason: str, *, entry: float | None = None) -> None:
     event = {
         "open_position": "skip_open_position",
@@ -678,6 +698,12 @@ def _log_skip_order(symbol: str, signal: str, reason: str, *, entry: float | Non
         fields["entry"] = entry
     _append_orders_log(event, **fields)
     logger.warning("%s: blocked new %s order (%s)", symbol.upper(), signal, reason)
+    _log_execution_decision(
+        symbol,
+        event,
+        block_reason=reason,
+        market_snapshot={"signal": signal, "entry": entry},
+    )
 
 
 def _sign_query(params: dict[str, Any]) -> str:
@@ -1044,6 +1070,12 @@ def _execute_open(
         )
         _last_execution_monotonic = time.monotonic()
         telegram.notify_dry_run(symbol, direction, price_str)
+        _log_execution_decision(
+            symbol,
+            "order_dry_run",
+            outcome="dry_run",
+            market_snapshot={"signal": direction, "entry": price_str},
+        )
         return
 
     if not _keys_configured():
@@ -1082,6 +1114,12 @@ def _execute_open(
             tp=payload["tp"],
             tp_type=TP_ORDER_TYPE,
         )
+        _log_execution_decision(
+            symbol,
+            "order_live_open",
+            outcome="live",
+            market_snapshot={"signal": direction, "entry": price_str, "orderId": order_id},
+        )
         if order_id is not None:
             _place_sl_tp_after_fill(symbol, direction, sl, tp, qty, int(order_id))
     except RuntimeError as exc:
@@ -1107,6 +1145,7 @@ def try_execute_valid_entry(
             signal=signal,
             execute_on_valid_entry=False,
         )
+        _log_execution_decision(symbol, "order_skip", block_reason="execute_off")
         return
     if not EXECUTION_ENABLED or telegram.is_trading_paused():
         _append_orders_log(
@@ -1116,6 +1155,8 @@ def try_execute_valid_entry(
             execution_enabled=EXECUTION_ENABLED,
             trading_paused=telegram.is_trading_paused(),
         )
+        reason = "fleet_paused" if telegram.is_trading_paused() else "execution_disabled"
+        _log_execution_decision(symbol, "order_skip", block_reason=reason, market_snapshot={"signal": signal})
         return
     if entry is None or not trade_plan or not trade_plan.get("active"):
         _append_orders_log(
@@ -1126,6 +1167,7 @@ def try_execute_valid_entry(
             has_trade_plan=trade_plan is not None,
             trade_plan_active=bool(trade_plan and trade_plan.get("active")),
         )
+        _log_execution_decision(symbol, "order_skip", block_reason="no_plan", market_snapshot={"signal": signal})
         return
 
     global _last_execution_monotonic
@@ -1135,12 +1177,14 @@ def try_execute_valid_entry(
         and now - _last_execution_monotonic < EXECUTION_ORDER_COOLDOWN
     ):
         _append_orders_log("skip_cooldown", symbol=symbol.upper(), signal=signal)
+        _log_execution_decision(symbol, "order_skip", block_reason="execution_cooldown", market_snapshot={"signal": signal})
         return
 
     sl = float(trade_plan.get("sl", 0))
     tp = float(trade_plan.get("tp1", 0))
     if sl <= 0 or tp <= 0:
         _append_orders_log("skip_invalid_sl_tp", symbol=symbol.upper(), signal=signal, sl=sl, tp=tp)
+        _log_execution_decision(symbol, "order_skip", block_reason="invalid_sl_tp", market_snapshot={"signal": signal})
         return
 
     legs = trade_plan.get("legs") or []

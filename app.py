@@ -22,7 +22,10 @@ from plotly.subplots import make_subplots
 load_dotenv()
 
 import execution
+import symbol_config
 import telegram_notify as telegram
+from indicators import IndicatorFilterSettings, evaluate_indicator_filters, compute_adx
+import db_store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -129,8 +132,25 @@ TRADE_PLAN_PARTIAL_CLOSE_PCT = float(os.getenv("TRADE_PLAN_PARTIAL_CLOSE_PCT", "
 TRADE_PLAN_TRAIL_PCT = float(os.getenv("TRADE_PLAN_TRAIL_PCT", "0.25"))
 TRADE_PLAN_INITIAL_SIZE_PCT = float(os.getenv("TRADE_PLAN_INITIAL_SIZE_PCT", "50"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
+
+INDICATOR_FILTERS_ENABLED = os.getenv("INDICATOR_FILTERS_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+RSI_FILTER_ENABLED = os.getenv("RSI_FILTER_ENABLED", "true").lower() in ("1", "true", "yes")
+RSI_LONG_MAX = float(os.getenv("RSI_LONG_MAX", "70"))
+RSI_SHORT_MIN = float(os.getenv("RSI_SHORT_MIN", "30"))
+MACD_FILTER_ENABLED = os.getenv("MACD_FILTER_ENABLED", "false").lower() in ("1", "true", "yes")
+ADX_PERIOD = int(os.getenv("ADX_PERIOD", "14"))
+ADX_FILTER_ENABLED = os.getenv("ADX_FILTER_ENABLED", "true").lower() in ("1", "true", "yes")
+ADX_MIN_TREND = float(os.getenv("ADX_MIN_TREND", "25"))
+ADX_USE_HTF = os.getenv("ADX_USE_HTF", "true").lower() in ("1", "true", "yes")
+
 DASH_HOST = os.getenv("DASH_HOST", "0.0.0.0")
 DASH_PORT = resolve_dash_port(_cli_args.port)
+
+symbol_config.apply_db_overrides(globals(), SYMBOL)
 
 REST_BASE = "https://api.binance.com"
 WS_BASE = "wss://stream.binance.com:9443"
@@ -187,6 +207,37 @@ def append_event_log(log_name: str, event: str, **fields) -> None:
 def log_error(event: str, **fields) -> None:
     append_event_log("errors", event, **fields)
     logger.error("%s %s", event, fields)
+
+
+def indicator_filter_settings() -> IndicatorFilterSettings:
+    return IndicatorFilterSettings(
+        enabled=INDICATOR_FILTERS_ENABLED,
+        rsi_enabled=RSI_FILTER_ENABLED,
+        rsi_long_max=RSI_LONG_MAX,
+        rsi_short_min=RSI_SHORT_MIN,
+        macd_enabled=MACD_FILTER_ENABLED,
+        adx_enabled=ADX_FILTER_ENABLED,
+        adx_min_trend=ADX_MIN_TREND,
+        adx_use_htf=ADX_USE_HTF,
+    )
+
+
+def log_decision_event(
+    event_type: str,
+    *,
+    outcome: str | None = None,
+    block_reason: str | None = None,
+    market_snapshot: dict | None = None,
+) -> None:
+    db_store.log_decision_event(
+        SYMBOL,
+        event_type,
+        outcome=outcome,
+        block_reason=block_reason,
+        config_snapshot=symbol_config.get_config_snapshot(),
+        market_snapshot=market_snapshot,
+        config_version=symbol_config.config_version(),
+    )
 
 
 def trade_plan_fingerprint(plan: dict) -> str:
@@ -824,6 +875,8 @@ def compute_market_analysis(
         "ema_slow": None,
         "ema_cross": "—",
         "rsi": None,
+        "adx": None,
+        "htf_adx": None,
         "macd": None,
         "macd_signal": None,
         "macd_hist": None,
@@ -860,6 +913,7 @@ def compute_market_analysis(
             analysis["ema_cross"] = "Flat"
 
     analysis["rsi"] = compute_rsi(closes, RSI_PERIOD)
+    analysis["adx"] = compute_adx(closed_df, ADX_PERIOD)
     macd, macd_signal, macd_hist = compute_macd_values(closes)
     analysis["macd"] = macd
     analysis["macd_signal"] = macd_signal
@@ -874,6 +928,8 @@ def compute_market_analysis(
         analysis["htf_ema_fast"] = htf_fast
         analysis["htf_ema_slow"] = htf_slow
         analysis["htf_ema_trend"] = htf_trend
+
+        analysis["htf_adx"] = compute_adx(htf_df, ADX_PERIOD)
 
         fvg = detect_latest_fvg(htf_df)
         if fvg:
@@ -1138,6 +1194,26 @@ def zone_signal_with_hysteresis(position: float, stable_signal: str) -> str:
     return "NEUTRAL"
 
 
+def _decision_market_snapshot(
+    signal: str,
+    confidence: int,
+    trend_bias: str,
+    market_analysis: dict | None,
+) -> dict:
+    metrics = {
+        "signal": signal,
+        "confidence": confidence,
+        "action": "TRADE" if is_tradable_signal(signal, confidence) else "WATCH",
+        "market_analysis": market_analysis or {},
+    }
+    aligned = (
+        signal_aligned_with_trend(signal, trend_bias)
+        if signal in ("LONG", "SHORT")
+        else None
+    )
+    return symbol_config.build_market_snapshot(metrics, trend_aligned=aligned)
+
+
 def record_valid_entry(
     signal: str,
     entry: float | None,
@@ -1146,12 +1222,31 @@ def record_valid_entry(
     candle_time,
     trend_bias: str,
     trade_plan: dict | None = None,
+    market_analysis: dict | None = None,
 ) -> None:
     global last_valid_entry_monotonic
 
+    market = _decision_market_snapshot(signal, confidence, trend_bias, market_analysis)
+
+    if not symbol_config.symbol_trading_enabled():
+        log_decision_event(
+            "valid_entry_blocked",
+            outcome="blocked",
+            block_reason="symbol_disabled",
+            market_snapshot=market,
+        )
+        return
+
     if not is_tradable_signal(signal, confidence) or entry is None or candle_time is None:
         return
+
     if not signal_aligned_with_trend(signal, trend_bias):
+        log_decision_event(
+            "valid_entry_blocked",
+            outcome="blocked",
+            block_reason="htf_mismatch",
+            market_snapshot=market,
+        )
         return
 
     now = time.monotonic()
@@ -1159,6 +1254,12 @@ def record_valid_entry(
         last_valid_entry_monotonic is not None
         and now - last_valid_entry_monotonic < SIGNAL_COOLDOWN_SEC
     ):
+        log_decision_event(
+            "valid_entry_blocked",
+            outcome="blocked",
+            block_reason="signal_cooldown",
+            market_snapshot=market,
+        )
         return
 
     if valid_entries:
@@ -1188,6 +1289,11 @@ def record_valid_entry(
         reasons=reasons,
         candle_time=str(candle_time),
         trend_bias=trend_bias,
+    )
+    log_decision_event(
+        "valid_entry",
+        outcome="recorded",
+        market_snapshot=market,
     )
     sl_val = trade_plan.get("sl") if trade_plan else None
     tp1_val = trade_plan.get("tp1") if trade_plan else None
@@ -1219,6 +1325,7 @@ def apply_signal_debounce(
     candle_time,
     trend_bias: str,
     trade_plan: dict | None = None,
+    market_analysis: dict | None = None,
 ) -> None:
     global stable_signal_dir, pending_signal, pending_signal_count
     global signal_dir, signal_confidence, signal_reasons, signal_entry
@@ -1242,33 +1349,82 @@ def apply_signal_debounce(
         )
         if is_tradable_signal(candidate, confidence):
             effective_plan = trade_plan
+            analysis = market_analysis
             if not effective_plan or not effective_plan.get("active"):
-                closed_rows = [row for row in candles if row.get("x")]
-                htf_closed_rows = [row for row in htf_candles if row.get("x")]
-                price = latest_price or entry
-                analysis = compute_market_analysis(
-                    closed_rows,
-                    htf_closed_rows,
-                    price,
-                    support=support,
-                    resistance=resistance,
-                    ob_zone_pct=zone_position_pct,
-                )
+                if analysis is None:
+                    closed_rows = [row for row in candles if row.get("x")]
+                    htf_closed_rows = [row for row in htf_candles if row.get("x")]
+                    price = latest_price or entry
+                    analysis = compute_market_analysis(
+                        closed_rows,
+                        htf_closed_rows,
+                        price,
+                        support=support,
+                        resistance=resistance,
+                        ob_zone_pct=zone_position_pct,
+                    )
                 effective_plan = compute_trade_plan(
                     candidate,
                     confidence,
                     entry,
                     support,
                     resistance,
-                    price,
+                    latest_price or entry,
                     analysis,
                     MIN_CONFIDENCE,
                 )
                 if not effective_plan.get("active"):
                     effective_plan = None
-            record_valid_entry(
-                candidate, entry, confidence, reasons, candle_time, trend_bias, effective_plan
+                    log_decision_event(
+                        "valid_entry_blocked",
+                        outcome="blocked",
+                        block_reason="no_active_plan",
+                        market_snapshot=_decision_market_snapshot(
+                            candidate, confidence, trend_bias, analysis
+                        ),
+                    )
+
+            if analysis is None:
+                closed_rows = [row for row in candles if row.get("x")]
+                htf_closed_rows = [row for row in htf_candles if row.get("x")]
+                analysis = compute_market_analysis(
+                    closed_rows,
+                    htf_closed_rows,
+                    latest_price or entry,
+                    support=support,
+                    resistance=resistance,
+                    ob_zone_pct=zone_position_pct,
+                )
+
+            filter_result = evaluate_indicator_filters(
+                candidate,
+                confidence,
+                analysis,
+                indicator_filter_settings(),
             )
+            if not filter_result.allowed:
+                log_decision_event(
+                    "indicator_blocked",
+                    outcome="blocked",
+                    block_reason=filter_result.block_reason,
+                    market_snapshot=_decision_market_snapshot(
+                        candidate, confidence, trend_bias, analysis
+                    ),
+                )
+            elif effective_plan and effective_plan.get("active"):
+                entry_reasons = reasons
+                if filter_result.notes:
+                    entry_reasons = f"{reasons} · {filter_result.notes}".strip(" · ")
+                record_valid_entry(
+                    candidate,
+                    entry,
+                    filter_result.confidence,
+                    entry_reasons,
+                    candle_time,
+                    trend_bias,
+                    effective_plan,
+                    analysis,
+                )
         stable_signal_dir = candidate
 
     signal_dir = stable_signal_dir
@@ -1439,6 +1595,7 @@ def update_trading_signal(
         candle_time,
         analysis.get("htf_bias", "NEUTRAL"),
         current_plan if current_plan.get("active") else None,
+        analysis,
     )
 
 
@@ -2264,6 +2421,14 @@ def macd_badge_class(histogram: float | None) -> str:
     return "badge badge-neutral"
 
 
+def adx_badge_class(adx: float | None) -> str:
+    if adx is None:
+        return "badge badge-neutral"
+    if adx >= ADX_MIN_TREND:
+        return "badge badge-bull"
+    return "badge badge-neutral"
+
+
 def panel_section(title: str) -> html.Div:
     return html.Div(title, className="panel-section-title")
 
@@ -2406,6 +2571,21 @@ def build_pattern_panel_children(metrics: dict) -> list:
             badge_class=trend_badge_class(analysis.get("htf_bias", "NEUTRAL")),
         )
     )
+    htf_adx = analysis.get("htf_adx")
+    htf_adx_text = f"{htf_adx:.1f}" if htf_adx is not None else "—"
+    htf_adx_hint = (
+        f"min {ADX_MIN_TREND} · HTF filter"
+        if INDICATOR_FILTERS_ENABLED and ADX_FILTER_ENABLED and ADX_USE_HTF
+        else None
+    )
+    children.append(
+        kv_row(
+            f"ADX ({ADX_PERIOD})",
+            htf_adx_text,
+            badge_class=adx_badge_class(htf_adx),
+            hint=htf_adx_hint,
+        )
+    )
 
     children.append(panel_section(f"Indicators · {INTERVAL}"))
     ema_fast = analysis.get("ema_fast")
@@ -2427,6 +2607,17 @@ def build_pattern_panel_children(metrics: dict) -> list:
     rsi = analysis.get("rsi")
     rsi_text = f"{rsi:.1f}" if rsi is not None else "—"
     children.append(kv_row(f"RSI ({RSI_PERIOD})", rsi_text, badge_class=rsi_badge_class(rsi)))
+
+    adx = analysis.get("adx")
+    adx_text = f"{adx:.1f}" if adx is not None else "—"
+    adx_hint = (
+        f"min {ADX_MIN_TREND} · LTF"
+        if INDICATOR_FILTERS_ENABLED and ADX_FILTER_ENABLED and not ADX_USE_HTF
+        else (f"min {ADX_MIN_TREND} · LTF" if adx is not None else None)
+    )
+    children.append(
+        kv_row(f"ADX ({ADX_PERIOD})", adx_text, badge_class=adx_badge_class(adx), hint=adx_hint)
+    )
 
     macd = analysis.get("macd")
     macd_hist = analysis.get("macd_hist")
@@ -2486,10 +2677,16 @@ def build_pattern_panel_children(metrics: dict) -> list:
     liquidity_interval = analysis.get("liquidity_interval", INTERVAL)
     children.append(kv_row(f"Liquidity ({liquidity_interval})", analysis.get("liquidity", "—"), strong=True))
 
-    if metrics.get("require_trend_align"):
+    if metrics.get("require_trend_align") or INDICATOR_FILTERS_ENABLED:
+        filter_bits = []
+        if metrics.get("require_trend_align"):
+            filter_bits.append("HTF trend")
+        if INDICATOR_FILTERS_ENABLED:
+            filter_bits.append("RSI/ADX filters")
+        filter_bits.append(f"{metrics.get('signal_cooldown_sec', SIGNAL_COOLDOWN_SEC)}s cooldown")
         children.append(
             html.P(
-                f"Valid entries: HTF trend + {metrics.get('signal_cooldown_sec', SIGNAL_COOLDOWN_SEC)}s cooldown",
+                f"Valid entries: {' + '.join(filter_bits)}",
                 className="panel-hint panel-footnote",
             )
         )
@@ -2966,6 +3163,11 @@ def build_hub_summary() -> dict:
         "execution_enabled": bool(ex.get("enabled")),
         "execution_auto": bool(ex.get("auto_execute")),
         "execution_mode": ex.get("mode", "dry"),
+        "db_enabled": db_store.is_enabled(),
+        "indicator_filters_enabled": INDICATOR_FILTERS_ENABLED,
+        "rsi": analysis.get("rsi"),
+        "adx": analysis.get("htf_adx") if ADX_USE_HTF else analysis.get("adx"),
+        "config_version": symbol_config.config_version(),
     }
 
 

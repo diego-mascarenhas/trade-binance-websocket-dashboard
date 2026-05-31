@@ -125,6 +125,26 @@ start_hub() {
     echo $! >> "$PID_FILE"
 }
 
+run_db_migrate() {
+    if [[ ! -x "$VENV_PYTHON" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$SCRIPT_DIR/.env" ]]; then
+        return 0
+    fi
+    if ! grep -qE '^DB_ENABLED=(1|true|yes)' "$SCRIPT_DIR/.env" 2>/dev/null; then
+        return 0
+    fi
+    if [[ ! -f "$SCRIPT_DIR/scripts/migrate_db.py" ]]; then
+        return 0
+    fi
+
+    log "Checking MySQL migrations..."
+    if ! "$VENV_PYTHON" "$SCRIPT_DIR/scripts/migrate_db.py"; then
+        log "WARNING: DB migration failed — fleet continues (check MySQL and .env)"
+    fi
+}
+
 start_dashboards() {
     if [[ ! -x "$VENV_PYTHON" ]]; then
         log "Missing venv. Run: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt"
@@ -179,6 +199,7 @@ fi
 parse_pairs
 : > "$PID_FILE"
 write_pairs_json
+run_db_migrate
 start_hub
 start_dashboards
 start_telegram_fleet
