@@ -15,6 +15,7 @@ const suggestionsBtn = document.getElementById("suggestions-btn");
 const suggestionsNote = document.getElementById("suggestions-note");
 const suggestionsContent = document.getElementById("suggestions-content");
 let deepseekAvailable = false;
+let lastSuggestions = [];
 
 const PLOTLY_LAYOUT = {
     paper_bgcolor: "#171a21",
@@ -184,13 +185,38 @@ function escapeHtml(value) {
         .replaceAll('"', "&quot;");
 }
 
+function canApplySuggestion(item) {
+    return Boolean(
+        item &&
+            item.symbol &&
+            item.config_changes &&
+            typeof item.config_changes === "object" &&
+            Object.keys(item.config_changes).length > 0
+    );
+}
+
+function renderSuggestionActions(item, index) {
+    if (!canApplySuggestion(item)) {
+        return `<div class="suggestion-actions"><span class="note" style="margin:0;font-size:0.75rem;">Sin override aplicable</span></div>`;
+    }
+    return `
+        <div class="suggestion-actions">
+            <button class="btn btn-primary" type="button" data-action="apply" data-index="${index}">Aplicar</button>
+            <button class="btn" type="button" data-action="restore" data-index="${index}">Restaurar</button>
+        </div>
+    `;
+}
+
 function renderSuggestions(payload) {
     if (!payload || payload.error) {
+        lastSuggestions = [];
         suggestionsContent.innerHTML = "";
         suggestionsNote.className = "note warn";
         suggestionsNote.textContent = payload?.error || "Could not load suggestions.";
         return;
     }
+
+    lastSuggestions = payload.suggestions || [];
 
     const cacheHint = payload.cached
         ? ` (cached ${payload.cached_seconds_ago}s ago — use Analyze to refresh after cooldown)`
@@ -198,22 +224,26 @@ function renderSuggestions(payload) {
     suggestionsNote.className = "note";
     suggestionsNote.textContent = `Model ${payload.model || "deepseek"} · ${payload.context_events || 0} events analyzed · ${payload.generated_at || ""}${cacheHint}`;
 
-    const cards = (payload.suggestions || [])
-        .map((item) => {
+    const cards = lastSuggestions
+        .map((item, index) => {
             const priority = (item.priority || "medium").toLowerCase();
             const symbol = item.symbol ? ` · ${escapeHtml(item.symbol)}` : "";
             const config = item.config_changes
                 ? `<div class="suggestion-config">${escapeHtml(JSON.stringify(item.config_changes))}</div>`
                 : "";
             return `
-                <article class="suggestion-card priority-${priority}">
-                    <div class="suggestion-title-row">
-                        <span class="suggestion-badge">${escapeHtml(item.area || "GENERAL")}</span>
-                        <span class="suggestion-badge">${escapeHtml(priority)}</span>
-                        <span class="suggestion-title">${escapeHtml(item.title || "Suggestion")}${symbol}</span>
+                <article class="suggestion-card priority-${priority}" data-index="${index}">
+                    <div class="suggestion-body">
+                        <div class="suggestion-title-row">
+                            <span class="suggestion-badge">${escapeHtml(item.area || "GENERAL")}</span>
+                            <span class="suggestion-badge">${escapeHtml(priority)}</span>
+                            <span class="suggestion-title">${escapeHtml(item.title || "Suggestion")}${symbol}</span>
+                        </div>
+                        <div class="suggestion-detail">${escapeHtml(item.detail || "")}</div>
+                        ${config}
+                        <div class="suggestion-feedback" data-feedback="${index}"></div>
                     </div>
-                    <div class="suggestion-detail">${escapeHtml(item.detail || "")}</div>
-                    ${config}
+                    ${renderSuggestionActions(item, index)}
                 </article>
             `;
         })
@@ -230,6 +260,98 @@ function renderSuggestions(payload) {
         <div class="suggestion-list">${cards || '<div class="note">No suggestions returned.</div>'}</div>
         ${warnings}
     `;
+}
+
+async function postJson(path, body) {
+    const response = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+    });
+    const payload = await response.json();
+    if (!response.ok && !payload.error) {
+        throw new Error(`${path} failed (${response.status})`);
+    }
+    return payload;
+}
+
+function setSuggestionFeedback(index, message, tone = "ok") {
+    const card = suggestionsContent.querySelector(`.suggestion-card[data-index="${index}"]`);
+    const feedback = suggestionsContent.querySelector(`[data-feedback="${index}"]`);
+    if (feedback) {
+        feedback.textContent = message;
+        feedback.style.color = tone === "error" ? "#fca5a5" : tone === "info" ? "#93c5fd" : "#86efac";
+    }
+    if (card) {
+        card.classList.remove("is-applied", "is-restored");
+        if (tone === "ok") {
+            card.classList.add("is-applied");
+        } else if (tone === "info") {
+            card.classList.add("is-restored");
+        }
+    }
+}
+
+async function applySuggestion(index) {
+    const item = lastSuggestions[index];
+    if (!canApplySuggestion(item)) {
+        return;
+    }
+    const button = suggestionsContent.querySelector(`button[data-action="apply"][data-index="${index}"]`);
+    if (button) {
+        button.disabled = true;
+        button.textContent = "Aplicando…";
+    }
+    try {
+        const result = await postJson("/api/symbol-config/apply", {
+            symbol: item.symbol,
+            config_changes: item.config_changes,
+            reason: `DeepSeek: ${item.title || "suggestion"}`,
+        });
+        if (!result.ok) {
+            setSuggestionFeedback(index, result.error || "No se pudo aplicar.", "error");
+            return;
+        }
+        setSuggestionFeedback(index, result.message || "Configuración aplicada.", "ok");
+    } catch (error) {
+        setSuggestionFeedback(index, error.message, "error");
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = "Aplicar";
+        }
+    }
+}
+
+async function restoreSuggestion(index) {
+    const item = lastSuggestions[index];
+    if (!canApplySuggestion(item)) {
+        return;
+    }
+    const button = suggestionsContent.querySelector(`button[data-action="restore"][data-index="${index}"]`);
+    if (button) {
+        button.disabled = true;
+        button.textContent = "Restaurando…";
+    }
+    try {
+        const result = await postJson("/api/symbol-config/restore", {
+            symbol: item.symbol,
+            config_keys: Object.keys(item.config_changes),
+            reason: `DeepSeek restore: ${item.title || "suggestion"}`,
+        });
+        if (!result.ok) {
+            setSuggestionFeedback(index, result.error || "No se pudo restaurar.", "error");
+            return;
+        }
+        setSuggestionFeedback(index, result.message || "Restaurado a defaults.", "info");
+    } catch (error) {
+        setSuggestionFeedback(index, error.message, "error");
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = "Restaurar";
+        }
+    }
 }
 
 async function loadSuggestions(force = false) {
@@ -308,12 +430,12 @@ async function refresh() {
         statusNote.className = "note";
         const rangeLabel = daysEl.options[daysEl.selectedIndex].text.toLowerCase();
         const total = overview.total_events || 0;
-        const symbols = overview.symbols_seen || 0;
+        const symbolsSeen = overview.symbols_seen || 0;
         const lastEvent = overview.last_event
             ? ` · last event ${overview.last_event.replace("T", " ").replace("+00:00", " UTC")}`
             : "";
         if (total > 0) {
-            statusNote.textContent = `MySQL connected · ${formatNumber(total)} events (${rangeLabel}) · ${formatNumber(symbols)} symbol(s)${lastEvent}.`;
+            statusNote.textContent = `MySQL connected · ${formatNumber(total)} events (${rangeLabel}) · ${formatNumber(symbolsSeen)} symbol(s)${lastEvent}.`;
         } else {
             statusNote.textContent = `MySQL connected · no events in ${rangeLabel} yet. Keep the fleet running to collect decision_events.`;
         }
@@ -340,6 +462,21 @@ exportBtn.addEventListener("click", () => {
 
 refreshBtn.addEventListener("click", refresh);
 suggestionsBtn.addEventListener("click", () => loadSuggestions(true));
+suggestionsContent.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-action]");
+    if (!button) {
+        return;
+    }
+    const index = Number(button.dataset.index);
+    if (Number.isNaN(index)) {
+        return;
+    }
+    if (button.dataset.action === "apply") {
+        applySuggestion(index);
+    } else if (button.dataset.action === "restore") {
+        restoreSuggestion(index);
+    }
+});
 daysEl.addEventListener("change", refresh);
 symbolEl.addEventListener("change", refresh);
 granularityEl.addEventListener("change", refresh);

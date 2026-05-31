@@ -12,6 +12,7 @@ from flask import Flask, Response, abort, jsonify, redirect, request, send_from_
 import db_analytics
 import db_store
 import deepseek_advisor
+import symbol_config_admin
 
 load_dotenv()
 
@@ -128,6 +129,37 @@ def suggestions():
         force=force,
     )
     status = 200 if not result.get("error") or result.get("suggestions") else 503
+    return _cors(jsonify(result)), status
+
+
+@app.route("/api/symbol-config/<symbol>", methods=["GET"])
+def symbol_config_get(symbol: str):
+    return _cors(jsonify(symbol_config_admin.get_symbol_override(symbol)))
+
+
+@app.route("/api/symbol-config/apply", methods=["POST"])
+def symbol_config_apply():
+    payload = request.get_json(silent=True) or {}
+    symbol = (payload.get("symbol") or "").strip()
+    config_changes = payload.get("config_changes") or {}
+    reason = payload.get("reason")
+    if not symbol:
+        return _cors(jsonify({"ok": False, "error": "symbol required"})), 400
+    result = symbol_config_admin.apply_config_changes(symbol, config_changes, reason=reason)
+    status = 200 if result.get("ok") else 400
+    return _cors(jsonify(result)), status
+
+
+@app.route("/api/symbol-config/restore", methods=["POST"])
+def symbol_config_restore():
+    payload = request.get_json(silent=True) or {}
+    symbol = (payload.get("symbol") or "").strip()
+    config_keys = payload.get("config_keys") or []
+    reason = payload.get("reason")
+    if not symbol:
+        return _cors(jsonify({"ok": False, "error": "symbol required"})), 400
+    result = symbol_config_admin.restore_config_keys(symbol, config_keys, reason=reason)
+    status = 200 if result.get("ok") else 400
     return _cors(jsonify(result)), status
 
 

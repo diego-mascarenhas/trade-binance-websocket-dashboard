@@ -361,6 +361,73 @@ def upsert_symbol_config(
             return None
 
 
+def deactivate_symbol_config(
+    symbol: str,
+    *,
+    updated_by: str = "manual",
+    reason: str | None = None,
+) -> int | None:
+    """Disable DB overrides for a symbol (falls back to .env on next process start)."""
+    if not DB_ENABLED or not _credentials_configured():
+        return None
+    if not ensure_schema():
+        return None
+
+    symbol = symbol.upper()
+    with _write_lock:
+        try:
+            conn = _connect()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT config_json, config_version
+                        FROM symbol_config
+                        WHERE symbol = %s
+                        LIMIT 1
+                        """,
+                        (symbol,),
+                    )
+                    existing = cursor.fetchone()
+                    if not existing:
+                        return 0
+
+                    previous_version = int(existing["config_version"])
+                    new_version = previous_version + 1
+
+                    cursor.execute(
+                        """
+                        UPDATE symbol_config
+                        SET active = 0,
+                            config_version = %s,
+                            updated_by = %s
+                        WHERE symbol = %s
+                        """,
+                        (new_version, updated_by, symbol),
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO symbol_config_history
+                            (symbol, config_json, config_version, previous_version, updated_by, reason)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            symbol,
+                            _json_dumps({}),
+                            new_version,
+                            previous_version,
+                            updated_by,
+                            reason or "restored to .env defaults",
+                        ),
+                    )
+            finally:
+                conn.close()
+            return new_version
+        except Exception as exc:
+            logger.warning("MySQL deactivate_symbol_config failed for %s: %s", symbol, exc)
+            return None
+
+
 def log_decision_event(
     symbol: str,
     event_type: str,

@@ -53,7 +53,9 @@ Respond ONLY with valid JSON (no markdown):
     }
   ],
   "warnings": ["optional risks in Spanish"]
-}"""
+}
+
+When config_changes is non-empty for a specific pair, symbol MUST be set (e.g. BTCUSDT)."""
 
 _cache_lock = threading.Lock()
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
