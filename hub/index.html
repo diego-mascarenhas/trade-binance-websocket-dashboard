@@ -57,6 +57,12 @@
             `;
         }
 
+        function obClass(obNear) {
+            if (obNear === "support") return "stat-value near-support";
+            if (obNear === "resistance") return "stat-value near-resistance";
+            return "stat-value";
+        }
+
         function cardShell(pair) {
             const url = `http://${host}:${pair.port}/`;
             const article = document.createElement("article");
@@ -76,7 +82,7 @@
                     ${statRow("24h", "—")}
                     ${statRow("Confidence", "—")}
                     ${statRow("Trend", "—")}
-                    ${statRow("Pattern", "—")}
+                    ${statRow("OB zone", "—")}
                     ${statRow("Position", "—")}
                 </div>
                 <p class="card-status">Connecting…</p>
@@ -100,7 +106,7 @@
                 statRow("24h", data.change_display || "—", changeClass(data.change_24h)),
                 statRow("Confidence", `${data.confidence ?? 0}%`, "stat-value strong"),
                 statRow("Trend", trendValue, trendBadge(trendValue)),
-                statRow("Pattern", data.pattern || "None", "stat-value"),
+                statRow("OB zone", data.ob_proximity || "—", obClass(data.ob_near)),
                 statRow(
                     "Position",
                     data.position || "None",

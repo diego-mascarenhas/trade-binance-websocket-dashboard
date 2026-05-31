@@ -2383,6 +2383,24 @@ def build_telegram_status() -> str:
     return "\n".join(lines)
 
 
+def format_ob_proximity(metrics: dict) -> tuple[str, str]:
+    """Label for hub cards: which OB wall price is nearest (support/resistance)."""
+    zone = metrics.get("zone_position_pct")
+    if zone is None:
+        return "—", "none"
+
+    zone = float(zone)
+    if zone <= SIGNAL_ZONE_LONG_ENTER:
+        return f"Support · {zone:.0f}%", "support"
+    if zone >= SIGNAL_ZONE_SHORT_ENTER:
+        return f"Resistance · {zone:.0f}%", "resistance"
+    if zone < 50:
+        return f"→ Support · {zone:.0f}%", "support-side"
+    if zone > 50:
+        return f"→ Resistance · {zone:.0f}%", "resistance-side"
+    return f"Mid · {zone:.0f}%", "mid"
+
+
 def build_hub_summary() -> dict:
     """Compact snapshot for the multi-pair hub cards."""
     _, _, metrics = get_candles_df()
@@ -2403,6 +2421,7 @@ def build_hub_summary() -> dict:
         position = "None"
 
     change = metrics.get("change_24h")
+    ob_proximity, ob_near = format_ob_proximity(metrics)
     return {
         "symbol": SYMBOL.upper(),
         "interval": INTERVAL,
@@ -2415,7 +2434,9 @@ def build_hub_summary() -> dict:
         "min_confidence": min_conf,
         "action": "TRADE" if is_tradable_signal(signal, confidence, min_conf) else "WATCH",
         "trend": analysis.get("htf_bias", "NEUTRAL"),
-        "pattern": metrics.get("pattern", "None"),
+        "ob_proximity": ob_proximity,
+        "ob_near": ob_near,
+        "zone_position_pct": metrics.get("zone_position_pct"),
         "ws_status": metrics.get("status", "—"),
         "position": position,
         "position_open": bool(pos.get("open")),

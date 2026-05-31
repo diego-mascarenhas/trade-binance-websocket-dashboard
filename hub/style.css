@@ -169,6 +169,16 @@ h1 {
     color: #58a6ff;
 }
 
+.stat-value.near-support {
+    color: #00c176;
+    font-weight: 600;
+}
+
+.stat-value.near-resistance {
+    color: #ff4d4f;
+    font-weight: 600;
+}
+
 .card-status {
     margin: 0;
     color: #6b7280;
