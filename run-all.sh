@@ -40,6 +40,13 @@ log() {
 }
 
 stop_all() {
+    if [[ -x "$VENV_PYTHON" && -f "$SCRIPT_DIR/telegram_fleet.py" ]]; then
+        TELEGRAM_COMMANDS_ENABLED=true "$VENV_PYTHON" -c "
+import telegram_notify as t
+t.shutdown_fleet()
+" 2>/dev/null || true
+    fi
+
     if [[ ! -f "$PID_FILE" ]]; then
         log "No pid file ($PID_FILE). Nothing to stop."
         return 0
@@ -132,9 +139,30 @@ start_dashboards() {
         local symbol="${item%%:*}"
         local port="${item##*:}"
         log "Dashboard ${symbol} -> http://127.0.0.1:${port}/"
-        "$VENV_PYTHON" "$SCRIPT_DIR/app.py" "$symbol" --port "$port" >/dev/null 2>&1 &
+        TELEGRAM_COMMANDS_ENABLED=false "$VENV_PYTHON" "$SCRIPT_DIR/app.py" "$symbol" --port "$port" >/dev/null 2>&1 &
         echo $! >> "$PID_FILE"
     done
+}
+
+start_telegram_fleet() {
+    if [[ ! -x "$VENV_PYTHON" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$SCRIPT_DIR/telegram_fleet.py" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$SCRIPT_DIR/.env" ]]; then
+        log "Telegram fleet skipped (.env not found)"
+        return 0
+    fi
+    if ! grep -q '^TELEGRAM_BOT_TOKEN=.\+' "$SCRIPT_DIR/.env" 2>/dev/null; then
+        log "Telegram fleet skipped (TELEGRAM_BOT_TOKEN not set)"
+        return 0
+    fi
+
+    log "Telegram fleet commands (/start /stop /status)"
+    TELEGRAM_COMMANDS_ENABLED=true HUB_PORT="$HUB_PORT" "$VENV_PYTHON" "$SCRIPT_DIR/telegram_fleet.py" >/dev/null 2>&1 &
+    echo $! >> "$PID_FILE"
 }
 
 if [[ "${1:-}" == "stop" ]]; then
@@ -152,6 +180,7 @@ parse_pairs
 write_pairs_json
 start_hub
 start_dashboards
+start_telegram_fleet
 
 log "Started ${#PAIR_LINES[@]} dashboard(s) + hub."
 log "Open hub: http://127.0.0.1:${HUB_PORT}/"

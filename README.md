@@ -75,11 +75,15 @@ Open the dashboard at `http://127.0.0.1:8050` (or the host/port from `.env` / `-
 | `LEVERAGE` | Fixed leverage, or fallback when `LEVERAGE_MODE=max` / API fails | `4` |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Optional Telegram alerts + commands `/status` `/stop` `/start` | — |
 
-Telegram commands (same chat as `TELEGRAM_CHAT_ID` only):
+Telegram commands (same chat as `TELEGRAM_CHAT_ID` only). With `./run-all.sh`, **one** fleet listener handles commands for all pairs (avoids 409 Conflict):
 
-- `/status` — symbol, signal, execution mode, last event
-- `/stop` — pause new orders (dashboard keeps running)
-- `/start` — resume orders
+- `/status` — fleet overview: TRADE setups, open positions, offline count
+- `/stop` — pause trading on **all** pairs (shared `logs/fleet.state`)
+- `/start` — resume fleet trading
+
+Individual dashboards only send alerts (valid entry, positions, dry-run/live). They do not poll Telegram commands.
+
+Single-pair mode: set `TELEGRAM_COMMANDS_ENABLED=true` on `app.py` to restore per-process commands.
 
 **Note:** Several scripts may **send** alerts with the same `TELEGRAM_BOT_TOKEN` (e.g. this dashboard + order-blocks bot). That is fine. Only **one** process may **poll** `getUpdates` for commands; if you see `409 Conflict`, stop the other poller or use a separate bot token for commands.
 

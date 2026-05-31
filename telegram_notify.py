@@ -1,4 +1,4 @@
-"""Telegram notifications and /start /stop /status commands."""
+"""Telegram notifications and fleet-wide /start /stop /status commands."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -22,8 +23,8 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TELEGRAM_POLL_INTERVAL = float(os.getenv("TELEGRAM_POLL_INTERVAL", "2"))
+LOG_DIR = os.getenv("LOG_DIR", "logs")
 
-_trading_paused = False
 _pause_lock = threading.Lock()
 _update_offset = 0
 _listener_stop = threading.Event()
@@ -32,23 +33,70 @@ _shutdown_lock = threading.Lock()
 _polling_conflict_warned = False
 
 
-def is_configured() -> bool:
-    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+def _fleet_state_path() -> Path:
+    path = Path(LOG_DIR)
+    path.mkdir(parents=True, exist_ok=True)
+    return path / "fleet.state"
+
+
+def read_fleet_state() -> dict[str, Any]:
+    default: dict[str, Any] = {
+        "trading_paused": False,
+        "fleet_running": False,
+    }
+    state_path = _fleet_state_path()
+    if not state_path.exists():
+        return dict(default)
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return dict(default)
+        return {**default, **data}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read fleet state: %s", exc)
+        return dict(default)
+
+
+def write_fleet_state(*, updated_by: str, **fields: Any) -> dict[str, Any]:
+    with _pause_lock:
+        state = read_fleet_state()
+        state.update(fields)
+        state["updated_at"] = time.time()
+        state["updated_by"] = updated_by
+        _fleet_state_path().write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return dict(state)
 
 
 def is_trading_paused() -> bool:
     with _pause_lock:
-        return _trading_paused
+        return bool(read_fleet_state().get("trading_paused"))
 
 
-def set_trading_paused(paused: bool) -> None:
-    global _trading_paused
+def is_fleet_running() -> bool:
     with _pause_lock:
-        _trading_paused = paused
+        return bool(read_fleet_state().get("fleet_running"))
+
+
+def set_trading_paused(paused: bool, *, updated_by: str = "telegram") -> None:
+    write_fleet_state(trading_paused=paused, updated_by=updated_by)
+
+
+def set_fleet_running(running: bool, *, updated_by: str = "run-all") -> None:
+    write_fleet_state(fleet_running=running, updated_by=updated_by)
 
 
 def trading_state_label() -> str:
+    if not is_fleet_running():
+        return "fleet stopped"
     return "paused" if is_trading_paused() else "active"
+
+
+def is_configured() -> bool:
+    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+
+def commands_enabled() -> bool:
+    return os.getenv("TELEGRAM_COMMANDS_ENABLED", "").lower() in ("1", "true", "yes")
 
 
 def _send_sync(text: str, chat_id: str | None = None) -> bool:
@@ -164,6 +212,14 @@ def notify_order_failed(symbol: str, direction: str) -> None:
     send_raw(f"❌ {symbol.upper()} futures — ORDER FAILED ({direction})")
 
 
+def notify_fleet_started(pair_count: int, hub_port: int) -> None:
+    send_bot(
+        f"Fleet started · {pair_count} pairs · hub :{hub_port}\n"
+        f"Trading: {trading_state_label()}\n"
+        f"Commands: /status · /stop · /start"
+    )
+
+
 def notify_started(
     symbol: str,
     execution_enabled: bool,
@@ -172,6 +228,8 @@ def notify_started(
     ui_enabled: bool,
     interval: str,
 ) -> None:
+    if not os.getenv("TELEGRAM_NOTIFY_PAIR_START", "").lower() in ("1", "true", "yes"):
+        return
     if execution_enabled:
         mode_label = execution_mode.upper()
     else:
@@ -180,26 +238,38 @@ def notify_started(
     send_bot(
         f"Dashboard started\n"
         f"Mode: {mode_label} | Symbol: {symbol.upper()} | Interval: {interval} | "
-        f"Port: {dash_port} | UI: {ui_label}\n"
-        f"Commands: /status · /stop · /start"
+        f"Port: {dash_port} | UI: {ui_label}"
     )
 
 
-def notify_stopped(symbol: str | None = None) -> None:
+def notify_fleet_stopped() -> None:
     global _shutdown_notified
     with _shutdown_lock:
         if _shutdown_notified:
             return
         _shutdown_notified = True
-    label = f" · {symbol.upper()}" if symbol else ""
-    if not send_bot_sync(f"Dashboard stopped{label}"):
-        logger.warning("Telegram stop notification was not delivered")
+    if not send_bot_sync("Fleet stopped — all dashboards offline"):
+        logger.warning("Telegram fleet stop notification was not delivered")
+
+
+def notify_stopped(symbol: str | None = None) -> None:
+    if symbol:
+        return
+    notify_fleet_stopped()
+
+
+def shutdown_fleet() -> None:
+    """Stop fleet command listener and notify once (run-all stop)."""
+    set_fleet_running(False, updated_by="run-all")
+    stop_command_listener()
+    notify_fleet_stopped()
 
 
 def shutdown(symbol: str | None = None) -> None:
-    """Stop command listener and send stop message once (safe to call multiple times)."""
-    stop_command_listener()
-    notify_stopped(symbol)
+    """Per-pair shutdown hook — fleet stop is handled by shutdown_fleet()."""
+    if symbol:
+        return
+    shutdown_fleet()
 
 
 def _telegram_api_get(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -249,12 +319,12 @@ def _authorized_chat(chat_id: Any) -> bool:
 
 def _handle_command(command: str, status_provider: Callable[[], str]) -> None:
     if command == "/stop":
-        set_trading_paused(True)
-        send_bot("Trading paused — no new orders will be sent")
+        set_trading_paused(True, updated_by="telegram")
+        send_bot("Fleet trading paused — no new orders on any pair")
         return
     if command == "/start":
-        set_trading_paused(False)
-        send_bot("Trading resumed — orders enabled again")
+        set_trading_paused(False, updated_by="telegram")
+        send_bot("Fleet trading resumed — orders enabled on all pairs")
         return
     if command == "/status":
         send_bot(status_provider())
@@ -305,7 +375,7 @@ def _command_loop(status_provider: Callable[[], str]) -> None:
 
 
 def start_command_listener(status_provider: Callable[[], str]) -> None:
-    if not is_configured():
+    if not is_configured() or not commands_enabled():
         return
     global _update_offset
     _prepare_command_polling()

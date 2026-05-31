@@ -2872,7 +2872,7 @@ def build_telegram_status() -> str:
     auto_execute = ex.get("auto_execute", False)
     exec_mode = ex.get("mode", "dry").upper() if exec_enabled else "OFF"
     if telegram.is_trading_paused():
-        trading = "paused (/start to resume)"
+        trading = "fleet paused (/start to resume)"
     elif not exec_enabled:
         trading = "off (EXECUTION_ENABLED=false)"
     elif not auto_execute:
@@ -2969,7 +2969,7 @@ def run_server() -> None:
 
     signal.signal(signal.SIGINT, _request_shutdown)
     signal.signal(signal.SIGTERM, _request_shutdown)
-    atexit.register(lambda: telegram.shutdown(SYMBOL))
+    atexit.register(lambda: None)
 
     try:
         if ui_enabled:
@@ -2983,11 +2983,8 @@ def run_server() -> None:
                 time.sleep(3600)
     except KeyboardInterrupt:
         logger.info("Shutting down")
-    finally:
-        telegram.shutdown(SYMBOL)
 
 
 if __name__ == "__main__":
     Thread(target=start_ws, daemon=True).start()
-    telegram.start_command_listener(build_telegram_status)
     run_server()
