@@ -32,6 +32,9 @@ OVERRIDABLE_KEYS: dict[str, Callable[[Any], Any]] = {
 _symbol_config_version: int = 0
 _symbol_trading_enabled: bool = True
 _cached_config_snapshot: dict[str, Any] = {}
+_env_defaults: dict[str, Any] = {}
+_execution_env_defaults: dict[str, Any] = {}
+_loaded_db_version: int = -1
 
 
 def config_version() -> int:
@@ -46,22 +49,41 @@ def get_config_snapshot() -> dict[str, Any]:
     return dict(_cached_config_snapshot)
 
 
-def apply_db_overrides(module_globals: dict[str, Any], symbol: str) -> None:
-    global _symbol_config_version, _symbol_trading_enabled, _cached_config_snapshot
-
-    _cached_config_snapshot = build_config_snapshot(module_globals)
-
-    if not db_store.is_enabled():
+def capture_env_defaults(module_globals: dict[str, Any]) -> None:
+    """Store .env values once so DB reload can reset before re-applying overrides."""
+    global _env_defaults, _execution_env_defaults
+    if _env_defaults:
         return
 
-    db_store.init()
-    overrides, version = db_store.get_symbol_config(symbol)
-    _symbol_config_version = version
+    for key in OVERRIDABLE_KEYS:
+        if key == "symbol_trading_enabled":
+            continue
+        if key in module_globals:
+            _env_defaults[key] = module_globals[key]
+    _env_defaults["symbol_trading_enabled"] = True
 
-    if not overrides:
-        logger.info("%s: no DB config row — using .env defaults", symbol.upper())
-        _cached_config_snapshot = build_config_snapshot(module_globals)
-        return
+    import execution
+
+    _execution_env_defaults["POSITION_SIZE_USDT"] = execution.POSITION_SIZE_USDT
+
+
+def _reset_module_globals(module_globals: dict[str, Any]) -> None:
+    global _symbol_trading_enabled
+
+    for key, value in _env_defaults.items():
+        if key == "symbol_trading_enabled":
+            _symbol_trading_enabled = bool(value)
+        elif key in module_globals:
+            module_globals[key] = value
+
+    import execution
+
+    for key, value in _execution_env_defaults.items():
+        setattr(execution, key, value)
+
+
+def _apply_overrides(module_globals: dict[str, Any], overrides: dict[str, Any]) -> list[str]:
+    global _symbol_trading_enabled
 
     if "symbol_trading_enabled" in overrides:
         _symbol_trading_enabled = OVERRIDABLE_KEYS["symbol_trading_enabled"](
@@ -78,19 +100,7 @@ def apply_db_overrides(module_globals: dict[str, Any], symbol: str) -> None:
             module_globals[key] = caster(overrides[key])
             applied.append(key)
         except (TypeError, ValueError) as exc:
-            logger.warning("Invalid DB override %s=%r for %s: %s", key, overrides[key], symbol, exc)
-
-    _cached_config_snapshot = build_config_snapshot(module_globals)
-
-    if applied:
-        logger.info(
-            "%s: applied DB config v%s overrides: %s",
-            symbol.upper(),
-            version,
-            ", ".join(applied),
-        )
-    if not _symbol_trading_enabled:
-        logger.info("%s: symbol_trading_enabled=false in DB", symbol.upper())
+            logger.warning("Invalid DB override %s=%r: %s", key, overrides[key], exc)
 
     import execution
 
@@ -100,9 +110,70 @@ def apply_db_overrides(module_globals: dict[str, Any], symbol: str) -> None:
                 execution.POSITION_SIZE_USDT = float(overrides[key])
                 applied.append(f"execution.{key}")
             except (TypeError, ValueError) as exc:
-                logger.warning("Invalid DB override %s for %s: %s", key, symbol, exc)
+                logger.warning("Invalid DB override %s: %s", key, exc)
 
+    return applied
+
+
+def reload_from_db(
+    module_globals: dict[str, Any],
+    symbol: str,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Reload symbol overrides from MySQL. Resets to .env defaults first."""
+    global _symbol_config_version, _cached_config_snapshot, _loaded_db_version
+
+    capture_env_defaults(module_globals)
+
+    if not db_store.is_enabled():
+        _cached_config_snapshot = build_config_snapshot(module_globals)
+        return {"changed": False, "db_enabled": False}
+
+    db_store.init()
+    overrides, version, active = db_store.get_symbol_config_record(symbol)
+
+    if not force and version == _loaded_db_version:
+        return {"changed": False, "config_version": version, "db_enabled": True}
+
+    previous_htf = module_globals.get("HTF_INTERVAL")
+    previous_interval = module_globals.get("INTERVAL")
+
+    _reset_module_globals(module_globals)
+    applied: list[str] = []
+
+    if active and overrides:
+        applied = _apply_overrides(module_globals, overrides)
+        logger.info(
+            "%s: hot-reloaded DB config v%s overrides: %s",
+            symbol.upper(),
+            version,
+            ", ".join(applied) if applied else "(empty)",
+        )
+    else:
+        logger.info("%s: hot-reloaded DB config v%s — using .env defaults", symbol.upper(), version)
+
+    _loaded_db_version = version
+    _symbol_config_version = version if active else 0
     _cached_config_snapshot = build_config_snapshot(module_globals)
+
+    needs_ws_reconnect = (
+        module_globals.get("HTF_INTERVAL") != previous_htf
+        or module_globals.get("INTERVAL") != previous_interval
+    )
+
+    return {
+        "changed": True,
+        "db_enabled": True,
+        "config_version": version,
+        "active": active,
+        "applied": applied,
+        "needs_ws_reconnect": needs_ws_reconnect,
+    }
+
+
+def apply_db_overrides(module_globals: dict[str, Any], symbol: str) -> None:
+    reload_from_db(module_globals, symbol, force=True)
 
 
 def build_config_snapshot(module_globals: dict[str, Any]) -> dict[str, Any]:

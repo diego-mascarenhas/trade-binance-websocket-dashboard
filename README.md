@@ -125,7 +125,7 @@ curl -o features.csv "http://127.0.0.1:8050/api/export/features.csv?days=30"
 
 ### DeepSeek config suggestions
 
-With `DEEPSEEK_ENABLED=true` and `DEEPSEEK_API_KEY` in `.env`, open **Analytics → Analyze** to get AI tuning advice from your `decision_events` (ADX/RSI thresholds, cooldown, per-symbol overrides). Responses are cached (`DEEPSEEK_SUGGESTIONS_COOLDOWN`, default 300s). API key stays on the server only.
+With `DEEPSEEK_ENABLED=true` and `DEEPSEEK_API_KEY` in `.env`, open **Analytics → Analyze** to get AI tuning advice from your `decision_events` (ADX/RSI thresholds, cooldown, per-symbol overrides). **Apply / Restore** saves to MySQL and immediately calls that pair's dashboard (`POST /api/reload-config`) — no restart. Optional `DB_CONFIG_POLL_SEC>0` polls MySQL as a fallback for manual SQL edits. Responses are cached (`DEEPSEEK_SUGGESTIONS_COOLDOWN`, default 300s).
 
 ### Telegram commands
 

@@ -8,7 +8,7 @@ import signal
 import socket
 import time
 from collections import deque
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 
 import aiohttp
 import pandas as pd
@@ -132,6 +132,7 @@ TRADE_PLAN_PARTIAL_CLOSE_PCT = float(os.getenv("TRADE_PLAN_PARTIAL_CLOSE_PCT", "
 TRADE_PLAN_TRAIL_PCT = float(os.getenv("TRADE_PLAN_TRAIL_PCT", "0.25"))
 TRADE_PLAN_INITIAL_SIZE_PCT = float(os.getenv("TRADE_PLAN_INITIAL_SIZE_PCT", "50"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
+DB_CONFIG_POLL_SEC = int(os.getenv("DB_CONFIG_POLL_SEC", "0"))
 
 INDICATOR_FILTERS_ENABLED = os.getenv("INDICATOR_FILTERS_ENABLED", "true").lower() in (
     "1",
@@ -150,7 +151,10 @@ ADX_USE_HTF = os.getenv("ADX_USE_HTF", "true").lower() in ("1", "true", "yes")
 DASH_HOST = os.getenv("DASH_HOST", "0.0.0.0")
 DASH_PORT = resolve_dash_port(_cli_args.port)
 
+symbol_config.capture_env_defaults(globals())
 symbol_config.apply_db_overrides(globals(), SYMBOL)
+
+ws_force_reconnect = Event()
 
 REST_BASE = "https://api.binance.com"
 WS_BASE = "wss://stream.binance.com:9443"
@@ -1713,15 +1717,37 @@ async def sync_orderbook(session: aiohttp.ClientSession, depth_buffer: list[dict
     return bid_map, ask_map, last_update_id
 
 
+def reload_symbol_config_from_db(*, force: bool = False) -> dict:
+    result = symbol_config.reload_from_db(globals(), SYMBOL, force=force)
+    if result.get("needs_ws_reconnect"):
+        ws_force_reconnect.set()
+        logger.info("%s: HTF/LTF interval changed — reconnecting WebSocket", SYMBOL.upper())
+    return result
+
+
+def config_poll_loop() -> None:
+    while True:
+        time.sleep(max(5, DB_CONFIG_POLL_SEC))
+        if not db_store.is_enabled():
+            continue
+        try:
+            result = reload_symbol_config_from_db()
+            if result.get("changed"):
+                logger.info(
+                    "%s: polled DB config v%s (%s)",
+                    SYMBOL.upper(),
+                    result.get("config_version"),
+                    ", ".join(result.get("applied") or []) or "defaults",
+                )
+        except Exception as exc:
+            logger.warning("%s: DB config poll failed: %s", SYMBOL.upper(), exc)
+
+
 async def ws_loop() -> None:
     global forming_candle, htf_forming_candle, latest_price, orderbook, ws_status, change_24h
 
     depth_buffer: list[dict] = []
-    stream_url = (
-        f"{WS_BASE}/stream?streams="
-        f"{SYMBOL}@kline_{INTERVAL}/{SYMBOL}@kline_{HTF_INTERVAL}/"
-        f"{SYMBOL}@depth@100ms/{SYMBOL}@miniTicker"
-    )
+    last_htf_interval = HTF_INTERVAL
 
     async with aiohttp.ClientSession() as session:
         history = await fetch_historical_klines(session, INTERVAL, min(MAX_CANDLES, 500))
@@ -1734,7 +1760,30 @@ async def ws_loop() -> None:
                 change_24h = initial_change
 
         while True:
+            current_ltf = INTERVAL
+            current_htf = HTF_INTERVAL
+            stream_url = (
+                f"{WS_BASE}/stream?streams="
+                f"{SYMBOL}@kline_{current_ltf}/{SYMBOL}@kline_{current_htf}/"
+                f"{SYMBOL}@depth@100ms/{SYMBOL}@miniTicker"
+            )
+
+            if current_htf != last_htf_interval:
+                try:
+                    htf_history = await fetch_historical_klines(
+                        session, current_htf, min(HTF_CANDLES, 500)
+                    )
+                    with state_lock:
+                        htf_candles.clear()
+                        htf_forming_candle = None
+                        htf_candles.extend(htf_history)
+                    last_htf_interval = current_htf
+                    logger.info("%s: reloaded HTF klines for %s", SYMBOL.upper(), current_htf)
+                except Exception as exc:
+                    logger.warning("%s: HTF history reload failed: %s", SYMBOL.upper(), exc)
+
             try:
+                ws_force_reconnect.clear()
                 ws_status = "connecting"
                 depth_buffer.clear()
 
@@ -1757,23 +1806,27 @@ async def ws_loop() -> None:
                     logger.info("Order book synced at updateId=%s", last_update_id)
 
                     async for raw in ws:
+                        if ws_force_reconnect.is_set():
+                            logger.info("%s: config change — reconnecting WebSocket", SYMBOL.upper())
+                            break
+
                         msg = json.loads(raw)
                         data = msg.get("data", {})
 
                         if "k" in data:
                             k = data["k"]
                             row = kline_row(k)
-                            interval = k.get("i", INTERVAL)
+                            interval = k.get("i", current_ltf)
 
                             with state_lock:
-                                if interval == HTF_INTERVAL:
+                                if interval == current_htf:
                                     htf_forming_candle = row
                                     if row["x"]:
                                         if htf_candles and htf_candles[-1]["t"] == row["t"]:
                                             htf_candles[-1] = row
                                         else:
                                             htf_candles.append(row)
-                                elif interval == INTERVAL:
+                                elif interval == current_ltf:
                                     latest_price = row["c"]
                                     forming_candle = row
                                     if row["x"]:
@@ -3007,6 +3060,14 @@ def hub_summary_route():
     return response
 
 
+@app.server.route("/api/reload-config", methods=["POST"])
+def reload_config_route():
+    result = reload_symbol_config_from_db(force=True)
+    response = jsonify({"ok": True, "symbol": SYMBOL.upper(), **result})
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+
 @app.callback(
     Output("live-chart", "figure"),
     Output("price-header", "children"),
@@ -3214,4 +3275,6 @@ def run_server() -> None:
 
 if __name__ == "__main__":
     Thread(target=start_ws, daemon=True).start()
+    if DB_CONFIG_POLL_SEC > 0:
+        Thread(target=config_poll_loop, daemon=True, name=f"config-poll-{SYMBOL}").start()
     run_server()
