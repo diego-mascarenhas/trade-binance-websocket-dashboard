@@ -58,8 +58,12 @@
         }
 
         function obClass(obNear) {
-            if (obNear === "support") return "stat-value near-support";
-            if (obNear === "resistance") return "stat-value near-resistance";
+            if (obNear === "support" || obNear === "support-side") {
+                return "stat-value near-support";
+            }
+            if (obNear === "resistance" || obNear === "resistance-side") {
+                return "stat-value near-resistance";
+            }
             return "stat-value";
         }
 

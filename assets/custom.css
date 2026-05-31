@@ -84,6 +84,28 @@
     font-weight: 600;
 }
 
+.price-ob-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 2px;
+    font-size: 0.85rem;
+}
+
+.price-ob {
+    font-weight: 600;
+}
+
+.price-ob.ob-near-support,
+.price-ob.ob-near-support-side {
+    color: #00c176;
+}
+
+.price-ob.ob-near-resistance,
+.price-ob.ob-near-resistance-side {
+    color: #ff4d4f;
+}
+
 .title {
     margin: 0 0 4px;
     font-size: 1.6rem;
@@ -193,6 +215,18 @@
 
 .kv-value-wrap .panel-hint {
     font-size: 0.75rem;
+}
+
+.kv-row .kv-value.ob-near-support,
+.kv-row .kv-value.ob-near-support-side {
+    color: #00c176;
+    font-weight: 600;
+}
+
+.kv-row .kv-value.ob-near-resistance,
+.kv-row .kv-value.ob-near-resistance-side {
+    color: #ff4d4f;
+    font-weight: 600;
 }
 
 .badge-row {

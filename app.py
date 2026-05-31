@@ -1890,10 +1890,13 @@ def kv_row(
     *,
     strong: bool = False,
     badge_class: str | None = None,
+    value_class: str | None = None,
     hint: str | None = None,
 ) -> html.Div:
     if badge_class:
         value_node = html.Span(str(value), className=badge_class)
+    elif value_class:
+        value_node = html.Span(str(value), className=value_class)
     elif strong:
         value_node = html.Strong(str(value), className="kv-value")
     else:
@@ -1909,16 +1912,87 @@ def kv_row(
     return html.Div(children, className="kv-row")
 
 
+def format_ob_proximity(metrics: dict) -> tuple[str, str]:
+    """Which OB wall is nearest: support/resistance (0–100% between walls)."""
+    zone = metrics.get("zone_position_pct")
+    if zone is None:
+        return "—", "none"
+
+    zone = float(zone)
+    if zone <= SIGNAL_ZONE_LONG_ENTER:
+        return f"Support · {zone:.0f}%", "support"
+    if zone >= SIGNAL_ZONE_SHORT_ENTER:
+        return f"Resistance · {zone:.0f}%", "resistance"
+    if zone < 50:
+        return f"→ Support · {zone:.0f}%", "support-side"
+    if zone > 50:
+        return f"→ Resistance · {zone:.0f}%", "resistance-side"
+    return f"Mid · {zone:.0f}%", "mid"
+
+
+def ob_proximity_value_class(ob_near: str) -> str:
+    if ob_near == "support":
+        return "kv-value ob-near-support"
+    if ob_near == "resistance":
+        return "kv-value ob-near-resistance"
+    if ob_near == "support-side":
+        return "kv-value ob-near-support-side"
+    if ob_near == "resistance-side":
+        return "kv-value ob-near-resistance-side"
+    return "kv-value"
+
+
+def build_ob_zone_kv_row(metrics: dict) -> html.Div:
+    ob_label, ob_near = format_ob_proximity(metrics)
+    return kv_row("OB zone", ob_label, value_class=ob_proximity_value_class(ob_near))
+
+
 def build_pattern_panel_children(metrics: dict) -> list:
     analysis = metrics.get("market_analysis") or {}
+
     children: list = [
-        panel_section("Pattern"),
-        kv_row(
-            "Confirmed",
-            metrics["pattern"],
-            badge_class=pattern_badge_class(metrics["pattern"]),
-        ),
+        panel_section("Order block"),
+        build_ob_zone_kv_row(metrics),
     ]
+    support_wall = metrics.get("support")
+    resistance_wall = metrics.get("resistance")
+    if support_wall:
+        children.append(
+            kv_row(
+                "Support wall",
+                format_price(support_wall),
+                strong=True,
+                hint=(
+                    f"qty {metrics['support_qty']:.4f}"
+                    if metrics.get("support_qty") is not None
+                    else None
+                ),
+            )
+        )
+    if resistance_wall:
+        children.append(
+            kv_row(
+                "Resistance wall",
+                format_price(resistance_wall),
+                strong=True,
+                hint=(
+                    f"qty {metrics['resistance_qty']:.4f}"
+                    if metrics.get("resistance_qty") is not None
+                    else None
+                ),
+            )
+        )
+
+    children.extend(
+        [
+            panel_section("Pattern"),
+            kv_row(
+                "Confirmed",
+                metrics["pattern"],
+                badge_class=pattern_badge_class(metrics["pattern"]),
+            ),
+        ]
+    )
 
     if metrics["pattern"] == "None":
         children.append(
@@ -2026,11 +2100,6 @@ def build_signal_panel_children(metrics: dict) -> list:
     )
     support_text = format_price(metrics.get("support")) if metrics.get("support") else "—"
     resistance_text = format_price(metrics.get("resistance")) if metrics.get("resistance") else "—"
-    zone_text = (
-        f"{metrics['zone_position_pct']:.1f}%"
-        if metrics.get("zone_position_pct") is not None
-        else "—"
-    )
     change_text = (
         f"{metrics['change_24h']:+.2f}%"
         if metrics.get("change_24h") is not None
@@ -2051,9 +2120,9 @@ def build_signal_panel_children(metrics: dict) -> list:
         kv_row("Confidence", f"{confidence}%", strong=True, hint=f"min {min_conf}%"),
         kv_row("Entry", entry_text, strong=True),
         panel_section("Order block zone"),
+        build_ob_zone_kv_row(metrics),
         kv_row("Support", support_text, strong=True),
         kv_row("Resistance", resistance_text, strong=True),
-        kv_row("Zone position", zone_text, strong=True),
         kv_row("24h change", change_text, strong=True),
         html.P(reasons, className="signal-reasons"),
     ]
@@ -2162,9 +2231,11 @@ def build_execution_panel_section(metrics: dict) -> list:
 
 def build_trade_plan_panel_children(metrics: dict) -> list:
     plan = metrics.get("trade_plan") or {}
+    ob_row = build_ob_zone_kv_row(metrics)
 
     if not plan.get("active"):
         return [
+            ob_row,
             panel_section("Trade plan"),
             kv_row("Plan", plan.get("summary", "No active plan."), strong=True),
             *build_execution_panel_section(metrics),
@@ -2217,6 +2288,7 @@ def build_trade_plan_panel_children(metrics: dict) -> list:
     )
 
     children: list = [
+        ob_row,
         panel_section("Trade plan"),
         html.Div(
             [
@@ -2324,10 +2396,21 @@ def update_dashboard(_: int):
         if metrics.get("change_24h") is not None
         else "—"
     )
+    ob_label, ob_near = format_ob_proximity(metrics)
     price_header_children = [
         html.Span(SYMBOL.upper(), className="price-symbol"),
         html.Strong(format_price(metrics.get("price")), className="price-value"),
         html.Span(change_text, className=change_24h_class(metrics.get("change_24h"))),
+        html.Div(
+            [
+                html.Span("OB zone", className="price-side-label"),
+                html.Span(
+                    ob_label,
+                    className=f"price-ob {ob_proximity_value_class(ob_near).replace('kv-value ', '')}",
+                ),
+            ],
+            className="price-ob-row",
+        ),
         html.Div(
             [
                 html.Span("Bid", className="price-side-label"),
@@ -2381,24 +2464,6 @@ def build_telegram_status() -> str:
     if ex.get("message"):
         lines.append(f"Last: {ex['message']}")
     return "\n".join(lines)
-
-
-def format_ob_proximity(metrics: dict) -> tuple[str, str]:
-    """Label for hub cards: which OB wall price is nearest (support/resistance)."""
-    zone = metrics.get("zone_position_pct")
-    if zone is None:
-        return "—", "none"
-
-    zone = float(zone)
-    if zone <= SIGNAL_ZONE_LONG_ENTER:
-        return f"Support · {zone:.0f}%", "support"
-    if zone >= SIGNAL_ZONE_SHORT_ENTER:
-        return f"Resistance · {zone:.0f}%", "resistance"
-    if zone < 50:
-        return f"→ Support · {zone:.0f}%", "support-side"
-    if zone > 50:
-        return f"→ Resistance · {zone:.0f}%", "resistance-side"
-    return f"Mid · {zone:.0f}%", "mid"
 
 
 def build_hub_summary() -> dict:
