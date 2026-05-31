@@ -49,42 +49,53 @@ def _fetch_pair_summary(port: int) -> dict | None:
         return None
 
 
+def _setup_line(data: dict) -> str:
+    signal = data.get("signal", "NEUTRAL")
+    confidence = int(data.get("confidence", 0))
+    smc = data.get("smc_pattern") or data.get("smc_state_short") or "—"
+    return f"{data.get('symbol', '—')}: {signal} {confidence}% · SMC {smc}"
+
+
 def build_fleet_status() -> str:
     pairs = _load_pairs()
     lines = [
-        f"Fleet · {len(pairs)} pairs · hub :{HUB_PORT}",
+        f"Fleet · {len(pairs)} pairs",
         f"Trading: {telegram.trading_state_label()}",
     ]
 
     trade_rows: list[str] = []
+    watch_rows: list[str] = []
     position_rows: list[str] = []
     offline = 0
 
     for pair in pairs:
-        symbol = str(pair.get("symbol", "—"))
         port = int(pair.get("port", 0))
         data = _fetch_pair_summary(port)
         if not data:
             offline += 1
             continue
 
-        signal = data.get("signal", "NEUTRAL")
-        confidence = int(data.get("confidence", 0))
         action = data.get("action", "WATCH")
-        position = data.get("position") or "None"
-        smc = data.get("smc_pattern") or data.get("smc_state_short") or "—"
-
         if data.get("position_open"):
-            position_rows.append(f"{symbol}: {position}")
+            pos = data.get("position") or "Open"
+            pct = data.get("position_pnl_pct")
+            if pct is not None:
+                pos = f"{pos} · {pct:+.2f}%"
+            position_rows.append(f"{data.get('symbol')}: {pos}")
         if action == "TRADE":
-            trade_rows.append(f"{symbol}: {signal} {confidence}% · SMC {smc}")
+            trade_rows.append(_setup_line(data))
+        elif action == "WATCH":
+            watch_rows.append(_setup_line(data))
 
     if trade_rows:
         lines.append("TRADE:")
-        lines.extend(trade_rows[:8])
+        lines.extend(trade_rows[:10])
+    if watch_rows:
+        lines.append("WATCH:")
+        lines.extend(watch_rows[:15])
     if position_rows:
         lines.append("Open:")
-        lines.extend(position_rows[:8])
+        lines.extend(position_rows[:10])
     if offline:
         lines.append(f"Offline: {offline}")
 

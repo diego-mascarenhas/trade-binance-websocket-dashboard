@@ -418,6 +418,7 @@ def _parse_position_row(row: dict[str, Any]) -> dict[str, Any] | None:
     entry = float(row.get("entryPrice", 0) or 0)
     mark = float(row.get("markPrice", 0) or 0)
     upnl = float(row.get("unRealizedProfit", 0) or 0)
+    initial_margin = float(row.get("initialMargin", 0) or row.get("isolatedMargin", 0) or 0)
 
     if entry > 0:
         volume_usdt = float(qty_decimal) * entry
@@ -434,8 +435,33 @@ def _parse_position_row(row: dict[str, Any]) -> dict[str, Any] | None:
         "entry": entry if entry > 0 else None,
         "volume_usdt": round(volume_usdt, 2) if volume_usdt is not None else None,
         "unrealized_pnl": round(upnl, 2),
+        "initial_margin": round(initial_margin, 2) if initial_margin > 0 else None,
         "mark_price": mark if mark > 0 else None,
     }
+
+
+def _attach_unrealized_pnl_pct(snapshot: dict[str, Any]) -> None:
+    pnl = snapshot.get("unrealized_pnl")
+    if pnl is None:
+        snapshot["unrealized_pnl_pct"] = None
+        return
+    margin = snapshot.get("initial_margin")
+    volume = snapshot.get("volume_usdt")
+    if margin and margin > 0:
+        snapshot["unrealized_pnl_pct"] = round(float(pnl) / float(margin) * 100, 2)
+    elif volume and volume > 0:
+        snapshot["unrealized_pnl_pct"] = round(float(pnl) / float(volume) * 100, 2)
+    else:
+        entry = snapshot.get("entry")
+        mark = snapshot.get("mark_price")
+        direction = snapshot.get("direction")
+        if entry and mark and entry > 0 and direction in ("LONG", "SHORT"):
+            move = (float(mark) - float(entry)) / float(entry) * 100
+            if direction == "SHORT":
+                move = -move
+            snapshot["unrealized_pnl_pct"] = round(move, 2)
+        else:
+            snapshot["unrealized_pnl_pct"] = None
 
 
 def _pending_entry_snapshot(symbol: str) -> dict[str, Any] | None:
@@ -491,11 +517,13 @@ def _fetch_exchange_exposure(symbol: str) -> dict[str, Any]:
     if len(legs) == 1:
         snapshot = dict(legs[0])
         snapshot["source"] = "binance"
+        _attach_unrealized_pnl_pct(snapshot)
         return snapshot
 
     if len(legs) > 1:
         total_vol = sum(leg.get("volume_usdt") or 0 for leg in legs)
         total_pnl = sum(leg.get("unrealized_pnl") or 0 for leg in legs)
+        total_margin = sum(leg.get("initial_margin") or 0 for leg in legs)
         directions = "+".join(leg["direction"] for leg in legs)
         snapshot = {
             "open": True,
@@ -505,10 +533,12 @@ def _fetch_exchange_exposure(symbol: str) -> dict[str, Any]:
             "entry": legs[0].get("entry"),
             "volume_usdt": round(total_vol, 2) if total_vol else None,
             "unrealized_pnl": round(total_pnl, 2),
+            "initial_margin": round(total_margin, 2) if total_margin else None,
             "mark_price": legs[0].get("mark_price"),
             "legs": legs,
             "source": "binance",
         }
+        _attach_unrealized_pnl_pct(snapshot)
         return snapshot
 
     pending = _pending_entry_snapshot(symbol)

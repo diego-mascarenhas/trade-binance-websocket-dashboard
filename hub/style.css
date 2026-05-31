@@ -64,13 +64,30 @@ h1 {
 .card-head {
     display: flex;
     align-items: baseline;
-    gap: 4px;
+    justify-content: space-between;
+    gap: 8px;
 }
 
 .symbol {
     font-size: 1.05rem;
     font-weight: 700;
     letter-spacing: 0.02em;
+}
+
+.head-pnl {
+    margin-left: auto;
+    font-size: 0.9rem;
+    font-weight: 600;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+
+.head-pnl.change-up {
+    color: #00c176;
+}
+
+.head-pnl.change-down {
+    color: #ff4d4f;
 }
 
 .port {

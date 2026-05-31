@@ -244,6 +244,16 @@
     font-weight: 600;
 }
 
+.kv-row .kv-value.pnl-up {
+    color: #00c176;
+    font-weight: 600;
+}
+
+.kv-row .kv-value.pnl-down {
+    color: #ff4d4f;
+    font-weight: 600;
+}
+
 .badge-row {
     display: flex;
     align-items: center;

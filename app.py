@@ -2609,11 +2609,20 @@ def build_execution_panel_section(metrics: dict) -> list:
         )
         entry_text = format_price(pos.get("entry")) if pos.get("entry") is not None else "—"
         pnl = pos.get("unrealized_pnl")
-        pnl_text = f"{pnl:+.2f}" if pnl is not None else "—"
+        pnl_pct = pos.get("unrealized_pnl_pct")
+        pnl_text = f"{pnl:+.2f} USDT" if pnl is not None else "—"
+        pnl_pct_text = f"{pnl_pct:+.2f}%" if pnl_pct is not None else "—"
+        pnl_class = "kv-value"
+        if pnl_pct is not None:
+            if pnl_pct > 0:
+                pnl_class = "kv-value pnl-up"
+            elif pnl_pct < 0:
+                pnl_class = "kv-value pnl-down"
         children.extend(
             [
                 kv_row("Position", f"{pos.get('direction', '—')} · {vol_text}", strong=True),
-                kv_row("Entry", entry_text, strong=True, hint=f"PnL {pnl_text} USDT"),
+                kv_row("Entry", entry_text, strong=True),
+                kv_row("PnL", f"{pnl_text} · {pnl_pct_text}", value_class=pnl_class),
                 kv_row("Size", pos.get("qty", "—"), strong=True),
             ]
         )
@@ -2892,6 +2901,20 @@ def build_telegram_status() -> str:
     return "\n".join(lines)
 
 
+def format_position_label(pos: dict) -> tuple[str, float | None, float | None]:
+    """Human-readable position + optional PnL USDT and ROE %."""
+    if pos.get("open"):
+        vol = pos.get("volume_usdt")
+        vol_text = f"{vol:.2f} USDT" if vol is not None else ""
+        label = f"{pos.get('direction', '—')} · {vol_text}".strip(" · ")
+        pnl = pos.get("unrealized_pnl")
+        pnl_pct = pos.get("unrealized_pnl_pct")
+        return label, pnl, pnl_pct
+    if pos.get("pending"):
+        return f"Pending {pos.get('direction', '—')}", None, None
+    return "None", None, None
+
+
 def build_hub_summary() -> dict:
     """Compact snapshot for the multi-pair hub cards."""
     _, _, metrics = get_candles_df()
@@ -2901,15 +2924,7 @@ def build_hub_summary() -> dict:
     analysis = metrics.get("market_analysis") or {}
     ex = metrics.get("execution") or {}
     pos = ex.get("position") or {}
-
-    if pos.get("open"):
-        vol = pos.get("volume_usdt")
-        vol_text = f"{vol:.2f} USDT" if vol is not None else ""
-        position = f"{pos.get('direction', '—')} · {vol_text}".strip(" · ")
-    elif pos.get("pending"):
-        position = f"Pending {pos.get('direction', '—')}"
-    else:
-        position = "None"
+    position, position_pnl, position_pnl_pct = format_position_label(pos)
 
     change = metrics.get("change_24h")
     ob_proximity, ob_near = format_ob_proximity(metrics)
@@ -2938,6 +2953,8 @@ def build_hub_summary() -> dict:
         "ws_status": metrics.get("status", "—"),
         "position": position,
         "position_open": bool(pos.get("open")),
+        "position_pnl": position_pnl,
+        "position_pnl_pct": position_pnl_pct,
         "execution_enabled": bool(ex.get("enabled")),
         "execution_auto": bool(ex.get("auto_execute")),
         "execution_mode": ex.get("mode", "dry"),

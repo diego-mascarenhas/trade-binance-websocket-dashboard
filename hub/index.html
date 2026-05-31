@@ -73,6 +73,13 @@
             return "stat-value smc-trend-range";
         }
 
+        function pnlClass(value) {
+            if (value == null) return "stat-value";
+            if (value > 0) return "stat-value change-up";
+            if (value < 0) return "stat-value change-down";
+            return "stat-value";
+        }
+
         function cardShell(pair) {
             const url = `http://${host}:${pair.port}/`;
             const article = document.createElement("article");
@@ -81,7 +88,7 @@
             article.innerHTML = `
                 <div class="card-head">
                     <span class="symbol">${pair.symbol}</span>
-                    <span class="port">:${pair.port}</span>
+                    <span class="head-pnl"></span>
                 </div>
                 <div class="badge-row">
                     <span class="badge badge-neutral card-signal">—</span>
@@ -102,6 +109,12 @@
             return article;
         }
 
+        function formatPnlPct(value) {
+            if (value == null) return "";
+            const sign = value > 0 ? "+" : "";
+            return `${sign}${Number(value).toFixed(2)}%`;
+        }
+
         function renderSummary(article, data) {
             const signalEl = article.querySelector(".card-signal");
             const actionEl = article.querySelector(".card-action");
@@ -109,6 +122,15 @@
             signalEl.className = signalBadge(data.signal);
             actionEl.textContent = data.action || "WATCH";
             actionEl.className = actionBadge(data.action);
+
+            const headPnl = article.querySelector(".head-pnl");
+            if (data.position_open && data.position_pnl_pct != null) {
+                headPnl.textContent = formatPnlPct(data.position_pnl_pct);
+                headPnl.className = `head-pnl ${pnlClass(data.position_pnl_pct).replace("stat-value ", "")}`;
+            } else {
+                headPnl.textContent = "";
+                headPnl.className = "head-pnl";
+            }
 
             const stats = article.querySelector(".card-stats");
             const trendValue = data.trend || "NEUTRAL";
@@ -126,7 +148,7 @@
                 statRow(
                     "Position",
                     data.position || "None",
-                    data.position_open ? "stat-value strong position-open" : "stat-value"
+                    data.position_open ? "stat-value strong" : "stat-value"
                 ),
             ].join("");
 
@@ -143,6 +165,11 @@
             signalEl.className = "badge badge-neutral";
             actionEl.textContent = "—";
             actionEl.className = "badge badge-neutral";
+            const headPnl = article.querySelector(".head-pnl");
+            if (headPnl) {
+                headPnl.textContent = "";
+                headPnl.className = "head-pnl";
+            }
             const statusEl = article.querySelector(".card-status");
             statusEl.textContent = "Dashboard not reachable";
             statusEl.className = "card-status card-status-offline";
@@ -189,7 +216,7 @@
                 if (!Array.isArray(pairs) || pairs.length === 0) {
                     throw new Error("No pairs configured");
                 }
-                meta.textContent = `${pairs.length} pairs · hub :${window.location.port || "8050"}`;
+                meta.textContent = `${pairs.length} pairs`;
                 const cards = pairs.map((pair) => {
                     const article = cardShell(pair);
                     grid.appendChild(article);
