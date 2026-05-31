@@ -179,6 +179,28 @@ h1 {
     font-weight: 600;
 }
 
+.stat-value.smc-trend-bull {
+    color: #00c176;
+    font-weight: 600;
+}
+
+.stat-value.smc-trend-bear {
+    color: #ff4d4f;
+    font-weight: 600;
+}
+
+.stat-value.smc-trend-range {
+    color: #9aa0a6;
+    font-weight: 600;
+}
+
+.stat-value.smc-oneline {
+    font-size: 0.75rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 .card-status {
     margin: 0;
     color: #6b7280;

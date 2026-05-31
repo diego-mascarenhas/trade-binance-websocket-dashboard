@@ -229,6 +229,21 @@
     font-weight: 600;
 }
 
+.kv-row .kv-value.smc-discount {
+    color: #00c176;
+    font-weight: 600;
+}
+
+.kv-row .kv-value.smc-premium {
+    color: #ff4d4f;
+    font-weight: 600;
+}
+
+.kv-row .kv-value.smc-equilibrium {
+    color: #f0b429;
+    font-weight: 600;
+}
+
 .badge-row {
     display: flex;
     align-items: center;

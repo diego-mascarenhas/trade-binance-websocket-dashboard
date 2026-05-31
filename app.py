@@ -111,6 +111,15 @@ MACD_FAST = int(os.getenv("MACD_FAST", "12"))
 MACD_SLOW = int(os.getenv("MACD_SLOW", "26"))
 MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", "9"))
 SWING_LOOKBACK = int(os.getenv("SWING_LOOKBACK", "20"))
+SMC_SWING_LEFT = int(os.getenv("SMC_SWING_LEFT", "2"))
+SMC_SWING_RIGHT = int(os.getenv("SMC_SWING_RIGHT", "2"))
+SMC_INT_SWING_LEFT = int(os.getenv("SMC_INT_SWING_LEFT", "1"))
+SMC_INT_SWING_RIGHT = int(os.getenv("SMC_INT_SWING_RIGHT", "1"))
+SMC_BREAK_LOOKBACK_HTF = int(os.getenv("SMC_BREAK_LOOKBACK_HTF", "3"))
+SMC_BREAK_LOOKBACK_LTF = int(os.getenv("SMC_BREAK_LOOKBACK_LTF", "12"))
+SMC_EQ_TOLERANCE_PCT = float(os.getenv("SMC_EQ_TOLERANCE_PCT", "0.08"))
+SMC_PD_DISCOUNT_MAX = float(os.getenv("SMC_PD_DISCOUNT_MAX", "38"))
+SMC_PD_PREMIUM_MIN = float(os.getenv("SMC_PD_PREMIUM_MIN", "62"))
 TRADE_PLAN_DCA_STEPS = int(os.getenv("TRADE_PLAN_DCA_STEPS", "2"))
 TRADE_PLAN_DCA_STEP_PCT = float(os.getenv("TRADE_PLAN_DCA_STEP_PCT", "0.12"))
 TRADE_PLAN_SL_BUFFER_PCT = float(os.getenv("TRADE_PLAN_SL_BUFFER_PCT", "0.06"))
@@ -439,6 +448,336 @@ def liquidity_label(closed_df: pd.DataFrame, price: float | None, lookback: int 
     return "Mid range"
 
 
+def find_fractal_swings(
+    closed_df: pd.DataFrame,
+    left: int = SMC_SWING_LEFT,
+    right: int = SMC_SWING_RIGHT,
+) -> list[dict]:
+    """Alternating swing highs/lows (fractal pivots) on OHLC data."""
+    if len(closed_df) < left + right + 1:
+        return []
+
+    highs = closed_df["h"].astype(float).values
+    lows = closed_df["l"].astype(float).values
+    raw: list[dict] = []
+
+    for index in range(left, len(closed_df) - right):
+        high_window = highs[index - left : index + right + 1]
+        if highs[index] >= max(high_window):
+            raw.append({"index": index, "type": "high", "price": float(highs[index])})
+        low_window = lows[index - left : index + right + 1]
+        if lows[index] <= min(low_window):
+            raw.append({"index": index, "type": "low", "price": float(lows[index])})
+
+    raw.sort(key=lambda item: item["index"])
+    merged: list[dict] = []
+    for swing in raw:
+        if not merged:
+            merged.append(swing)
+            continue
+        if merged[-1]["type"] != swing["type"]:
+            merged.append(swing)
+            continue
+        if swing["type"] == "high" and swing["price"] >= merged[-1]["price"]:
+            merged[-1] = swing
+        elif swing["type"] == "low" and swing["price"] <= merged[-1]["price"]:
+            merged[-1] = swing
+
+    return merged
+
+
+def _swing_sequence_label(highs: list[float], lows: list[float]) -> str:
+    parts: list[str] = []
+    if len(highs) >= 2:
+        parts.append("HH" if highs[-1] > highs[-2] else "LH")
+    if len(lows) >= 2:
+        parts.append("HL" if lows[-1] > lows[-2] else "LL")
+    return " · ".join(parts) if parts else "—"
+
+
+def _structure_trend(highs: list[float], lows: list[float]) -> str:
+    if len(highs) < 2 or len(lows) < 2:
+        return "RANGING"
+    hh = highs[-1] > highs[-2]
+    hl = lows[-1] > lows[-2]
+    lh = highs[-1] < highs[-2]
+    ll = lows[-1] < lows[-2]
+    if hh and hl:
+        return "BULLISH"
+    if lh and ll:
+        return "BEARISH"
+    return "RANGING"
+
+
+def _pd_zone_from_pct(pct: float | None) -> str:
+    if pct is None:
+        return "—"
+    if pct <= SMC_PD_DISCOUNT_MAX:
+        return "Discount"
+    if pct >= SMC_PD_PREMIUM_MIN:
+        return "Premium"
+    return "Equilibrium"
+
+
+def _detect_recent_structure_event(
+    closed_df: pd.DataFrame,
+    swings: list[dict],
+    trend: str,
+    *,
+    lookback: int = 3,
+    prefix: str = "",
+) -> tuple[str, str, str]:
+    """Return (pattern, bias, pattern_type) e.g. ('BOS', 'bull', 'bos_bull')."""
+    if len(closed_df) < 2 or len(swings) < 2:
+        return "—", "neutral", "none"
+
+    swing_highs = [sw for sw in swings if sw["type"] == "high"]
+    swing_lows = [sw for sw in swings if sw["type"] == "low"]
+    if not swing_highs or not swing_lows:
+        return "—", "neutral", "none"
+
+    start = max(1, len(closed_df) - lookback)
+    for index in range(len(closed_df) - 1, start - 1, -1):
+        last_close = float(closed_df.iloc[index]["c"])
+        prev_close = float(closed_df.iloc[index - 1]["c"])
+        relevant_highs = [sw for sw in swing_highs if sw["index"] < index]
+        relevant_lows = [sw for sw in swing_lows if sw["index"] < index]
+        if not relevant_highs or not relevant_lows:
+            continue
+
+        last_high = relevant_highs[-1]["price"]
+        last_low = relevant_lows[-1]["price"]
+        broke_high = last_close > last_high and prev_close <= last_high
+        broke_low = last_close < last_low and prev_close >= last_low
+
+        if broke_high:
+            if trend in ("BULLISH", "RANGING"):
+                return f"{prefix}BOS", "bull", "bos_bull"
+            return f"{prefix}CHoCH", "bull", "choch_bull"
+        if broke_low:
+            if trend in ("BEARISH", "RANGING"):
+                return f"{prefix}BOS", "bear", "bos_bear"
+            return f"{prefix}CHoCH", "bear", "choch_bear"
+
+    return "—", "neutral", "none"
+
+
+def _detect_equal_liquidity(swings: list[dict], price: float) -> tuple[str, str, str]:
+    """Equal highs (EQH) or equal lows (EQL) liquidity pools."""
+    highs = [sw for sw in swings if sw["type"] == "high"]
+    lows = [sw for sw in swings if sw["type"] == "low"]
+    tolerance = price * SMC_EQ_TOLERANCE_PCT / 100
+
+    if len(highs) >= 2:
+        level = (highs[-2]["price"] + highs[-1]["price"]) / 2
+        if abs(highs[-2]["price"] - highs[-1]["price"]) <= tolerance:
+            if abs(price - level) <= tolerance * 2:
+                return "EQH", "bear", "eqh"
+
+    if len(lows) >= 2:
+        level = (lows[-2]["price"] + lows[-1]["price"]) / 2
+        if abs(lows[-2]["price"] - lows[-1]["price"]) <= tolerance:
+            if abs(price - level) <= tolerance * 2:
+                return "EQL", "bull", "eql"
+
+    return "—", "neutral", "none"
+
+
+def _pd_zone_pattern_fallback(pd_zone: str) -> tuple[str, str, str]:
+    mapping = {
+        "Discount": ("Disc", "bull", "pd_discount"),
+        "Premium": ("Prem", "bear", "pd_premium"),
+        "Equilibrium": ("Eq", "neutral", "pd_equilibrium"),
+    }
+    return mapping.get(pd_zone, ("—", "neutral", "none"))
+
+
+def _resolve_smc_pattern(
+    htf_df: pd.DataFrame,
+    htf_swings: list[dict],
+    htf_trend: str,
+    ltf_df: pd.DataFrame | None,
+    price: float,
+    liquidity: str,
+    pd_zone: str,
+) -> tuple[str, str, str]:
+    pattern, bias, ptype = _detect_recent_structure_event(
+        htf_df,
+        htf_swings,
+        htf_trend,
+        lookback=SMC_BREAK_LOOKBACK_HTF,
+    )
+    if pattern != "—":
+        return pattern, bias, ptype
+
+    if ltf_df is not None and not ltf_df.empty:
+        ltf_swings = find_fractal_swings(
+            ltf_df,
+            left=SMC_INT_SWING_LEFT,
+            right=SMC_INT_SWING_RIGHT,
+        )
+        ltf_highs = [sw["price"] for sw in ltf_swings if sw["type"] == "high"]
+        ltf_lows = [sw["price"] for sw in ltf_swings if sw["type"] == "low"]
+        ltf_trend = _structure_trend(ltf_highs, ltf_lows)
+        pattern, bias, ptype = _detect_recent_structure_event(
+            ltf_df,
+            ltf_swings,
+            ltf_trend,
+            lookback=SMC_BREAK_LOOKBACK_LTF,
+            prefix="i",
+        )
+        if pattern != "—":
+            return pattern, bias, ptype
+
+    pattern, bias, ptype = _detect_equal_liquidity(htf_swings, price)
+    if pattern != "—":
+        return pattern, bias, ptype
+
+    if liquidity == "Sweep high":
+        return "EQH", "bear", "sweep_high"
+    if liquidity == "Sweep low":
+        return "EQL", "bull", "sweep_low"
+    if liquidity == "At swing high":
+        return "EQH", "bear", "at_swing_high"
+    if liquidity == "At swing low":
+        return "EQL", "bull", "at_swing_low"
+
+    return _pd_zone_pattern_fallback(pd_zone)
+
+
+def _build_smc_state(
+    trend: str,
+    pd_zone: str,
+    pattern: str,
+    liquidity: str,
+    ob_zone_pct: float | None,
+) -> tuple[str, str]:
+    """Human-readable SMC phase + short hint."""
+    state = f"{pattern} · {pd_zone}" if pd_zone != "—" else pattern
+
+    hints: list[str] = []
+    if pattern.startswith("BOS"):
+        hints.append("Structure continuation")
+    elif pattern.startswith("CHoCH") or pattern.startswith("iCHoCH"):
+        hints.append("Potential reversal")
+    elif pattern.startswith("iBOS"):
+        hints.append("Internal continuation")
+    elif pattern == "EQH":
+        hints.append("Sell-side liquidity · equal highs")
+    elif pattern == "EQL":
+        hints.append("Buy-side liquidity · equal lows")
+    if liquidity in ("Sweep low", "At swing low") and pd_zone == "Discount":
+        hints.append("Liquidity grab below")
+    elif liquidity in ("Sweep high", "At swing high") and pd_zone == "Premium":
+        hints.append("Liquidity grab above")
+    if ob_zone_pct is not None:
+        if ob_zone_pct <= SIGNAL_ZONE_LONG_ENTER:
+            hints.append("At OB support")
+        elif ob_zone_pct >= SIGNAL_ZONE_SHORT_ENTER:
+            hints.append("At OB resistance")
+
+    return state, " · ".join(hints) if hints else "—"
+
+
+def format_smc_hub_label(smc: dict) -> str:
+    """Hub cards: SMC pattern code only (BOS, CHoCH, EQH, …)."""
+    pattern = smc.get("pattern", "—")
+    return pattern if pattern not in (None, "—") else "—"
+
+
+def compute_smc_structure(
+    htf_closed_df: pd.DataFrame,
+    price: float | None,
+    liquidity: str,
+    ltf_closed_df: pd.DataFrame | None = None,
+    support: float | None = None,
+    resistance: float | None = None,
+    ob_zone_pct: float | None = None,
+) -> dict:
+    empty = {
+        "trend": "RANGING",
+        "sequence": "—",
+        "pattern": "—",
+        "pattern_bias": "neutral",
+        "pattern_type": "none",
+        "last_event": "—",
+        "last_event_type": "none",
+        "pd_zone": "—",
+        "pd_pct": None,
+        "state": "—",
+        "state_hint": "—",
+    }
+    if htf_closed_df.empty or price is None:
+        return empty
+
+    swings = find_fractal_swings(htf_closed_df)
+    swing_highs = [sw["price"] for sw in swings if sw["type"] == "high"]
+    swing_lows = [sw["price"] for sw in swings if sw["type"] == "low"]
+    trend = _structure_trend(swing_highs, swing_lows)
+    sequence = _swing_sequence_label(swing_highs, swing_lows)
+
+    range_low = swing_lows[-1] if swing_lows else None
+    range_high = swing_highs[-1] if swing_highs else None
+    if (
+        support
+        and resistance
+        and resistance > support
+        and (range_low is None or range_high is None or range_high <= range_low)
+    ):
+        range_low = support
+        range_high = resistance
+
+    pd_pct = None
+    if range_low is not None and range_high is not None and range_high > range_low:
+        pd_pct = (price - range_low) * 100 / (range_high - range_low)
+    pd_zone = _pd_zone_from_pct(pd_pct)
+
+    pattern, pattern_bias, pattern_type = _resolve_smc_pattern(
+        htf_closed_df,
+        swings,
+        trend,
+        ltf_closed_df,
+        price,
+        liquidity,
+        pd_zone,
+    )
+    last_event = pattern if pattern != "—" else "—"
+    last_event_type = pattern_type
+    state, state_hint = _build_smc_state(trend, pd_zone, pattern, liquidity, ob_zone_pct)
+
+    return {
+        "trend": trend,
+        "sequence": sequence,
+        "pattern": pattern,
+        "pattern_bias": pattern_bias,
+        "pattern_type": pattern_type,
+        "last_event": last_event,
+        "last_event_type": last_event_type,
+        "pd_zone": pd_zone,
+        "pd_pct": pd_pct,
+        "state": state,
+        "state_hint": state_hint,
+    }
+
+
+def pd_zone_value_class(pd_zone: str) -> str:
+    if pd_zone == "Discount":
+        return "kv-value smc-discount"
+    if pd_zone == "Premium":
+        return "kv-value smc-premium"
+    if pd_zone == "Equilibrium":
+        return "kv-value smc-equilibrium"
+    return "kv-value"
+
+
+def structure_event_badge_class(event_type: str) -> str:
+    if event_type in ("bos_bull", "choch_bull", "eql", "sweep_low", "at_swing_low", "pd_discount"):
+        return "badge badge-bull"
+    if event_type in ("bos_bear", "choch_bear", "eqh", "sweep_high", "at_swing_high", "pd_premium"):
+        return "badge badge-bear"
+    return "badge badge-neutral"
+
+
 def compute_htf_bias(htf_closed_df: pd.DataFrame) -> tuple[str, float | None, float | None, float | None]:
     if len(htf_closed_df) < HTF_EMA_TREND + 2:
         return "NEUTRAL", None, None, None
@@ -470,6 +809,10 @@ def compute_market_analysis(
     closed_rows: list[dict],
     htf_closed_rows: list[dict],
     price: float | None,
+    *,
+    support: float | None = None,
+    resistance: float | None = None,
+    ob_zone_pct: float | None = None,
 ) -> dict:
     analysis = {
         "htf_interval": HTF_INTERVAL,
@@ -489,6 +832,16 @@ def compute_market_analysis(
         "fvg_interval": HTF_INTERVAL,
         "liquidity": "—",
         "liquidity_interval": INTERVAL,
+        "smc": {
+            "trend": "RANGING",
+            "sequence": "—",
+            "last_event": "—",
+            "last_event_type": "none",
+            "pd_zone": "—",
+            "pd_pct": None,
+            "state": "—",
+            "state_hint": "—",
+        },
     }
     if not closed_rows:
         return analysis
@@ -527,6 +880,16 @@ def compute_market_analysis(
             analysis["fvg"] = fvg
             analysis["fvg_label"] = fvg["label"]
             analysis["fvg_interval"] = HTF_INTERVAL
+
+        analysis["smc"] = compute_smc_structure(
+            htf_df,
+            price,
+            analysis["liquidity"],
+            ltf_closed_df=closed_df if not closed_df.empty else None,
+            support=support,
+            resistance=resistance,
+            ob_zone_pct=ob_zone_pct,
+        )
 
     return analysis
 
@@ -883,7 +1246,14 @@ def apply_signal_debounce(
                 closed_rows = [row for row in candles if row.get("x")]
                 htf_closed_rows = [row for row in htf_candles if row.get("x")]
                 price = latest_price or entry
-                analysis = compute_market_analysis(closed_rows, htf_closed_rows, price)
+                analysis = compute_market_analysis(
+                    closed_rows,
+                    htf_closed_rows,
+                    price,
+                    support=support,
+                    resistance=resistance,
+                    ob_zone_pct=zone_position_pct,
+                )
                 effective_plan = compute_trade_plan(
                     candidate,
                     confidence,
@@ -1043,7 +1413,14 @@ def update_trading_signal(
     candle_time = forming_candle["t"] if forming_candle else None
     closed_rows = [row for row in candles if row.get("x")]
     htf_closed_rows = [row for row in htf_candles if row.get("x")]
-    analysis = compute_market_analysis(closed_rows, htf_closed_rows, current_price)
+    analysis = compute_market_analysis(
+        closed_rows,
+        htf_closed_rows,
+        current_price,
+        support=support_level,
+        resistance=resistance_level,
+        ob_zone_pct=zone_position_pct,
+    )
     current_plan = compute_trade_plan(
         candidate if candidate in ("LONG", "SHORT") else stable_signal_dir,
         confidence if pending_signal_count >= SIGNAL_DEBOUNCE_COUNT - 1 else signal_confidence,
@@ -1319,7 +1696,14 @@ def get_candles_df() -> pd.DataFrame:
         htf_closed_rows = [row for row in htf_candles if row.get("x")]
         confirmed = resolve_confirmed_pattern(closed_rows)
         latest_pattern = confirmed or "None"
-        market_analysis = compute_market_analysis(closed_rows, htf_closed_rows, latest_price)
+        market_analysis = compute_market_analysis(
+            closed_rows,
+            htf_closed_rows,
+            latest_price,
+            support=support,
+            resistance=resistance,
+            ob_zone_pct=zone_position_pct,
+        )
 
         ob = {
             "bids": list(orderbook.get("bids", [])),
@@ -2053,6 +2437,39 @@ def build_pattern_panel_children(metrics: dict) -> list:
     children.append(kv_row("MACD", macd_text, badge_class=macd_badge_class(macd_hist)))
 
     children.append(panel_section(f"Structure · {HTF_INTERVAL}"))
+    smc = analysis.get("smc") or {}
+    smc_trend = smc.get("trend", "RANGING")
+    children.append(
+        kv_row(
+            "Market structure",
+            smc_trend,
+            badge_class=trend_badge_class(smc_trend),
+            hint=smc.get("sequence"),
+        )
+    )
+    smc_event = smc.get("pattern", "—")
+    smc_event_type = smc.get("pattern_type", "none")
+    children.append(
+        kv_row(
+            "Pattern",
+            smc_event,
+            badge_class=structure_event_badge_class(smc_event_type),
+            hint=smc.get("sequence"),
+        )
+    )
+    pd_zone = smc.get("pd_zone", "—")
+    pd_pct = smc.get("pd_pct")
+    pd_text = f"{pd_zone} · {pd_pct:.0f}%" if pd_pct is not None and pd_zone != "—" else pd_zone
+    children.append(kv_row("P/D zone", pd_text, value_class=pd_zone_value_class(pd_zone)))
+    children.append(
+        kv_row(
+            "SMC detail",
+            smc.get("state", "—"),
+            strong=True,
+            hint=smc.get("state_hint"),
+        )
+    )
+
     fvg = analysis.get("fvg")
     fvg_label = analysis.get("fvg_label", "—")
     fvg_interval = analysis.get("fvg_interval", HTF_INTERVAL)
@@ -2487,6 +2904,7 @@ def build_hub_summary() -> dict:
 
     change = metrics.get("change_24h")
     ob_proximity, ob_near = format_ob_proximity(metrics)
+    smc = analysis.get("smc") or {}
     return {
         "symbol": SYMBOL.upper(),
         "interval": INTERVAL,
@@ -2499,6 +2917,12 @@ def build_hub_summary() -> dict:
         "min_confidence": min_conf,
         "action": "TRADE" if is_tradable_signal(signal, confidence, min_conf) else "WATCH",
         "trend": analysis.get("htf_bias", "NEUTRAL"),
+        "smc_state": smc.get("state", "—"),
+        "smc_pattern": smc.get("pattern", "—"),
+        "smc_pattern_bias": smc.get("pattern_bias", "neutral"),
+        "smc_state_short": format_smc_hub_label(smc),
+        "smc_trend": smc.get("trend", "RANGING"),
+        "smc_pd_zone": smc.get("pd_zone", "—"),
         "ob_proximity": ob_proximity,
         "ob_near": ob_near,
         "zone_position_pct": metrics.get("zone_position_pct"),

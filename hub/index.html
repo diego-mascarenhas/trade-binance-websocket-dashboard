@@ -11,7 +11,7 @@
         <header class="header">
             <div>
                 <h1>Binance Live Dashboards</h1>
-                <p class="subtitle">Live signal, trend, and position per pair.</p>
+                <p class="subtitle">Live signal, SMC structure, trend, and position per pair.</p>
             </div>
             <div class="meta" id="meta"></div>
         </header>
@@ -67,6 +67,12 @@
             return "stat-value";
         }
 
+        function smcPatternClass(bias) {
+            if (bias === "bull") return "stat-value smc-trend-bull";
+            if (bias === "bear") return "stat-value smc-trend-bear";
+            return "stat-value smc-trend-range";
+        }
+
         function cardShell(pair) {
             const url = `http://${host}:${pair.port}/`;
             const article = document.createElement("article");
@@ -86,6 +92,7 @@
                     ${statRow("24h", "—")}
                     ${statRow("Confidence", "—")}
                     ${statRow("Trend", "—")}
+                    ${statRow("SMC", "—")}
                     ${statRow("OB zone", "—")}
                     ${statRow("Position", "—")}
                 </div>
@@ -110,6 +117,11 @@
                 statRow("24h", data.change_display || "—", changeClass(data.change_24h)),
                 statRow("Confidence", `${data.confidence ?? 0}%`, "stat-value strong"),
                 statRow("Trend", trendValue, trendBadge(trendValue)),
+                statRow(
+                    "SMC",
+                    data.smc_pattern || data.smc_state_short || "—",
+                    `${smcPatternClass(data.smc_pattern_bias)} smc-oneline`
+                ),
                 statRow("OB zone", data.ob_proximity || "—", obClass(data.ob_near)),
                 statRow(
                     "Position",
