@@ -106,6 +106,23 @@ python scripts/migrate_db.py --status        # list applied / pending
 
 Migrations live in `db/migrations/` (e.g. `001_initial_schema.sql`). `./run-all.sh` runs them automatically when `DB_ENABLED=true`. Add new files as `002_description.sql`, `003_...`, etc.
 
+### Decision analytics (ML-ready)
+
+Hub and analytics share **one port** (`HUB_PORT`, default **8050**):
+
+- Hub: `http://127.0.0.1:8050/`
+- Analytics: `http://127.0.0.1:8050/analytics/`
+
+KPIs, hourly/daily charts, block-reason breakdowns, and **CSV export** for ML (RSI, ADX, confidence, trend, config snapshot).
+
+Works even with `DB_ENABLED=false` (UI shows empty state). With DB on, `./run-all.sh` runs migrations then serves hub + analytics via `hub_server.py`.
+
+Export for notebooks:
+
+```bash
+curl -o features.csv "http://127.0.0.1:8050/api/export/features.csv?days=30"
+```
+
 ### Telegram commands
 
 Fleet commands (same chat as `TELEGRAM_CHAT_ID` only). With `./run-all.sh`, **one** fleet listener handles commands for all pairs (avoids 409 Conflict):

@@ -115,13 +115,17 @@ write_pairs_json() {
 }
 
 start_hub() {
-    if ! command -v python3 >/dev/null 2>&1; then
-        log "python3 not found."
+    if [[ ! -x "$VENV_PYTHON" ]]; then
+        log "Missing venv. Run: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt"
+        exit 1
+    fi
+    if [[ ! -f "$SCRIPT_DIR/hub_server.py" ]]; then
+        log "hub_server.py not found in $SCRIPT_DIR"
         exit 1
     fi
 
-    log "Hub http://0.0.0.0:${HUB_PORT}/"
-    python3 -m http.server "$HUB_PORT" --bind 0.0.0.0 --directory "$HUB_DIR" >/dev/null 2>&1 &
+    log "Hub http://0.0.0.0:${HUB_PORT}/ (analytics /analytics/)"
+    HUB_PORT="$HUB_PORT" "$VENV_PYTHON" "$SCRIPT_DIR/hub_server.py" >/dev/null 2>&1 &
     echo $! >> "$PID_FILE"
 }
 
@@ -206,6 +210,7 @@ start_telegram_fleet
 
 log "Started ${#PAIR_LINES[@]} dashboard(s) + hub."
 log "Open hub: http://127.0.0.1:${HUB_PORT}/"
+log "Analytics: http://127.0.0.1:${HUB_PORT}/analytics/"
 log "Stop all: ./run-all.sh stop"
 
 wait

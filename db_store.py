@@ -65,6 +65,11 @@ def _credentials_configured() -> bool:
     return bool(DB_USER and DB_NAME)
 
 
+def connect():
+    """Public connection helper for read-only analytics modules."""
+    return _connect()
+
+
 def _connect():
     import pymysql
 

@@ -12,6 +12,7 @@
             <div>
                 <h1>Binance Live Dashboards</h1>
                 <p class="subtitle">Live signal, SMC structure, trend, and position per pair.</p>
+                <a class="header-link" id="analytics-link" href="#">Decision analytics →</a>
             </div>
             <div class="meta" id="meta"></div>
         </header>
@@ -23,6 +24,10 @@
         const meta = document.getElementById("meta");
         const footer = document.getElementById("footer");
         const host = window.location.hostname || "127.0.0.1";
+        const analyticsLink = document.getElementById("analytics-link");
+        if (analyticsLink) {
+            analyticsLink.href = "/analytics/";
+        }
         const REFRESH_MS = 3000;
 
         function signalBadge(signal) {
