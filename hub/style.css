@@ -60,12 +60,6 @@ h1 {
     color: #ffc107;
 }
 
-.meta-foot {
-    margin-top: 6px;
-    font-size: 0.74rem;
-    color: #6b7280;
-}
-
 .grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));

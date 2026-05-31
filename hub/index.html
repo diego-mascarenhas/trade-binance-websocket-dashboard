@@ -220,7 +220,6 @@
                 lowSignal: 0,
                 fleetPaused: false,
                 executeAuto: false,
-                executionMode: "off",
             };
 
             for (const data of results) {
@@ -251,7 +250,6 @@
                 }
                 counts.fleetPaused = Boolean(data.trading_paused);
                 counts.executeAuto = Boolean(data.execution_auto);
-                counts.executionMode = data.execution_mode || "off";
             }
             return counts;
         }
@@ -286,14 +284,9 @@
                 blocks.push("fleet paused");
             }
 
-            const execLabel = counts.executeAuto
-                ? `exec ${String(counts.executionMode).toUpperCase()}`
-                : "exec manual";
-
             meta.innerHTML = `
                 <div class="meta-primary">${parts.join(" · ")}</div>
                 ${blocks.length ? `<div class="meta-blocks">Blocked: ${blocks.join(" · ")}</div>` : ""}
-                <div class="meta-foot">${execLabel} · updates ${REFRESH_MS / 1000}s</div>
             `;
         }
 
