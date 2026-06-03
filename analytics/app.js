@@ -27,6 +27,29 @@ const PLOTLY_LAYOUT = {
     yaxis: { gridcolor: "#2a2f3a", zerolinecolor: "#2a2f3a" },
 };
 
+/** Fixed colors per decision event — not Plotly’s default palette (which can look brown/orange). */
+const EVENT_TYPE_COLORS = {
+    valid_entry: "#22c55e",
+    valid_entry_blocked: "#f59e0b",
+    indicator_blocked: "#ef4444",
+    order_skip: "#a855f7",
+    order_dry_run: "#38bdf8",
+    order_live_open: "#3b82f6",
+};
+
+function colorForEventType(eventType) {
+    if (EVENT_TYPE_COLORS[eventType]) {
+        return EVENT_TYPE_COLORS[eventType];
+    }
+    let hash = 0;
+    const text = String(eventType || "other");
+    for (let i = 0; i < text.length; i += 1) {
+        hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
+    }
+    const hue = hash % 360;
+    return `hsl(${hue} 45% 52%)`;
+}
+
 function queryParams() {
     const params = new URLSearchParams();
     params.set("days", daysEl.value);
@@ -112,12 +135,16 @@ function pivotSeries(rows) {
         matrix[`${row.bucket}|${row.event_type}`] = row.count;
     });
 
-    const traces = [...types].sort().map((eventType) => ({
-        x: buckets,
-        y: buckets.map((bucket) => matrix[`${bucket}|${eventType}`] || 0),
-        name: eventType,
-        type: "bar",
-    }));
+    const traces = [...types].sort().map((eventType) => {
+        const color = colorForEventType(eventType);
+        return {
+            x: buckets,
+            y: buckets.map((bucket) => matrix[`${bucket}|${eventType}`] || 0),
+            name: eventType,
+            type: "bar",
+            marker: { color },
+        };
+    });
 
     return traces;
 }
