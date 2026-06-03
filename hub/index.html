@@ -23,6 +23,7 @@
         const grid = document.getElementById("grid");
         const meta = document.getElementById("meta");
         const footer = document.getElementById("footer");
+        const host = window.location.hostname || "127.0.0.1";
         const analyticsLink = document.getElementById("analytics-link");
         if (analyticsLink) {
             analyticsLink.href = "/analytics/";
@@ -276,12 +277,29 @@
             }
         }
 
+        function renderHubFetchHint(summaryPayload, pairCount) {
+            if (!summaryPayload) {
+                footer.textContent =
+                    "Hub cannot load /api/hub-summaries — deploy latest code (hub_proxy.py) and restart ./run-all.sh";
+                return;
+            }
+            const online = summaryPayload.online_count ?? Object.keys(summaryPayload.summaries || {}).length;
+            const offline = summaryPayload.offline_count ?? (summaryPayload.offline || []).length;
+            if (offline === pairCount && online === 0) {
+                footer.textContent =
+                    `${offline} dashboards not reachable on 127.0.0.1 — is ./run-all.sh running in screen? Check: curl -s http://127.0.0.1:8050/api/hub-summaries`;
+            } else {
+                footer.textContent = `Updates every 3s · ${online} online · ${offline} offline`;
+            }
+        }
+
         async function refreshCards(pairs, cards) {
             const [summaryPayload, fleetExposure, fleetPositions] = await Promise.all([
                 fetchAllSummaries().catch(() => null),
                 fetchFleetExposure(),
                 fetchFleetPositions(),
             ]);
+            renderHubFetchHint(summaryPayload, pairs.length);
             const summaries = (summaryPayload && summaryPayload.summaries) || {};
             const results = pairs.map((pair, index) => {
                 const symbol = (pair.symbol || "").toUpperCase();
@@ -460,7 +478,6 @@
                     grid.appendChild(article);
                     return article;
                 });
-                footer.textContent = "Updates every 3s · Start with ./run-all.sh";
                 refreshCards(pairs, cards);
                 setInterval(() => refreshCards(pairs, cards), REFRESH_MS);
             })

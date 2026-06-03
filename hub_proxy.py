@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent
 PAIRS_FILE = ROOT / "hub" / "pairs.json"
 PROXY_HOST = os.getenv("HUB_PROXY_HOST", os.getenv("FLEET_STATUS_HOST", "127.0.0.1"))
-PROXY_TIMEOUT = float(os.getenv("HUB_PROXY_TIMEOUT_SEC", os.getenv("FLEET_STATUS_TIMEOUT", "2.5")))
+PROXY_TIMEOUT = float(os.getenv("HUB_PROXY_TIMEOUT_SEC", os.getenv("FLEET_STATUS_TIMEOUT", "5")))
 
 
 def load_pairs() -> list[dict[str, Any]]:

@@ -65,7 +65,10 @@ def analytics_static(filename: str):
 @app.route("/api/hub-summaries")
 def hub_summaries():
     """Aggregate hub-summary from each local dashboard port (for remote hub UI)."""
-    return _cors(jsonify(hub_proxy.fetch_all_summaries()))
+    payload = hub_proxy.fetch_all_summaries()
+    payload["online_count"] = len(payload.get("summaries") or {})
+    payload["offline_count"] = len(payload.get("offline") or [])
+    return _cors(jsonify(payload))
 
 
 @app.route("/api/fleet-exposure")
