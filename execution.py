@@ -901,13 +901,17 @@ def _place_protection_legs(
 
     if need_tp:
         try:
-            if TP_ORDER_TYPE == "trailing":
-                tp_resp = _place_trailing_tp(symbol, direction, tp_price, qty)
-                _append_orders_log("tp_trailing_reconciled", symbol=symbol, response=tp_resp)
-            else:
-                tp_resp = _place_take_profit_fixed(symbol, direction, tp_price, qty)
-                _append_orders_log("tp_fixed_reconciled", symbol=symbol, response=tp_resp)
-            result["tp"] = True
+            placed, skipped = _place_tp_for_position(
+                symbol,
+                direction,
+                tp_price,
+                qty,
+                log_suffix="_reconciled",
+            )
+            if placed:
+                result["tp"] = True
+            elif not skipped:
+                result["tp"] = False
         except RuntimeError as exc:
             logger.error("TP reconcile failed for %s: %s", symbol, exc)
             _append_orders_log("tp_reconcile_failed", symbol=symbol, error=str(exc))
@@ -1509,6 +1513,88 @@ def round_price(symbol: str, value: float) -> str:
     return format(quantized, "f")
 
 
+def _get_mark_price(symbol: str) -> float | None:
+    snapshot = _fetch_exchange_exposure(symbol.upper())
+    mark = snapshot.get("mark_price")
+    if mark is not None and float(mark) > 0:
+        return float(mark)
+    return None
+
+
+def _tp_would_trigger_immediately(direction: str, tp: float, mark: float) -> bool:
+    """True when TP trigger/activation would fire at current mark (Binance -2021)."""
+    direction = direction.upper()
+    if direction == "LONG":
+        return mark >= tp
+    return mark <= tp
+
+
+def _is_immediate_trigger_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "-2021" in str(exc) or "immediately trigger" in text
+
+
+def _place_tp_for_position(
+    symbol: str,
+    direction: str,
+    tp_price: str,
+    qty: str,
+    *,
+    log_suffix: str = "",
+) -> tuple[bool, bool]:
+    """Place TP if valid vs mark. Returns (placed, skipped_immediate)."""
+    symbol = symbol.upper()
+    direction = direction.upper()
+    try:
+        tp_val = float(tp_price)
+    except (TypeError, ValueError):
+        tp_val = 0.0
+
+    mark = _get_mark_price(symbol)
+    if mark is not None and tp_val > 0 and _tp_would_trigger_immediately(direction, tp_val, mark):
+        _append_orders_log(
+            "tp_skip_immediate",
+            symbol=symbol,
+            direction=direction,
+            tp=tp_price,
+            mark=mark,
+            context=log_suffix or "protection",
+        )
+        logger.info(
+            "%s: skip TP%s — mark %.8g already at/through target %.8g (%s)",
+            symbol,
+            f" ({log_suffix})" if log_suffix else "",
+            mark,
+            tp_val,
+            direction,
+        )
+        return False, True
+
+    try:
+        if TP_ORDER_TYPE == "trailing":
+            tp_resp = _place_trailing_tp(symbol, direction, tp_price, qty)
+            event = f"tp_trailing{log_suffix}"
+        else:
+            tp_resp = _place_take_profit_fixed(symbol, direction, tp_price, qty)
+            event = f"tp_fixed{log_suffix}"
+        _append_orders_log(event, symbol=symbol, response=tp_resp, tp=tp_price, mark=mark)
+        return True, False
+    except RuntimeError as exc:
+        if _is_immediate_trigger_error(exc):
+            _append_orders_log(
+                "tp_skip_immediate",
+                symbol=symbol,
+                direction=direction,
+                tp=tp_price,
+                mark=mark,
+                error=str(exc),
+                context=log_suffix or "protection",
+            )
+            logger.info("%s: TP skipped (immediate trigger): %s", symbol, exc)
+            return False, True
+        raise
+
+
 def round_qty(symbol: str, value: float) -> str:
     filt = _load_symbol_filters(symbol)
     step = filt["step_size"]
@@ -1807,13 +1893,19 @@ def _place_sl_tp_after_fill(
         telegram.notify_sl_tp_failed(symbol, direction, "SL", str(exc))
 
     try:
-        if TP_ORDER_TYPE == "trailing":
-            tp_resp = _place_trailing_tp(symbol, direction, tp_price, qty)
-            _append_orders_log("tp_trailing_placed", symbol=symbol, response=tp_resp)
-        else:
-            tp_resp = _place_take_profit_fixed(symbol, direction, tp_price, qty)
-            _append_orders_log("tp_fixed_placed", symbol=symbol, response=tp_resp)
-        result["tp"] = True
+        placed, skipped = _place_tp_for_position(symbol, direction, tp_price, qty, log_suffix="_placed")
+        if placed:
+            result["tp"] = True
+        elif skipped:
+            _append_orders_log(
+                "tp_skipped_after_fill",
+                symbol=symbol,
+                direction=direction,
+                tp=tp_price,
+                tp_type=TP_ORDER_TYPE,
+                qty=qty,
+                reason="mark_through_target",
+            )
     except RuntimeError as exc:
         logger.error("TP placement failed for %s: %s", symbol, exc)
         _append_orders_log(
