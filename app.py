@@ -1311,6 +1311,21 @@ def record_valid_entry(
         format_price(sl_val) if sl_val else None,
         format_price(tp1_val) if tp1_val else None,
     )
+    if trade_plan and trade_plan.get("active"):
+        legs = trade_plan.get("legs") or []
+        size_pct = float(legs[0]["size_pct"]) if legs else float(trade_plan.get("partial_close_pct", 50))
+        blocked, balance_reason = execution.fleet_side_balance_blocks(
+            signal,
+            execution.estimate_order_notional_usdt(size_pct),
+        )
+        if blocked:
+            log_decision_event(
+                "valid_entry_blocked",
+                outcome="blocked",
+                block_reason=balance_reason,
+                market_snapshot=market,
+            )
+            return
     execution.try_execute_valid_entry(
         SYMBOL,
         signal,

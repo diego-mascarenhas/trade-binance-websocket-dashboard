@@ -207,6 +207,7 @@ def build_config_snapshot(module_globals: dict[str, Any]) -> dict[str, Any]:
     snapshot["execute_on_valid_entry"] = execution.EXECUTE_ON_VALID_ENTRY
     snapshot["execution_mode"] = execution.EXECUTION_MODE
     snapshot["position_size_usdt"] = execution.POSITION_SIZE_USDT
+    snapshot["fleet_side_balance_max_pct"] = execution.FLEET_SIDE_BALANCE_MAX_PCT
     return snapshot
 
 

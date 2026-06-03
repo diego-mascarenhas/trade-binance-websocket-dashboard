@@ -215,20 +215,35 @@
             }
         }
 
+        async function fetchFleetExposure() {
+            try {
+                const response = await fetch("/api/fleet-exposure");
+                if (!response.ok) {
+                    return null;
+                }
+                return await response.json();
+            } catch {
+                return null;
+            }
+        }
+
         async function refreshCards(pairs, cards) {
-            const results = await Promise.all(
-                pairs.map(async (pair, index) => {
-                    try {
-                        const data = await fetchSummary(pair);
-                        renderSummary(cards[index], data);
-                        return data;
-                    } catch {
-                        renderOffline(cards[index]);
-                        return null;
-                    }
-                })
-            );
-            renderHubMeta(aggregateHubCounts(results), pairs.length);
+            const [results, fleetExposure] = await Promise.all([
+                Promise.all(
+                    pairs.map(async (pair, index) => {
+                        try {
+                            const data = await fetchSummary(pair);
+                            renderSummary(cards[index], data);
+                            return data;
+                        } catch {
+                            renderOffline(cards[index]);
+                            return null;
+                        }
+                    })
+                ),
+                fetchFleetExposure(),
+            ]);
+            renderHubMeta(aggregateHubCounts(results), pairs.length, fleetExposure);
         }
 
         function aggregateHubCounts(results) {
@@ -288,8 +303,16 @@
             return counts;
         }
 
-        function renderHubMeta(counts, totalPairs) {
+        function renderHubMeta(counts, totalPairs, fleetExposure) {
             const parts = [`${totalPairs} pairs`];
+            if (fleetExposure && fleetExposure.enabled) {
+                const longTotal = Number(fleetExposure.long_total_usdt || 0).toFixed(0);
+                const shortTotal = Number(fleetExposure.short_total_usdt || 0).toFixed(0);
+                const imb = fleetExposure.imbalance_pct ?? 0;
+                const maxPct = fleetExposure.max_pct ?? 0;
+                parts.push(`L ${longTotal} / S ${shortTotal} USDT`);
+                parts.push(`imb ${imb}% · cap +${maxPct}%`);
+            }
             if (counts.offline) {
                 parts.push(`${counts.offline} offline`);
             }

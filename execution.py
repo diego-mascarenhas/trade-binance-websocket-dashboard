@@ -61,6 +61,8 @@ EXECUTION_ORDER_COOLDOWN = int(os.getenv("EXECUTION_ORDER_COOLDOWN", "180"))
 EXECUTION_MAINTENANCE_SEC = float(os.getenv("EXECUTION_MAINTENANCE_SEC", "15"))
 ENTRY_LIMIT_TTL_SEC = int(os.getenv("ENTRY_LIMIT_TTL_SEC", "600"))
 PROTECTION_RECONCILE_ENABLED = _env_bool("PROTECTION_RECONCILE_ENABLED", "true")
+FLEET_SIDE_BALANCE_MAX_PCT = float(os.getenv("FLEET_SIDE_BALANCE_MAX_PCT", "20"))
+FLEET_EXPOSURE_CACHE_SEC = float(os.getenv("FLEET_EXPOSURE_CACHE_SEC", "8"))
 EXECUTION_BLOCK_IF_OPEN = _env_bool("EXECUTION_BLOCK_IF_OPEN", "true")
 EXECUTION_POSITION_CACHE_SEC = float(os.getenv("EXECUTION_POSITION_CACHE_SEC", "5"))
 BE_EXIT_PNL_MAX_USDT = float(os.getenv("BE_EXIT_PNL_MAX_USDT", "0.15"))
@@ -70,6 +72,8 @@ LOG_DIR = os.getenv("LOG_DIR", "logs")
 _status_lock = threading.Lock()
 _maintenance_lock = threading.Lock()
 _last_maintenance: dict[str, float] = {}
+_fleet_exposure_lock = threading.Lock()
+_fleet_exposure_cache: tuple[float, dict[str, Any]] | None = None
 _hedge_mode_lock = threading.Lock()
 _hedge_mode: bool | None = None
 _last_execution_monotonic: float | None = None
@@ -1023,13 +1027,176 @@ def has_limit_at_price(symbol: str, direction: str, entry: float) -> bool:
     return False
 
 
-def can_place_new_order(symbol: str, direction: str, entry: float) -> tuple[bool, str]:
-    """Mirror trade-binance-websocket-order-blocks can_place_new_order."""
-    if not EXECUTION_BLOCK_IF_OPEN or not _keys_configured():
-        return True, ""
+def _get_all_position_risk() -> list[dict[str, Any]]:
+    if not _keys_configured():
+        return []
+    try:
+        resp = _fapi_request("GET", "/fapi/v2/positionRisk", {})
+        return resp if isinstance(resp, list) else []
+    except RuntimeError as exc:
+        logger.warning("positionRisk (all symbols) failed: %s", exc)
+        return []
 
+
+def _get_all_open_orders() -> list[dict[str, Any]]:
+    if not _keys_configured():
+        return []
+    try:
+        resp = _fapi_request("GET", "/fapi/v1/openOrders", {})
+        return resp if isinstance(resp, list) else []
+    except RuntimeError as exc:
+        logger.warning("openOrders (all symbols) failed: %s", exc)
+        return []
+
+
+def _pending_entry_notional(order: dict[str, Any]) -> float:
+    if not _is_entry_limit_order(order):
+        return 0.0
+    try:
+        price = float(order.get("price", 0) or 0)
+        qty = float(order.get("origQty") or order.get("quantity") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if price <= 0 or qty <= 0:
+        return 0.0
+    return price * qty
+
+
+def get_fleet_side_exposure(*, force: bool = False) -> dict[str, Any]:
+    """Aggregate LONG/SHORT notional (open positions + pending entry limits)."""
+    global _fleet_exposure_cache
+
+    empty = {
+        "enabled": FLEET_SIDE_BALANCE_MAX_PCT > 0,
+        "max_pct": FLEET_SIDE_BALANCE_MAX_PCT,
+        "long_positions_usdt": 0.0,
+        "short_positions_usdt": 0.0,
+        "long_pending_usdt": 0.0,
+        "short_pending_usdt": 0.0,
+        "long_total_usdt": 0.0,
+        "short_total_usdt": 0.0,
+        "imbalance_pct": 0.0,
+    }
+    if not _keys_configured():
+        return empty
+
+    now = time.monotonic()
+    with _fleet_exposure_lock:
+        if (
+            not force
+            and _fleet_exposure_cache is not None
+            and now - _fleet_exposure_cache[0] < FLEET_EXPOSURE_CACHE_SEC
+        ):
+            return dict(_fleet_exposure_cache[1])
+
+    long_pos = short_pos = long_pending = short_pending = 0.0
+
+    for row in _get_all_position_risk():
+        parsed = _parse_position_row(row)
+        if not parsed:
+            continue
+        vol = float(parsed.get("volume_usdt") or 0)
+        if parsed.get("direction") == "LONG":
+            long_pos += vol
+        else:
+            short_pos += vol
+
+    for order in _get_all_open_orders():
+        notional = _pending_entry_notional(order)
+        if notional <= 0:
+            continue
+        if order.get("side") == "BUY":
+            long_pending += notional
+        else:
+            short_pending += notional
+
+    long_total = long_pos + long_pending
+    short_total = short_pos + short_pending
+    smaller = min(long_total, short_total)
+    larger = max(long_total, short_total)
+    if smaller > 0:
+        imbalance_pct = round((larger - smaller) / smaller * 100, 1)
+    elif larger > 0:
+        imbalance_pct = 100.0
+    else:
+        imbalance_pct = 0.0
+
+    result = {
+        "enabled": FLEET_SIDE_BALANCE_MAX_PCT > 0,
+        "max_pct": FLEET_SIDE_BALANCE_MAX_PCT,
+        "long_positions_usdt": round(long_pos, 2),
+        "short_positions_usdt": round(short_pos, 2),
+        "long_pending_usdt": round(long_pending, 2),
+        "short_pending_usdt": round(short_pending, 2),
+        "long_total_usdt": round(long_total, 2),
+        "short_total_usdt": round(short_total, 2),
+        "imbalance_pct": imbalance_pct,
+    }
+    with _fleet_exposure_lock:
+        _fleet_exposure_cache = (now, result)
+    return dict(result)
+
+
+def fleet_side_balance_blocks(
+    direction: str,
+    additional_usdt: float,
+) -> tuple[bool, str]:
+    """
+    Block when the larger side would exceed the smaller by more than FLEET_SIDE_BALANCE_MAX_PCT.
+    Example: max 20% → LONG total may be at most SHORT_total * 1.20.
+    If the opposite side is zero, new entries on the empty side are allowed.
+    """
+    if FLEET_SIDE_BALANCE_MAX_PCT <= 0 or not _keys_configured() or not EXECUTION_ENABLED:
+        return False, ""
+
+    direction = direction.upper()
+    try:
+        add_usdt = max(float(additional_usdt), 0.0)
+    except (TypeError, ValueError):
+        add_usdt = 0.0
+
+    exposure = get_fleet_side_exposure()
+    long_total = float(exposure["long_total_usdt"])
+    short_total = float(exposure["short_total_usdt"])
+    max_mult = 1.0 + FLEET_SIDE_BALANCE_MAX_PCT / 100.0
+
+    if direction == "LONG":
+        if short_total <= 0:
+            return False, ""
+        if long_total + add_usdt > short_total * max_mult:
+            return True, "fleet_long_imbalance"
+    elif direction == "SHORT":
+        if long_total <= 0:
+            return False, ""
+        if short_total + add_usdt > long_total * max_mult:
+            return True, "fleet_short_imbalance"
+    return False, ""
+
+
+def estimate_order_notional_usdt(size_pct: float = 100.0) -> float:
+    return _calculate_notional_usdt() * (max(float(size_pct), 0.0) / 100.0)
+
+
+def can_place_new_order(
+    symbol: str,
+    direction: str,
+    entry: float,
+    *,
+    size_pct: float = 100.0,
+) -> tuple[bool, str]:
+    """Mirror trade-binance-websocket-order-blocks can_place_new_order."""
     symbol = symbol.upper()
     direction = direction.upper()
+
+    blocked, balance_reason = fleet_side_balance_blocks(
+        direction,
+        estimate_order_notional_usdt(size_pct),
+    )
+    if blocked:
+        return False, balance_reason
+
+    if not EXECUTION_BLOCK_IF_OPEN or not _keys_configured():
+        return True, ""
 
     if has_open_position(symbol):
         return False, "open_position"
@@ -1071,6 +1238,8 @@ def _log_skip_order(symbol: str, signal: str, reason: str, *, entry: float | Non
         "pending_opposite_limit": "skip_pending_limit",
         "conflicting_limits": "skip_conflicting_limits",
         "duplicate_limit_price": "skip_duplicate_limit",
+        "fleet_long_imbalance": "skip_fleet_long_imbalance",
+        "fleet_short_imbalance": "skip_fleet_short_imbalance",
     }.get(reason, "skip_order_guard")
     fields: dict[str, Any] = {"symbol": symbol.upper(), "signal": signal, "reason": reason}
     if entry is not None:
@@ -1429,7 +1598,7 @@ def _execute_open(
     global _last_execution_monotonic
 
     symbol = symbol.upper()
-    allowed, block_reason = can_place_new_order(symbol, direction, entry)
+    allowed, block_reason = can_place_new_order(symbol, direction, entry, size_pct=size_pct)
     if not allowed:
         _log_skip_order(symbol, direction, block_reason, entry=entry)
         _set_status(message=f"Blocked: {block_reason}", last_event=block_reason)
@@ -1609,7 +1778,7 @@ def try_execute_valid_entry(
     entry_price = float(legs[0]["price"]) if legs else float(entry)
     fingerprint = f"{signal}|{entry_price:.2f}|{sl:.2f}|{tp:.2f}"
 
-    allowed, block_reason = can_place_new_order(symbol, signal, entry_price)
+    allowed, block_reason = can_place_new_order(symbol, signal, entry_price, size_pct=size_pct)
     if not allowed:
         _log_skip_order(symbol, signal, block_reason, entry=entry_price)
         return

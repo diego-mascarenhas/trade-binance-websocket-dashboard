@@ -12,6 +12,7 @@ from flask import Flask, Response, abort, jsonify, redirect, request, send_from_
 import db_analytics
 import db_store
 import deepseek_advisor
+import execution
 import symbol_config_admin
 
 load_dotenv()
@@ -58,6 +59,11 @@ def analytics_static(filename: str):
     if ".." in filename:
         abort(404)
     return send_from_directory(ANALYTICS_DIR, filename)
+
+
+@app.route("/api/fleet-exposure")
+def fleet_exposure():
+    return _cors(jsonify(execution.get_fleet_side_exposure()))
 
 
 @app.route("/api/health")

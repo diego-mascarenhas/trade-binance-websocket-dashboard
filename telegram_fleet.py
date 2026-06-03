@@ -116,6 +116,17 @@ def build_fleet_status() -> str:
         f"<b>Fleet</b> · {len(pairs)} pairs",
         f"{_trading_emoji()} Trading: <b>{_esc(telegram.trading_state_label())}</b>",
     ]
+    try:
+        import execution
+
+        exp = execution.get_fleet_side_exposure()
+        if exp.get("enabled"):
+            parts.append(
+                f"⚖️ L <b>{exp['long_total_usdt']:.0f}</b> / S <b>{exp['short_total_usdt']:.0f}</b> USDT "
+                f"(imb {exp['imbalance_pct']:.0f}% · max +{exp['max_pct']:.0f}%)"
+            )
+    except Exception as exc:
+        logger.debug("Fleet exposure unavailable: %s", exc)
 
     trade_blocks: list[str] = []
     watch_blocks: list[str] = []
