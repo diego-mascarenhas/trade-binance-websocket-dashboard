@@ -72,6 +72,10 @@ TRADE_PLAN_EXECUTE_DCA = _env_bool("TRADE_PLAN_EXECUTE_DCA", "true")
 TRADE_PLAN_DCA_SIGNAL_DRIVEN = _env_bool("TRADE_PLAN_DCA_SIGNAL_DRIVEN", "true")
 TRADE_PLAN_TP1_RR = float(os.getenv("TRADE_PLAN_TP1_RR", "1.0"))
 TRADE_PLAN_SL_MIN_DISTANCE_PCT = float(os.getenv("TRADE_PLAN_SL_MIN_DISTANCE_PCT", "1.0"))
+TRADE_PLAN_AUTO_BE = _env_bool("TRADE_PLAN_AUTO_BE", "true")
+TRADE_PLAN_PARTIAL_CLOSE_PCT = float(os.getenv("TRADE_PLAN_PARTIAL_CLOSE_PCT", "70"))
+TRADE_PLAN_BE_BUFFER_PCT = float(os.getenv("TRADE_PLAN_BE_BUFFER_PCT", "0.05"))
+PARTIAL_CLOSE_DETECT_TOLERANCE_PCT = float(os.getenv("PARTIAL_CLOSE_DETECT_TOLERANCE_PCT", "8"))
 TP_REPRICE_TOLERANCE_PCT = float(os.getenv("TP_REPRICE_TOLERANCE_PCT", "0.5"))
 SL_REPRICE_TOLERANCE_PCT = float(os.getenv("SL_REPRICE_TOLERANCE_PCT", "0.35"))
 
@@ -198,7 +202,154 @@ def dca_legs_placed(symbol: str) -> int:
 
 
 def reset_dca_state(symbol: str) -> None:
-    _update_trade_context(symbol.upper(), dca_legs_placed=0, dca_max_legs=0)
+    _update_trade_context(
+        symbol.upper(),
+        dca_legs_placed=0,
+        dca_max_legs=0,
+        be_applied=False,
+        position_peak_qty=None,
+    )
+
+
+def breakeven_sl_price(direction: str, entry: float) -> float:
+    """SL at break-even (+ buffer) for the remaining runner."""
+    direction = direction.upper()
+    buffer = TRADE_PLAN_BE_BUFFER_PCT / 100
+    if entry <= 0:
+        return entry
+    if direction == "LONG":
+        return entry * (1 - buffer)
+    if direction == "SHORT":
+        return entry * (1 + buffer)
+    return entry
+
+
+def _position_qty_decimal(snapshot: dict[str, Any]) -> Decimal:
+    try:
+        return Decimal(str(snapshot.get("qty") or "0"))
+    except Exception:
+        return Decimal(0)
+
+
+def _update_position_peak_qty(symbol: str, snapshot: dict[str, Any]) -> tuple[Decimal, Decimal]:
+    """Track max position size to detect partial closes (TP1)."""
+    current = _position_qty_decimal(snapshot)
+    if current <= 0:
+        return Decimal(0), current
+    ctx = _get_trade_context(symbol)
+    try:
+        peak = Decimal(str(ctx.get("position_peak_qty") or "0"))
+    except Exception:
+        peak = Decimal(0)
+    if current > peak:
+        peak = current
+        _update_trade_context(
+            symbol,
+            position_peak_qty=format(peak.normalize(), "f"),
+        )
+    return peak, current
+
+
+def _maybe_apply_breakeven_sl(symbol: str, snapshot: dict[str, Any]) -> bool:
+    """
+    After ~TRADE_PLAN_PARTIAL_CLOSE_PCT of the position is closed, move SL to break-even
+    on the remaining qty (default on).
+    """
+    if not TRADE_PLAN_AUTO_BE or not REST_PLACE_SL_TP:
+        return False
+    if not snapshot.get("open"):
+        return False
+
+    symbol = symbol.upper()
+    ctx = _get_trade_context(symbol)
+    if ctx.get("be_applied") in (True, "true", "1", 1):
+        return False
+
+    direction = _primary_position_direction(snapshot.get("direction")) or _primary_position_direction(
+        ctx.get("direction")
+    )
+    if direction not in ("LONG", "SHORT"):
+        return False
+
+    peak, current = _update_position_peak_qty(symbol, snapshot)
+    if peak <= 0 or current <= 0:
+        return False
+
+    closed_pct = float((peak - current) / peak * 100)
+    trigger_threshold = max(
+        TRADE_PLAN_PARTIAL_CLOSE_PCT - PARTIAL_CLOSE_DETECT_TOLERANCE_PCT,
+        50.0,
+    )
+    if closed_pct < trigger_threshold:
+        return False
+
+    entry_raw = snapshot.get("entry") or ctx.get("entry")
+    try:
+        entry = float(entry_raw) if entry_raw not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        entry = 0.0
+    if entry <= 0:
+        logger.warning("%s: cannot apply BE — missing entry", symbol)
+        return False
+
+    be_sl = breakeven_sl_price(direction, entry)
+    pos_dir = direction
+    qty = _position_qty_string(symbol, pos_dir)
+    if not qty:
+        return False
+
+    _cancel_symbol_sl_orders(symbol, pos_dir)
+    sl_price = round_price_for_sl(symbol, direction, be_sl)
+    try:
+        sl_resp = _place_stop_loss(symbol, pos_dir, sl_price, qty)
+        _append_orders_log(
+            "be_sl_applied",
+            symbol=symbol,
+            direction=pos_dir,
+            entry=entry,
+            sl=sl_price,
+            qty=qty,
+            closed_pct=round(closed_pct, 2),
+            peak_qty=str(peak),
+            response=sl_resp,
+        )
+    except RuntimeError as exc:
+        logger.error("%s: BE SL placement failed: %s", symbol, exc)
+        _append_orders_log("be_sl_failed", symbol=symbol, error=str(exc))
+        telegram.notify_sl_tp_failed(symbol, pos_dir, "BE SL", str(exc))
+        return False
+
+    _update_trade_context(
+        symbol,
+        be_applied=True,
+        sl=sl_price,
+        entry=round_price(symbol, entry),
+        direction=pos_dir,
+    )
+    _invalidate_position_cache(symbol)
+    runner_pct = max(0.0, float(current / peak * 100))
+    if telegram.is_configured():
+        telegram.notify_be_sl_applied(
+            symbol,
+            pos_dir,
+            sl_price,
+            format_price_human(entry),
+            runner_pct,
+            closed_pct,
+        )
+    _set_status(
+        message=f"BE SL · {symbol} {pos_dir} @ {sl_price} · runner {runner_pct:.0f}%",
+        last_event="be_sl_applied",
+    )
+    return True
+
+
+def format_price_human(price: float) -> str:
+    if price >= 1000:
+        return f"{price:,.4f}"
+    if price >= 1:
+        return f"{price:.4f}"
+    return f"{price:.6f}"
 
 
 def _sync_dca_leg_count(symbol: str) -> None:
@@ -305,6 +456,8 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
             exit_notified=True,
             dca_legs_placed=0,
             dca_max_legs=0,
+            be_applied=False,
+            position_peak_qty=None,
         )
         return
 
@@ -318,6 +471,8 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
         exit_notified=True,
         dca_legs_placed=0,
         dca_max_legs=0,
+        be_applied=False,
+        position_peak_qty=None,
     )
     _append_orders_log(
         "position_closed",
@@ -984,11 +1139,17 @@ def reconcile_position_protection(
 
     sl_changed = False
     if entry_f is not None and entry_f > 0:
-        sl_val, sl_changed = resolve_sl_for_open_position(
-            pos_dir,
-            entry_f,
-            float(sl_val) if sl_val is not None and sl_val > 0 else None,
-        )
+        if ctx.get("be_applied") in (True, "true", "1", 1):
+            be_sl = breakeven_sl_price(pos_dir, entry_f)
+            if sl_val is None or abs(float(sl_val or 0) - be_sl) > 1e-12:
+                sl_val = be_sl
+                sl_changed = True
+        else:
+            sl_val, sl_changed = resolve_sl_for_open_position(
+                pos_dir,
+                entry_f,
+                float(sl_val) if sl_val is not None and sl_val > 0 else None,
+            )
 
     tp_val, tp_recalc = _resolve_tp_for_open_position(
         symbol,
@@ -1044,6 +1205,7 @@ def reconcile_position_protection(
         and sl_val is not None
         and sl_val > 0
         and entry_f is not None
+        and not ctx.get("be_applied")
         and _sl_order_needs_refresh(symbol, pos_dir, float(sl_val), entry_f)
     ):
         _cancel_symbol_sl_orders(symbol, pos_dir)
@@ -1112,6 +1274,9 @@ def run_execution_maintenance(
 
     cancel_stale_entry_limits(symbol)
     _sync_dca_leg_count(symbol)
+    snapshot = _fetch_exchange_exposure(symbol)
+    if snapshot.get("open"):
+        _maybe_apply_breakeven_sl(symbol, snapshot)
     reconcile_position_protection(symbol, direction=direction, sl=sl, tp=tp)
 
 
@@ -2444,6 +2609,7 @@ def _execute_open(
             dca_legs_placed=0 if dca_max_legs else None,
             dca_max_legs=dca_max_legs if dca_max_legs else None,
         )
+        _update_trade_context(symbol, be_applied=False, position_peak_qty=None)
         if dca_max_legs > 0:
             _sync_dca_leg_count(symbol)
         _log_execution_decision(

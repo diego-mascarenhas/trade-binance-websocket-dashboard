@@ -262,6 +262,22 @@ def notify_be_exit(symbol: str, message: str) -> None:
     send_shield(f"{symbol.upper()} futures\n{message}")
 
 
+def notify_be_sl_applied(
+    symbol: str,
+    direction: str,
+    sl_price: str,
+    entry_price: str,
+    runner_pct: float,
+    closed_pct: float,
+) -> None:
+    send_shield(
+        f"{symbol.upper()} futures\n"
+        f"BREAK_EVEN SL · {direction}\n"
+        f"~{closed_pct:.0f}% closed · runner {runner_pct:.0f}%\n"
+        f"SL → {sl_price} (entry {entry_price})"
+    )
+
+
 def notify_position_closed(symbol: str, message: str) -> None:
     send_bot(f"{symbol.upper()} futures\n{message}")
 

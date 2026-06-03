@@ -251,6 +251,8 @@
                 trade: 0,
                 watch: 0,
                 open: 0,
+                openLong: 0,
+                openShort: 0,
                 pending: 0,
                 offline: 0,
                 tradeAligned: 0,
@@ -274,6 +276,12 @@
                 }
                 if (data.position_open) {
                     counts.open += 1;
+                    const dir = (data.position_direction || "").toUpperCase();
+                    if (dir === "LONG") {
+                        counts.openLong += 1;
+                    } else if (dir === "SHORT") {
+                        counts.openShort += 1;
+                    }
                     const protected =
                         data.protection_ok ||
                         (data.tp_kind === "trailing" && data.trailing_active);
@@ -318,7 +326,11 @@
             }
             parts.push(`${counts.trade} TRADE`, `${counts.watch} WATCH`);
             if (counts.open) {
-                parts.push(`${counts.open} open`);
+                if (counts.openLong || counts.openShort) {
+                    parts.push(`${counts.openLong}/${counts.openShort} open`);
+                } else {
+                    parts.push(`${counts.open} open`);
+                }
             }
             if (counts.unprotected) {
                 parts.push(`${counts.unprotected} no SL/TP`);

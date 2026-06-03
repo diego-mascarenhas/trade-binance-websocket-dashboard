@@ -1097,8 +1097,13 @@ def compute_trade_plan(
         "runner_pct": runner_pct,
         "breakeven_price": avg_entry,
         "breakeven_note": (
-            f"At TP1: close {TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% manually → optional SL to BE "
-            f"({format_price(avg_entry)}) on runner {runner_pct:.0f}% (not auto yet)"
+            f"At ~{TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% closed → auto SL to BE "
+            f"({format_price(avg_entry)}) on runner {runner_pct:.0f}%"
+            if execution.TRADE_PLAN_AUTO_BE
+            else (
+                f"At TP1: close {TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% → SL to BE "
+                f"({format_price(avg_entry)}) on runner {runner_pct:.0f}% (auto BE off)"
+            )
         ),
         "trail_pct": TRADE_PLAN_TRAIL_PCT,
         "trail_note": (
@@ -3370,6 +3375,11 @@ def build_hub_summary() -> dict:
         "ws_status": metrics.get("status", "—"),
         "position": position,
         "position_open": bool(pos.get("open")),
+        "position_direction": (
+            str(pos.get("direction") or "").split("+", 1)[0].strip().upper()
+            if pos.get("open")
+            else None
+        ),
         "position_pending": bool(pos.get("pending")),
         "position_pnl": position_pnl,
         "position_pnl_pct": position_pnl_pct,
