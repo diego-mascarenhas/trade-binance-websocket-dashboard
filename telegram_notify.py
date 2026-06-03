@@ -240,6 +240,12 @@ def notify_order_failed(symbol: str, direction: str) -> None:
     send_raw(f"❌ {symbol.upper()} futures — ORDER FAILED ({direction})")
 
 
+def notify_sl_tp_failed(symbol: str, direction: str, leg: str, detail: str) -> None:
+    send_raw(
+        f"⚠️ {symbol.upper()} futures — {leg} not placed ({direction})\n{detail[:500]}"
+    )
+
+
 def notify_tp_exit(symbol: str, message: str, *, trailing: bool = False) -> None:
     body = f"{symbol.upper()} futures\n{message}"
     if trailing:

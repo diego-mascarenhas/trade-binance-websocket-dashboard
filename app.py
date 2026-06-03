@@ -1950,24 +1950,39 @@ def get_candles_df() -> pd.DataFrame:
             "market_analysis": market_analysis,
             "require_trend_align": REQUIRE_TREND_ALIGN,
             "signal_cooldown_sec": SIGNAL_COOLDOWN_SEC,
-            "trade_plan": resolve_trade_plan(
-                compute_trade_plan(
+            "trade_plan": (
+                _resolved_trade_plan := resolve_trade_plan(
+                    compute_trade_plan(
+                        signal_dir,
+                        signal_confidence,
+                        signal_entry,
+                        support,
+                        resistance,
+                        latest_price,
+                        market_analysis,
+                        MIN_CONFIDENCE,
+                    ),
                     signal_dir,
-                    signal_confidence,
-                    signal_entry,
-                    support,
-                    resistance,
-                    latest_price,
-                    market_analysis,
-                    MIN_CONFIDENCE,
-                ),
-                signal_dir,
+                )
             ),
             "log_dir": LOG_DIR,
-            "execution": {
-                **execution.get_execution_status(),
-                "position": execution.get_exchange_exposure(SYMBOL),
-            },
+        }
+        if _resolved_trade_plan.get("active"):
+            execution.run_execution_maintenance(
+                SYMBOL,
+                direction=_resolved_trade_plan.get("signal"),
+                sl=float(_resolved_trade_plan["sl"])
+                if _resolved_trade_plan.get("sl")
+                else None,
+                tp=float(_resolved_trade_plan["tp1"])
+                if _resolved_trade_plan.get("tp1")
+                else None,
+            )
+        else:
+            execution.run_execution_maintenance(SYMBOL)
+        metrics["execution"] = {
+            **execution.get_execution_status(),
+            "position": execution.get_exchange_exposure(SYMBOL),
         }
 
     return pd.DataFrame(rows), ob, metrics
@@ -2868,12 +2883,18 @@ def build_execution_panel_section(metrics: dict) -> list:
                 pnl_class = "kv-value pnl-up"
             elif pnl_pct < 0:
                 pnl_class = "kv-value pnl-down"
+        prot_class = "kv-value"
+        if pos.get("protection_ok"):
+            prot_class = "kv-value pnl-up"
+        elif pos.get("has_sl") or pos.get("has_tp"):
+            prot_class = "kv-value change-down"
         children.extend(
             [
                 kv_row("Position", f"{pos.get('direction', '—')} · {vol_text}", strong=True),
                 kv_row("Entry", entry_text, strong=True),
                 kv_row("PnL", f"{pnl_text} · {pnl_pct_text}", value_class=pnl_class),
                 kv_row("Size", pos.get("qty", "—"), strong=True),
+                kv_row("Protection", format_protection_display(pos), value_class=prot_class),
             ]
         )
     elif pos.get("pending"):
@@ -3159,6 +3180,19 @@ def build_telegram_status() -> str:
     return "\n".join(lines)
 
 
+def format_protection_display(pos: dict) -> str:
+    if pos.get("open"):
+        sl_mark = "✓" if pos.get("has_sl") else "✗"
+        tp_mark = "✓" if pos.get("has_tp") else "✗"
+        return f"SL {sl_mark} · TP {tp_mark}"
+    if pos.get("pending"):
+        ttl = execution.ENTRY_LIMIT_TTL_SEC
+        if ttl > 0:
+            return f"Pending (TTL {ttl}s)"
+        return "Pending"
+    return "—"
+
+
 def format_position_label(pos: dict) -> tuple[str, float | None, float | None]:
     """Human-readable position + optional PnL USDT and ROE %."""
     if pos.get("open"):
@@ -3218,6 +3252,10 @@ def build_hub_summary() -> dict:
         "position_pending": bool(pos.get("pending")),
         "position_pnl": position_pnl,
         "position_pnl_pct": position_pnl_pct,
+        "has_sl": bool(pos.get("has_sl")),
+        "has_tp": bool(pos.get("has_tp")),
+        "protection_ok": bool(pos.get("protection_ok")),
+        "protection_display": format_protection_display(pos),
         "trend_aligned": trend_aligned,
         "require_trend_align": REQUIRE_TREND_ALIGN,
         "trading_paused": telegram.is_trading_paused(),

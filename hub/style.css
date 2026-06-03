@@ -72,6 +72,18 @@ h1 {
     color: #ffc107;
 }
 
+.protection-ok {
+    color: #4ade80;
+}
+
+.protection-partial {
+    color: #fbbf24;
+}
+
+.protection-miss {
+    color: #f87171;
+}
+
 .grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));

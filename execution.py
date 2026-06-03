@@ -58,6 +58,9 @@ REST_SL_TP_POLL_INTERVAL = float(os.getenv("REST_SL_TP_POLL_INTERVAL", "2"))
 TP_ORDER_TYPE = os.getenv("TP_ORDER_TYPE", "trailing").lower()
 TP_TRAILING_CALLBACK_RATE = float(os.getenv("TP_TRAILING_CALLBACK_RATE", "0.5"))
 EXECUTION_ORDER_COOLDOWN = int(os.getenv("EXECUTION_ORDER_COOLDOWN", "180"))
+EXECUTION_MAINTENANCE_SEC = float(os.getenv("EXECUTION_MAINTENANCE_SEC", "15"))
+ENTRY_LIMIT_TTL_SEC = int(os.getenv("ENTRY_LIMIT_TTL_SEC", "600"))
+PROTECTION_RECONCILE_ENABLED = _env_bool("PROTECTION_RECONCILE_ENABLED", "true")
 EXECUTION_BLOCK_IF_OPEN = _env_bool("EXECUTION_BLOCK_IF_OPEN", "true")
 EXECUTION_POSITION_CACHE_SEC = float(os.getenv("EXECUTION_POSITION_CACHE_SEC", "5"))
 BE_EXIT_PNL_MAX_USDT = float(os.getenv("BE_EXIT_PNL_MAX_USDT", "0.15"))
@@ -65,6 +68,8 @@ BE_EXIT_PRICE_PCT = float(os.getenv("BE_EXIT_PRICE_PCT", "0.12"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 
 _status_lock = threading.Lock()
+_maintenance_lock = threading.Lock()
+_last_maintenance: dict[str, float] = {}
 _hedge_mode_lock = threading.Lock()
 _hedge_mode: bool | None = None
 _last_execution_monotonic: float | None = None
@@ -579,6 +584,16 @@ def get_exchange_exposure(symbol: str) -> dict[str, Any]:
         snapshot = dict(snapshot)
         if snapshot.get("source") == "binance":
             snapshot["source"] = "monitoring"
+    snapshot = dict(snapshot)
+    primary_dir = _primary_position_direction(snapshot.get("direction"))
+    if snapshot.get("open") and primary_dir:
+        snapshot.update(get_position_protection(symbol, primary_dir))
+    else:
+        snapshot["has_sl"] = False
+        snapshot["has_tp"] = False
+        snapshot["sl_count"] = 0
+        snapshot["tp_count"] = 0
+        snapshot["protection_ok"] = False
     with _position_snapshot_lock:
         _position_snapshot_cache[symbol] = (now, snapshot)
     return dict(snapshot)
@@ -593,6 +608,336 @@ def _get_open_orders(symbol: str) -> list[dict[str, Any]]:
     except RuntimeError as exc:
         logger.warning("openOrders failed for %s: %s", symbol, exc)
         return []
+
+
+def _get_open_algo_orders(symbol: str) -> list[dict[str, Any]]:
+    if not _keys_configured():
+        return []
+    try:
+        resp = _fapi_request(
+            "GET",
+            "/fapi/v1/openAlgoOrders",
+            {"symbol": symbol.upper(), "algoType": "CONDITIONAL"},
+        )
+        return resp if isinstance(resp, list) else []
+    except RuntimeError as exc:
+        logger.warning("openAlgoOrders failed for %s: %s", symbol, exc)
+        return []
+
+
+def _algo_order_role(order: dict[str, Any], position_direction: str) -> str | None:
+    """Classify an open algo order as stop-loss or take-profit for a position side."""
+    position_direction = position_direction.upper()
+    order_type = str(order.get("orderType") or order.get("type") or "").upper()
+    side = str(order.get("side") or "").upper()
+    status = str(order.get("algoStatus") or order.get("status") or "").upper()
+    if status in ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "FINISHED"):
+        return None
+
+    if position_direction == "LONG":
+        if side == "SELL" and order_type == "STOP_MARKET":
+            return "sl"
+        if side == "SELL" and order_type in (
+            "TAKE_PROFIT_MARKET",
+            "TRAILING_STOP_MARKET",
+            "TAKE_PROFIT",
+        ):
+            return "tp"
+    elif position_direction == "SHORT":
+        if side == "BUY" and order_type == "STOP_MARKET":
+            return "sl"
+        if side == "BUY" and order_type in (
+            "TAKE_PROFIT_MARKET",
+            "TRAILING_STOP_MARKET",
+            "TAKE_PROFIT",
+        ):
+            return "tp"
+    return None
+
+
+def _primary_position_direction(direction: str | None) -> str | None:
+    if not direction:
+        return None
+    text = str(direction).upper()
+    if "+" in text:
+        return text.split("+", 1)[0].strip() or None
+    return text
+
+
+def get_position_protection(symbol: str, direction: str | None) -> dict[str, Any]:
+    """Whether open conditional orders cover SL and TP for the current position side."""
+    primary = _primary_position_direction(direction)
+    result = {
+        "has_sl": False,
+        "has_tp": False,
+        "sl_count": 0,
+        "tp_count": 0,
+        "protection_ok": False,
+    }
+    if not primary or not _keys_configured():
+        return result
+
+    want_ps = primary if is_hedge_mode() else None
+    for order in _get_open_algo_orders(symbol):
+        if want_ps:
+            pos_side = str(order.get("positionSide") or "").upper()
+            if pos_side and pos_side not in (want_ps, "BOTH"):
+                continue
+        role = _algo_order_role(order, primary)
+        if role == "sl":
+            result["has_sl"] = True
+            result["sl_count"] += 1
+        elif role == "tp":
+            result["has_tp"] = True
+            result["tp_count"] += 1
+    result["protection_ok"] = result["has_sl"] and result["has_tp"]
+    return result
+
+
+def _invalidate_position_cache(symbol: str) -> None:
+    symbol = symbol.upper()
+    with _position_snapshot_lock:
+        _position_snapshot_cache.pop(symbol, None)
+
+
+def _position_qty_string(symbol: str, direction: str) -> str | None:
+    direction = direction.upper()
+    for row in _get_position_risk(symbol):
+        if row.get("symbol") != symbol.upper():
+            continue
+        parsed = _parse_position_row(row)
+        if not parsed or parsed.get("direction") != direction:
+            continue
+        qty_raw = parsed.get("qty")
+        if qty_raw is None:
+            continue
+        try:
+            return round_qty(symbol, float(qty_raw))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _cancel_limit_order(symbol: str, order_id: int) -> dict[str, Any]:
+    return _fapi_request(
+        "DELETE",
+        "/fapi/v1/order",
+        {"symbol": symbol.upper(), "orderId": order_id},
+    )
+
+
+def cancel_stale_entry_limits(symbol: str) -> int:
+    """Cancel unfilled entry LIMIT orders older than ENTRY_LIMIT_TTL_SEC (0 = disabled)."""
+    if ENTRY_LIMIT_TTL_SEC <= 0 or not _keys_configured():
+        return 0
+
+    symbol = symbol.upper()
+    now_ms = int(time.time() * 1000)
+    cancelled = 0
+    for order in _get_open_orders(symbol):
+        if not _is_entry_limit_order(order):
+            continue
+        order_id = order.get("orderId")
+        if order_id is None:
+            continue
+        updated_ms = int(order.get("updateTime") or order.get("time") or 0)
+        if updated_ms <= 0 or now_ms - updated_ms < ENTRY_LIMIT_TTL_SEC * 1000:
+            continue
+        try:
+            _cancel_limit_order(symbol, int(order_id))
+            age_sec = int((now_ms - updated_ms) / 1000)
+            _append_orders_log(
+                "entry_limit_expired",
+                symbol=symbol,
+                orderId=order_id,
+                age_sec=age_sec,
+                ttl_sec=ENTRY_LIMIT_TTL_SEC,
+            )
+            logger.info(
+                "%s: cancelled stale entry limit %s (age %ss)",
+                symbol,
+                order_id,
+                age_sec,
+            )
+            cancelled += 1
+        except RuntimeError as exc:
+            logger.warning("%s: failed to cancel stale limit %s: %s", symbol, order_id, exc)
+            _append_orders_log(
+                "entry_limit_cancel_failed",
+                symbol=symbol,
+                orderId=order_id,
+                error=str(exc),
+            )
+    if cancelled:
+        _invalidate_position_cache(symbol)
+    return cancelled
+
+
+def _place_protection_legs(
+    symbol: str,
+    direction: str,
+    sl: float,
+    tp: float,
+    qty: str,
+    *,
+    need_sl: bool,
+    need_tp: bool,
+) -> dict[str, bool]:
+    """Place missing SL/TP on an open position (no entry wait)."""
+    result = {"sl": not need_sl, "tp": not need_tp}
+    if not REST_PLACE_SL_TP:
+        return result
+
+    sl_price = round_price(symbol, sl)
+    tp_price = round_price(symbol, tp)
+
+    if need_sl:
+        try:
+            sl_resp = _place_stop_loss(symbol, direction, sl_price, qty)
+            _append_orders_log("sl_reconciled", symbol=symbol, response=sl_resp)
+            result["sl"] = True
+        except RuntimeError as exc:
+            logger.error("SL reconcile failed for %s: %s", symbol, exc)
+            _append_orders_log("sl_reconcile_failed", symbol=symbol, error=str(exc))
+            telegram.notify_sl_tp_failed(symbol, direction, "SL (reconcile)", str(exc))
+
+    if need_tp:
+        try:
+            if TP_ORDER_TYPE == "trailing":
+                tp_resp = _place_trailing_tp(symbol, direction, tp_price, qty)
+                _append_orders_log("tp_trailing_reconciled", symbol=symbol, response=tp_resp)
+            else:
+                tp_resp = _place_take_profit_fixed(symbol, direction, tp_price, qty)
+                _append_orders_log("tp_fixed_reconciled", symbol=symbol, response=tp_resp)
+            result["tp"] = True
+        except RuntimeError as exc:
+            logger.error("TP reconcile failed for %s: %s", symbol, exc)
+            _append_orders_log("tp_reconcile_failed", symbol=symbol, error=str(exc))
+            telegram.notify_sl_tp_failed(symbol, direction, "TP (reconcile)", str(exc))
+
+    return result
+
+
+def reconcile_position_protection(
+    symbol: str,
+    *,
+    direction: str | None = None,
+    sl: float | None = None,
+    tp: float | None = None,
+) -> dict[str, Any]:
+    """Ensure open position has SL/TP algo orders; place any missing legs."""
+    symbol = symbol.upper()
+    summary: dict[str, Any] = {
+        "symbol": symbol,
+        "reconciled": False,
+        "placed_sl": False,
+        "placed_tp": False,
+    }
+    if not EXECUTION_ENABLED or EXECUTION_MODE != "live" or not _keys_configured():
+        return summary
+    if not PROTECTION_RECONCILE_ENABLED or not REST_PLACE_SL_TP:
+        return summary
+    if not has_open_position(symbol):
+        return summary
+
+    snapshot = _fetch_exchange_exposure(symbol)
+    if not snapshot.get("open"):
+        return summary
+
+    pos_dir = _primary_position_direction(snapshot.get("direction")) or _primary_position_direction(
+        direction
+    )
+    ctx = _get_trade_context(symbol)
+    if not pos_dir:
+        pos_dir = _primary_position_direction(ctx.get("direction")) or _primary_position_direction(direction)
+    if not pos_dir:
+        logger.warning("%s: cannot reconcile protection without position direction", symbol)
+        return summary
+
+    sl_val = sl
+    if sl_val is None or sl_val <= 0:
+        raw_sl = ctx.get("sl")
+        try:
+            sl_val = float(raw_sl) if raw_sl not in (None, "") else None
+        except (TypeError, ValueError):
+            sl_val = None
+
+    tp_val = tp
+    if tp_val is None or tp_val <= 0:
+        raw_tp = ctx.get("tp")
+        try:
+            tp_val = float(raw_tp) if raw_tp not in (None, "") else None
+        except (TypeError, ValueError):
+            tp_val = None
+
+    protection = get_position_protection(symbol, pos_dir)
+    summary.update(protection)
+    need_sl = not protection["has_sl"]
+    need_tp = not protection["has_tp"]
+    if not need_sl and not need_tp:
+        return summary
+
+    if need_sl and (sl_val is None or sl_val <= 0):
+        logger.warning("%s: missing SL on exchange but no sl price in context/plan", symbol)
+        need_sl = False
+    if need_tp and (tp_val is None or tp_val <= 0):
+        logger.warning("%s: missing TP on exchange but no tp price in context/plan", symbol)
+        need_tp = False
+    if not need_sl and not need_tp:
+        return summary
+
+    qty = _position_qty_string(symbol, pos_dir)
+    if not qty:
+        logger.warning("%s: cannot reconcile protection — no position qty", symbol)
+        return summary
+
+    placed = _place_protection_legs(
+        symbol,
+        pos_dir,
+        float(sl_val or 0),
+        float(tp_val or 0),
+        qty,
+        need_sl=need_sl,
+        need_tp=need_tp,
+    )
+    summary["reconciled"] = placed["sl"] or placed["tp"]
+    summary["placed_sl"] = need_sl and placed["sl"]
+    summary["placed_tp"] = need_tp and placed["tp"]
+    if summary["reconciled"]:
+        _invalidate_position_cache(symbol)
+        parts = []
+        if summary["placed_sl"]:
+            parts.append("SL")
+        if summary["placed_tp"]:
+            parts.append("TP")
+        _set_status(
+            message=f"Protection reconciled · {' + '.join(parts)} · {symbol}",
+            last_event="protection_reconciled",
+        )
+    return summary
+
+
+def run_execution_maintenance(
+    symbol: str,
+    *,
+    direction: str | None = None,
+    sl: float | None = None,
+    tp: float | None = None,
+) -> None:
+    """Periodic: cancel stale entry limits; repair missing SL/TP on open positions."""
+    if not EXECUTION_ENABLED or not _keys_configured() or EXECUTION_MODE != "live":
+        return
+
+    symbol = symbol.upper()
+    now = time.monotonic()
+    with _maintenance_lock:
+        last = _last_maintenance.get(symbol, 0.0)
+        if now - last < EXECUTION_MAINTENANCE_SEC:
+            return
+        _last_maintenance[symbol] = now
+
+    cancel_stale_entry_limits(symbol)
+    reconcile_position_protection(symbol, direction=direction, sl=sl, tp=tp)
 
 
 def _is_entry_limit_order(order: dict[str, Any]) -> bool:
@@ -969,34 +1314,72 @@ def _place_sl_tp_after_fill(
     tp: float,
     quantity: str,
     order_id: int | None,
-) -> None:
+) -> dict[str, bool]:
+    """Place SL then TP after entry fill. Never raises — logs and notifies on partial failure."""
+    result = {"sl": False, "tp": False}
     if not REST_PLACE_SL_TP:
-        return
+        return result
 
     fill_qty = quantity
     if order_id is not None:
         waited = _wait_limit_fill(symbol, order_id, REST_SL_TP_FILL_WAIT)
         if not waited:
-            _set_status(message=f"Entry not filled in {REST_SL_TP_FILL_WAIT}s — SL/TP skipped")
+            msg = f"Entry not filled in {REST_SL_TP_FILL_WAIT}s — SL/TP skipped"
+            _set_status(message=msg, last_event="skip_sl_tp")
             _append_orders_log("skip_sl_tp", symbol=symbol, reason="entry_not_filled", orderId=order_id)
-            return
+            telegram.notify_sl_tp_failed(
+                symbol,
+                direction,
+                "SL/TP",
+                f"Limit order {order_id} not FILLED within {REST_SL_TP_FILL_WAIT}s",
+            )
+            return result
         fill_qty = waited
 
     sl_price = round_price(symbol, sl)
     tp_price = round_price(symbol, tp)
     qty = round_qty(symbol, float(fill_qty))
 
-    sl_resp = _place_stop_loss(symbol, direction, sl_price, qty)
-    _append_orders_log("sl_placed", symbol=symbol, response=sl_resp)
+    try:
+        sl_resp = _place_stop_loss(symbol, direction, sl_price, qty)
+        _append_orders_log("sl_placed", symbol=symbol, response=sl_resp)
+        result["sl"] = True
+    except RuntimeError as exc:
+        logger.error("SL placement failed for %s: %s", symbol, exc)
+        _append_orders_log("sl_failed", symbol=symbol, sl=sl_price, qty=qty, error=str(exc))
+        telegram.notify_sl_tp_failed(symbol, direction, "SL", str(exc))
 
-    if TP_ORDER_TYPE == "trailing":
-        tp_resp = _place_trailing_tp(symbol, direction, tp_price, qty)
-        _append_orders_log("tp_trailing_placed", symbol=symbol, response=tp_resp)
+    try:
+        if TP_ORDER_TYPE == "trailing":
+            tp_resp = _place_trailing_tp(symbol, direction, tp_price, qty)
+            _append_orders_log("tp_trailing_placed", symbol=symbol, response=tp_resp)
+        else:
+            tp_resp = _place_take_profit_fixed(symbol, direction, tp_price, qty)
+            _append_orders_log("tp_fixed_placed", symbol=symbol, response=tp_resp)
+        result["tp"] = True
+    except RuntimeError as exc:
+        logger.error("TP placement failed for %s: %s", symbol, exc)
+        _append_orders_log(
+            "tp_failed",
+            symbol=symbol,
+            tp=tp_price,
+            tp_type=TP_ORDER_TYPE,
+            qty=qty,
+            error=str(exc),
+        )
+        telegram.notify_sl_tp_failed(symbol, direction, "TP", str(exc))
+
+    if result["sl"] and result["tp"]:
+        _set_status(message=f"SL/TP placed · qty {qty}", last_event="sl_tp_placed")
+    elif result["sl"] or result["tp"]:
+        missing = "TP" if result["sl"] else "SL"
+        _set_status(
+            message=f"Partial protection · {missing} missing · qty {qty}",
+            last_event="sl_tp_partial",
+        )
     else:
-        tp_resp = _place_take_profit_fixed(symbol, direction, tp_price, qty)
-        _append_orders_log("tp_fixed_placed", symbol=symbol, response=tp_resp)
-
-    _set_status(message=f"SL/TP placed · qty {qty}")
+        _set_status(message=f"SL/TP failed · qty {qty}", last_event="sl_tp_failed")
+    return result
 
 
 def _execute_open(

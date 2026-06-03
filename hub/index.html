@@ -85,6 +85,19 @@
             return "stat-value";
         }
 
+        function protectionClass(data) {
+            if (!data.position_open) {
+                return "stat-value";
+            }
+            if (data.protection_ok) {
+                return "stat-value protection-ok";
+            }
+            if (data.has_sl || data.has_tp) {
+                return "stat-value protection-partial";
+            }
+            return "stat-value protection-miss";
+        }
+
         function cardShell(pair) {
             const url = `http://${host}:${pair.port}/`;
             const article = document.createElement("article");
@@ -154,6 +167,11 @@
                     "Position",
                     data.position || "None",
                     data.position_open ? "stat-value strong" : "stat-value"
+                ),
+                statRow(
+                    "Protection",
+                    data.protection_display || "—",
+                    protectionClass(data)
                 ),
             ].join("");
 
@@ -226,6 +244,7 @@
                 fleetPaused: false,
                 executeAuto: false,
                 dbEnabled: false,
+                unprotected: 0,
             };
 
             for (const data of results) {
@@ -240,6 +259,9 @@
                 }
                 if (data.position_open) {
                     counts.open += 1;
+                    if (!data.protection_ok) {
+                        counts.unprotected += 1;
+                    }
                 }
                 if (data.position_pending) {
                     counts.pending += 1;
@@ -271,6 +293,9 @@
             parts.push(`${counts.trade} TRADE`, `${counts.watch} WATCH`);
             if (counts.open) {
                 parts.push(`${counts.open} open`);
+            }
+            if (counts.unprotected) {
+                parts.push(`${counts.unprotected} no SL/TP`);
             }
             if (counts.pending) {
                 parts.push(`${counts.pending} pending`);
