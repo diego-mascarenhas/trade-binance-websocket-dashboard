@@ -1048,10 +1048,10 @@ def compute_trade_plan(
     for index, dca_price in enumerate(dca_prices[1:], start=1):
         legs.append(
             {
-                "label": f"DCA {index} · {dca_size:.0f}% · on valid entry",
+                "label": f"DCA {index + 1} · {dca_size:.0f}% · if position adverse",
                 "price": dca_price,
                 "size_pct": dca_size,
-                "trigger": "valid_entry",
+                "trigger": "valid_entry_adverse",
             }
         )
 
@@ -1085,7 +1085,7 @@ def compute_trade_plan(
         "active": True,
         "signal": signal,
         "summary": (
-            f"Suggested {signal} plan · DCA on each valid entry · partial {TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% at TP1"
+            f"Suggested {signal} plan · DCA if position adverse · partial {TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% at TP1"
             if TRADE_PLAN_EXECUTE_DCA and len(legs) > 1
             else f"Suggested {signal} plan · partial {TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% at TP1"
         ),
@@ -1379,7 +1379,25 @@ def record_valid_entry(
                     market_snapshot=market,
                 )
                 return
-            size_pct = float(legs[leg_index]["size_pct"])
+            leg = legs[leg_index]
+            dca_entry = execution.resolve_dca_leg_entry_price(leg_index, leg, float(entry))
+            if leg_index >= 1 and execution.TRADE_PLAN_DCA_ADVERSE_ONLY:
+                allowed, block_reason = execution.can_place_dca_add(
+                    SYMBOL,
+                    signal,
+                    dca_entry,
+                    size_pct=float(leg["size_pct"]),
+                    max_legs=len(legs),
+                )
+                if not allowed:
+                    log_decision_event(
+                        "valid_entry_blocked",
+                        outcome="blocked",
+                        block_reason=block_reason,
+                        market_snapshot=market,
+                    )
+                    return
+            size_pct = float(leg["size_pct"])
         elif use_dca:
             size_pct = sum(float(leg["size_pct"]) for leg in legs)
         else:

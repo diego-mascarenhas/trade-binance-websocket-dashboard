@@ -70,6 +70,8 @@ BE_EXIT_PRICE_PCT = float(os.getenv("BE_EXIT_PRICE_PCT", "0.12"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 TRADE_PLAN_EXECUTE_DCA = _env_bool("TRADE_PLAN_EXECUTE_DCA", "true")
 TRADE_PLAN_DCA_SIGNAL_DRIVEN = _env_bool("TRADE_PLAN_DCA_SIGNAL_DRIVEN", "true")
+TRADE_PLAN_DCA_ADVERSE_ONLY = _env_bool("TRADE_PLAN_DCA_ADVERSE_ONLY", "true")
+DCA_FAVORABLE_PNL_MAX_USDT = float(os.getenv("DCA_FAVORABLE_PNL_MAX_USDT", "0"))
 TRADE_PLAN_TP1_RR = float(os.getenv("TRADE_PLAN_TP1_RR", "1.0"))
 TRADE_PLAN_SL_MIN_DISTANCE_PCT = float(os.getenv("TRADE_PLAN_SL_MIN_DISTANCE_PCT", "1.0"))
 TRADE_PLAN_AUTO_BE = _env_bool("TRADE_PLAN_AUTO_BE", "true")
@@ -1762,6 +1764,75 @@ def estimate_order_notional_usdt(size_pct: float = 100.0) -> float:
     return _calculate_notional_usdt() * (max(float(size_pct), 0.0) / 100.0)
 
 
+def _position_adverse_for_dca(
+    symbol: str,
+    direction: str,
+    add_entry: float,
+) -> tuple[bool, str]:
+    """
+    DCA adds only when the open position is against us (underwater / averaging into loss).
+    SHORT: add only above position entry; LONG: add only below position entry.
+    """
+    symbol = symbol.upper()
+    direction = direction.upper()
+    if add_entry <= 0:
+        return False, "invalid_entry"
+
+    snapshot = _fetch_exchange_exposure(symbol)
+    if not snapshot.get("open"):
+        return False, "dca_no_position"
+
+    pos_entry_raw = snapshot.get("entry")
+    try:
+        pos_entry = float(pos_entry_raw) if pos_entry_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        pos_entry = None
+
+    mark_raw = snapshot.get("mark_price")
+    try:
+        mark = float(mark_raw) if mark_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        mark = None
+
+    upnl_raw = snapshot.get("unrealized_pnl")
+    if upnl_raw is not None:
+        try:
+            upnl = float(upnl_raw)
+            if upnl > DCA_FAVORABLE_PNL_MAX_USDT:
+                return False, "dca_favorable_pnl"
+        except (TypeError, ValueError):
+            pass
+
+    if pos_entry is not None and pos_entry > 0:
+        if direction == "LONG" and add_entry >= pos_entry:
+            return False, "dca_add_with_trend"
+        if direction == "SHORT" and add_entry <= pos_entry:
+            return False, "dca_add_with_trend"
+
+    if mark is not None and mark > 0 and pos_entry is not None and pos_entry > 0:
+        if direction == "LONG" and mark >= pos_entry:
+            return False, "dca_position_favorable"
+        if direction == "SHORT" and mark <= pos_entry:
+            return False, "dca_position_favorable"
+
+    return True, ""
+
+
+def resolve_dca_leg_entry_price(
+    leg_index: int,
+    leg: dict[str, Any],
+    signal_entry: float,
+) -> float:
+    """Leg 0 = signal entry; DCA2/DCA3+ use planned adverse levels from the trade plan."""
+    if leg_index <= 0:
+        return signal_entry
+    try:
+        plan_price = float(leg.get("price") or 0)
+    except (TypeError, ValueError):
+        plan_price = 0.0
+    return plan_price if plan_price > 0 else signal_entry
+
+
 def can_place_dca_add(
     symbol: str,
     direction: str,
@@ -1785,6 +1856,11 @@ def can_place_dca_add(
         return False, "dca_no_position"
     if pos_dir != direction:
         return False, "dca_direction_mismatch"
+
+    if TRADE_PLAN_DCA_ADVERSE_ONLY:
+        adverse, adverse_reason = _position_adverse_for_dca(symbol, direction, entry)
+        if not adverse:
+            return False, adverse_reason or "dca_favorable"
 
     blocked, balance_reason = fleet_side_balance_blocks(
         direction,
@@ -1927,6 +2003,10 @@ def _log_skip_order(symbol: str, signal: str, reason: str, *, entry: float | Non
         "dca_max_legs": "skip_dca_max",
         "dca_no_position": "skip_dca_no_position",
         "dca_direction_mismatch": "skip_dca_mismatch",
+        "dca_favorable_pnl": "skip_dca_favorable",
+        "dca_add_with_trend": "skip_dca_favorable",
+        "dca_position_favorable": "skip_dca_favorable",
+        "dca_favorable": "skip_dca_favorable",
     }.get(reason, "skip_order_guard")
     fields: dict[str, Any] = {"symbol": symbol.upper(), "signal": signal, "reason": reason}
     if entry is not None:
@@ -3443,7 +3523,7 @@ def try_execute_valid_entry(
             )
             return
         leg = legs[leg_index]
-        entry_price = float(entry)
+        entry_price = resolve_dca_leg_entry_price(leg_index, leg, float(entry))
         size_pct = float(leg["size_pct"])
         fingerprint = f"{signal}|{sl:.2f}|{tp:.2f}|leg{leg_index}|{entry_price:.4f}"
         if leg_index == 0:
@@ -3499,15 +3579,18 @@ def try_execute_valid_entry(
                 name=f"exec-dca-add-{symbol}-{signal}-leg{leg_index}",
             )
     elif use_dca:
-        leg_prices = "|".join(f"{float(leg['price']):.4f}" for leg in legs) if legs else ""
+        bundle_legs = legs
+        if TRADE_PLAN_DCA_ADVERSE_ONLY:
+            bundle_legs = legs[:1]
+        leg_prices = "|".join(f"{float(leg['price']):.4f}" for leg in bundle_legs) if bundle_legs else ""
         fingerprint = f"{signal}|{sl:.2f}|{tp:.2f}|{leg_prices}"
-        allowed, block_reason = can_place_dca_bundle(symbol, signal, legs)
+        allowed, block_reason = can_place_dca_bundle(symbol, signal, bundle_legs)
         if not allowed:
             _log_skip_order(symbol, signal, block_reason, entry=avg_entry)
             return
         thread = threading.Thread(
             target=_execute_open_dca,
-            args=(symbol, signal, sl, tp, legs, reasons, fingerprint, avg_entry),
+            args=(symbol, signal, sl, tp, bundle_legs, reasons, fingerprint, avg_entry),
             daemon=True,
             name=f"exec-dca-{symbol}-{signal}",
         )
