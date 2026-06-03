@@ -4,6 +4,8 @@ import atexit
 import json
 import logging
 import os
+import random
+import re
 import signal
 import socket
 import time
@@ -1346,6 +1348,7 @@ def record_valid_entry(
         outcome="recorded",
         market_snapshot=market,
     )
+    execution.stage_valid_entry_snapshot(SYMBOL, market)
     sl_val = trade_plan.get("sl") if trade_plan else None
     tp1_val = trade_plan.get("tp1") if trade_plan else None
     telegram.notify_valid_entry(
@@ -1827,11 +1830,31 @@ def config_poll_loop() -> None:
             logger.warning("%s: DB config poll failed: %s", SYMBOL.upper(), exc)
 
 
+def _websocket_reconnect_delay(exc: Exception, attempt: int) -> float:
+    """Backoff + honor Binance -1003 IP ban window."""
+    message = str(exc)
+    lower = message.lower()
+    if "-1003" in message or "too many requests" in lower or "banned until" in lower:
+        match = re.search(r"banned until (\d+)", message)
+        if match:
+            until_s = int(match.group(1)) / 1000.0
+            return max(60.0, until_s - time.time() + 5.0)
+        return min(600.0, 90.0 * (2 ** min(attempt, 3)))
+
+    base = min(120.0, 3.0 * (2 ** min(attempt, 6)))
+    return base + random.uniform(0.0, min(15.0, base * 0.25))
+
+
 async def ws_loop() -> None:
     global forming_candle, htf_forming_candle, latest_price, orderbook, ws_status, change_24h
 
     depth_buffer: list[dict] = []
     last_htf_interval = HTF_INTERVAL
+    reconnect_attempt = 0
+
+    stagger_s = (hash(SYMBOL.upper()) % 30) + random.uniform(0.0, 2.0)
+    logger.info("%s: WebSocket stagger %.1fs (reduces REST burst on fleet start)", SYMBOL.upper(), stagger_s)
+    await asyncio.sleep(stagger_s)
 
     async with aiohttp.ClientSession() as session:
         history = await fetch_historical_klines(session, INTERVAL, min(MAX_CANDLES, 500))
@@ -1871,7 +1894,12 @@ async def ws_loop() -> None:
                 ws_status = "connecting"
                 depth_buffer.clear()
 
-                async with websockets.connect(stream_url, ping_interval=20, ping_timeout=20) as ws:
+                async with websockets.connect(
+                    stream_url,
+                    ping_interval=30,
+                    ping_timeout=60,
+                    close_timeout=10,
+                ) as ws:
                     logger.info("WebSocket connected for %s", SYMBOL.upper())
                     ws_status = "buffering depth"
 
@@ -1887,6 +1915,7 @@ async def ws_loop() -> None:
                         sync_orderbook_state(bid_map, ask_map)
 
                     ws_status = "live"
+                    reconnect_attempt = 0
                     logger.info("Order book synced at updateId=%s", last_update_id)
 
                     async for raw in ws:
@@ -1957,10 +1986,23 @@ async def ws_loop() -> None:
                                 sync_orderbook_state(bid_map, ask_map)
 
             except Exception as exc:
-                log_error("websocket_loop_error", error=str(exc))
-                logger.exception("WebSocket loop error, reconnecting in 3s")
+                delay = _websocket_reconnect_delay(exc, reconnect_attempt)
+                reconnect_attempt += 1
+                log_error(
+                    "websocket_loop_error",
+                    error=str(exc),
+                    reconnect_in_sec=round(delay, 1),
+                    attempt=reconnect_attempt,
+                )
+                logger.warning(
+                    "%s: WebSocket error (%s), reconnect in %.0fs (attempt %s)",
+                    SYMBOL.upper(),
+                    exc,
+                    delay,
+                    reconnect_attempt,
+                )
                 ws_status = "reconnecting"
-                await asyncio.sleep(3)
+                await asyncio.sleep(delay)
 
 
 def resolve_confirmed_pattern(closed_rows: list[dict]) -> str | None:
@@ -3297,26 +3339,7 @@ def build_telegram_status() -> str:
 
 
 def format_protection_display(pos: dict) -> str:
-    if pos.get("open"):
-        sl_mark = "✓" if pos.get("has_sl") else "✗"
-        if pos.get("tp_kind") == "trailing":
-            if pos.get("trailing_active"):
-                tp_part = "TP ✓ trail"
-            elif pos.get("trailing_pending") or pos.get("has_tp"):
-                tp_part = "TP ○ trail"
-            else:
-                tp_part = "TP ✗"
-        elif pos.get("has_tp"):
-            tp_part = "TP ✓"
-        else:
-            tp_part = "TP ✗"
-        return f"SL {sl_mark} · {tp_part}"
-    if pos.get("pending"):
-        ttl = execution.ENTRY_LIMIT_TTL_SEC
-        if ttl > 0:
-            return f"Pending (TTL {ttl}s)"
-        return "Pending"
-    return "—"
+    return execution.format_protection_display(pos)
 
 
 def format_position_label(pos: dict) -> tuple[str, float | None, float | None]:
@@ -3342,6 +3365,11 @@ def build_hub_summary() -> dict:
     analysis = metrics.get("market_analysis") or {}
     ex = metrics.get("execution") or {}
     pos = ex.get("position") or {}
+    if pos.get("open"):
+        primary = str(pos.get("direction") or "").split("+", 1)[0].strip().upper()
+        if primary in ("LONG", "SHORT") and not pos.get("has_sl") and not pos.get("has_tp"):
+            pos = {**pos, **execution.get_position_protection(SYMBOL, primary)}
+        pos = {**pos, "protection_display": execution.format_protection_display(pos)}
     position, position_pnl, position_pnl_pct = format_position_label(pos)
 
     change = metrics.get("change_24h")
@@ -3375,6 +3403,8 @@ def build_hub_summary() -> dict:
         "ws_status": metrics.get("status", "—"),
         "position": position,
         "position_open": bool(pos.get("open")),
+        "position_source": pos.get("source"),
+        "keys_configured": execution.keys_configured(),
         "position_direction": (
             str(pos.get("direction") or "").split("+", 1)[0].strip().upper()
             if pos.get("open")

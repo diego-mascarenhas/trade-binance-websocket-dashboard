@@ -23,7 +23,6 @@
         const grid = document.getElementById("grid");
         const meta = document.getElementById("meta");
         const footer = document.getElementById("footer");
-        const host = window.location.hostname || "127.0.0.1";
         const analyticsLink = document.getElementById("analytics-link");
         if (analyticsLink) {
             analyticsLink.href = "/analytics/";
@@ -83,6 +82,41 @@
             if (value > 0) return "stat-value change-up";
             if (value < 0) return "stat-value change-down";
             return "stat-value";
+        }
+
+        function formatPositionLabel(pos) {
+            if (!pos || !pos.open) {
+                return "None";
+            }
+            const vol = pos.volume_usdt != null ? `${Number(pos.volume_usdt).toFixed(2)} USDT` : "";
+            return `${pos.direction || "—"} · ${vol}`.replace(/ · $/, "");
+        }
+
+        function mergeFleetPosition(data, fleetPositions) {
+            if (!data || !fleetPositions || !data.symbol) {
+                return data;
+            }
+            const pos = (fleetPositions.positions || {})[data.symbol];
+            if (!pos || !pos.open) {
+                return data;
+            }
+            return {
+                ...data,
+                position_open: true,
+                position_pending: false,
+                position_direction: String(pos.direction || "").split("+")[0],
+                position: formatPositionLabel(pos),
+                position_pnl: pos.unrealized_pnl ?? data.position_pnl,
+                position_pnl_pct: pos.unrealized_pnl_pct ?? data.position_pnl_pct,
+                has_sl: pos.has_sl ?? data.has_sl,
+                has_tp: pos.has_tp ?? data.has_tp,
+                tp_kind: pos.tp_kind ?? data.tp_kind,
+                trailing_active: pos.trailing_active ?? data.trailing_active,
+                trailing_pending: pos.trailing_pending ?? data.trailing_pending,
+                protection_ok: pos.protection_ok ?? data.protection_ok,
+                protection_display: pos.protection_display ?? data.protection_display,
+                position_source: "fleet",
+            };
         }
 
         function protectionClass(data) {
@@ -177,7 +211,13 @@
 
             const statusEl = article.querySelector(".card-status");
             const exec = data.execution_enabled ? data.execution_mode.toUpperCase() : "OFF";
-            statusEl.textContent = `${data.ws_status || "—"} · exec ${exec}`;
+            let status = `${data.ws_status || "—"} · exec ${exec}`;
+            if (data.position_source === "no_keys" || data.keys_configured === false) {
+                status += " · no Binance keys";
+            } else if (data.position_source === "fleet") {
+                status += " · pos fleet";
+            }
+            statusEl.textContent = status;
             statusEl.className = "card-status";
         }
 
@@ -198,14 +238,11 @@
             statusEl.className = "card-status card-status-offline";
         }
 
-        async function fetchSummary(pair) {
+        async function fetchAllSummaries() {
             const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 2500);
+            const timeout = setTimeout(() => controller.abort(), 8000);
             try {
-                const response = await fetch(`http://${host}:${pair.port}/api/hub-summary`, {
-                    mode: "cors",
-                    signal: controller.signal,
-                });
+                const response = await fetch("/api/hub-summaries", { signal: controller.signal });
                 if (!response.ok) {
                     throw new Error(String(response.status));
                 }
@@ -227,26 +264,45 @@
             }
         }
 
-        async function refreshCards(pairs, cards) {
-            const [results, fleetExposure] = await Promise.all([
-                Promise.all(
-                    pairs.map(async (pair, index) => {
-                        try {
-                            const data = await fetchSummary(pair);
-                            renderSummary(cards[index], data);
-                            return data;
-                        } catch {
-                            renderOffline(cards[index]);
-                            return null;
-                        }
-                    })
-                ),
-                fetchFleetExposure(),
-            ]);
-            renderHubMeta(aggregateHubCounts(results), pairs.length, fleetExposure);
+        async function fetchFleetPositions() {
+            try {
+                const response = await fetch("/api/fleet-positions");
+                if (!response.ok) {
+                    return null;
+                }
+                return await response.json();
+            } catch {
+                return null;
+            }
         }
 
-        function aggregateHubCounts(results) {
+        async function refreshCards(pairs, cards) {
+            const [summaryPayload, fleetExposure, fleetPositions] = await Promise.all([
+                fetchAllSummaries().catch(() => null),
+                fetchFleetExposure(),
+                fetchFleetPositions(),
+            ]);
+            const summaries = (summaryPayload && summaryPayload.summaries) || {};
+            const results = pairs.map((pair, index) => {
+                const symbol = (pair.symbol || "").toUpperCase();
+                let data = summaries[symbol];
+                if (!data) {
+                    renderOffline(cards[index]);
+                    return null;
+                }
+                data = mergeFleetPosition(data, fleetPositions);
+                renderSummary(cards[index], data);
+                return data;
+            });
+            renderHubMeta(
+                aggregateHubCounts(results, fleetPositions),
+                pairs.length,
+                fleetExposure,
+                fleetPositions
+            );
+        }
+
+        function aggregateHubCounts(results, fleetPositions) {
             const counts = {
                 trade: 0,
                 watch: 0,
@@ -264,6 +320,8 @@
                 unprotected: 0,
             };
 
+            const fleetMap = fleetPositions && fleetPositions.positions ? fleetPositions.positions : null;
+
             for (const data of results) {
                 if (!data) {
                     counts.offline += 1;
@@ -274,17 +332,23 @@
                 } else {
                     counts.watch += 1;
                 }
-                if (data.position_open) {
+                const fleetPos = fleetMap && data.symbol ? fleetMap[data.symbol] : null;
+                const positionOpen = fleetPos && fleetPos.open ? true : Boolean(data.position_open);
+                if (positionOpen) {
                     counts.open += 1;
-                    const dir = (data.position_direction || "").toUpperCase();
-                    if (dir === "LONG") {
+                    const dir = (
+                        fleetPos ? fleetPos.direction : data.position_direction || ""
+                    ).toUpperCase();
+                    if (dir.startsWith("LONG")) {
                         counts.openLong += 1;
-                    } else if (dir === "SHORT") {
+                    } else if (dir.startsWith("SHORT")) {
                         counts.openShort += 1;
                     }
                     const protected =
+                        (fleetPos && fleetPos.protection_ok) ||
                         data.protection_ok ||
-                        (data.tp_kind === "trailing" && data.trailing_active);
+                        (data.tp_kind === "trailing" && data.trailing_active) ||
+                        (fleetPos && fleetPos.tp_kind === "trailing" && fleetPos.trailing_active);
                     if (!protected) {
                         counts.unprotected += 1;
                     }
@@ -311,8 +375,13 @@
             return counts;
         }
 
-        function renderHubMeta(counts, totalPairs, fleetExposure) {
+        function renderHubMeta(counts, totalPairs, fleetExposure, fleetPositions) {
             const parts = [`${totalPairs} pairs`];
+            if (fleetPositions && fleetPositions.keys_configured === false) {
+                parts.push("⚠ no API keys");
+            } else if (fleetPositions && fleetPositions.api_error) {
+                parts.push("⚠ Binance API");
+            }
             if (fleetExposure && fleetExposure.enabled) {
                 const longTotal = Number(fleetExposure.long_total_usdt || 0).toFixed(0);
                 const shortTotal = Number(fleetExposure.short_total_usdt || 0).toFixed(0);

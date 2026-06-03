@@ -13,6 +13,7 @@ import db_analytics
 import db_store
 import deepseek_advisor
 import execution
+import hub_proxy
 import symbol_config_admin
 
 load_dotenv()
@@ -61,9 +62,20 @@ def analytics_static(filename: str):
     return send_from_directory(ANALYTICS_DIR, filename)
 
 
+@app.route("/api/hub-summaries")
+def hub_summaries():
+    """Aggregate hub-summary from each local dashboard port (for remote hub UI)."""
+    return _cors(jsonify(hub_proxy.fetch_all_summaries()))
+
+
 @app.route("/api/fleet-exposure")
 def fleet_exposure():
     return _cors(jsonify(execution.get_fleet_side_exposure()))
+
+
+@app.route("/api/fleet-positions")
+def fleet_positions():
+    return _cors(jsonify(execution.get_fleet_open_positions_map()))
 
 
 @app.route("/api/health")
@@ -169,6 +181,28 @@ def symbol_config_restore():
     return _cors(jsonify(result)), status
 
 
+@app.route("/api/trade-outcomes")
+def trade_outcomes():
+    days = _int_arg("days", 30)
+    limit = _int_arg("limit", 200, minimum=1, maximum=5000)
+    offset = _int_arg("offset", 0, minimum=0, maximum=500000)
+    rows, total = db_analytics.get_ml_trade_outcomes(
+        days=days,
+        symbol=_optional_symbol(),
+        limit=limit,
+        offset=offset,
+    )
+    return _cors(
+        jsonify(
+            {
+                "rows": rows,
+                "total": total,
+                "columns": list(db_analytics.ML_TRADE_OUTCOME_KEYS),
+            }
+        )
+    )
+
+
 @app.route("/api/export/features.csv")
 def export_features_csv():
     days = _int_arg("days", 30)
@@ -181,6 +215,23 @@ def export_features_csv():
     )
     csv_text = db_analytics.features_to_csv(rows)
     filename = f"decision_features_{days}d.csv"
+    response = Response(csv_text, mimetype="text/csv")
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return _cors(response)
+
+
+@app.route("/api/export/trade-outcomes.csv")
+def export_trade_outcomes_csv():
+    days = _int_arg("days", 30)
+    limit = _int_arg("limit", 50000, minimum=1, maximum=50000)
+    rows, _ = db_analytics.get_ml_trade_outcomes(
+        days=days,
+        symbol=_optional_symbol(),
+        limit=limit,
+        offset=0,
+    )
+    csv_text = db_analytics.trade_outcomes_to_csv(rows)
+    filename = f"trade_outcomes_{days}d.csv"
     response = Response(csv_text, mimetype="text/csv")
     response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
     return _cors(response)

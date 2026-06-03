@@ -1,4 +1,4 @@
-"""Read-only analytics queries on decision_events (ML-ready exports)."""
+"""Read-only analytics on decision_events and trade_outcomes (ML-ready exports)."""
 
 from __future__ import annotations
 
@@ -9,6 +9,39 @@ from datetime import datetime, timezone
 from typing import Any
 
 import db_store
+
+ML_TRADE_OUTCOME_KEYS = (
+    "id",
+    "symbol",
+    "direction",
+    "entry_decision_event_id",
+    "entry_price",
+    "exit_price",
+    "exit_qty",
+    "realized_pnl",
+    "pnl_pct",
+    "exit_type",
+    "outcome",
+    "sl_price",
+    "tp_price",
+    "tp_type",
+    "be_applied",
+    "dca_legs_placed",
+    "entry_opened_at",
+    "entry_signal",
+    "entry_confidence",
+    "entry_trend",
+    "entry_trend_aligned",
+    "entry_rsi",
+    "entry_macd_hist",
+    "entry_adx",
+    "entry_htf_adx",
+    "entry_smc_pattern",
+    "entry_smc_trend",
+    "entry_price_at_signal",
+    "entry_change_24h",
+    "closed_at",
+)
 
 ML_FEATURE_KEYS = (
     "symbol",
@@ -148,7 +181,162 @@ def get_overview(days: int | None = 7) -> dict[str, Any]:
 
     row["enabled"] = True
     row["days"] = days
+    row.update(_trade_outcomes_summary(days))
     return row
+
+
+def _trade_outcomes_summary(days: int | None) -> dict[str, Any]:
+    if not db_store.is_enabled():
+        return {
+            "closed_trades": 0,
+            "trade_wins": 0,
+            "trade_losses": 0,
+            "trade_breakeven": 0,
+            "total_realized_pnl": 0.0,
+            "avg_realized_pnl": None,
+        }
+
+    where_extra, params = _days_clause(days)
+    try:
+        conn = db_store.connect()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) AS closed_trades,
+                        SUM(outcome = 'win') AS trade_wins,
+                        SUM(outcome = 'loss') AS trade_losses,
+                        SUM(outcome = 'breakeven') AS trade_breakeven,
+                        COALESCE(SUM(realized_pnl), 0) AS total_realized_pnl,
+                        AVG(realized_pnl) AS avg_realized_pnl
+                    FROM trade_outcomes
+                    WHERE 1=1{where_extra}
+                    """,
+                    params,
+                )
+                stats = cursor.fetchone() or {}
+        finally:
+            conn.close()
+    except Exception:
+        return {
+            "closed_trades": 0,
+            "trade_wins": 0,
+            "trade_losses": 0,
+            "trade_breakeven": 0,
+            "total_realized_pnl": 0.0,
+            "avg_realized_pnl": None,
+        }
+
+    avg_pnl = stats.get("avg_realized_pnl")
+    return {
+        "closed_trades": int(stats.get("closed_trades") or 0),
+        "trade_wins": int(stats.get("trade_wins") or 0),
+        "trade_losses": int(stats.get("trade_losses") or 0),
+        "trade_breakeven": int(stats.get("trade_breakeven") or 0),
+        "total_realized_pnl": float(stats.get("total_realized_pnl") or 0),
+        "avg_realized_pnl": float(avg_pnl) if avg_pnl is not None else None,
+    }
+
+
+def _flatten_trade_outcome_row(row: dict[str, Any]) -> dict[str, Any]:
+    created = row.get("created_at")
+    if isinstance(created, datetime):
+        created = created.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    entry_opened = row.get("entry_opened_at")
+    if isinstance(entry_opened, datetime):
+        entry_opened = entry_opened.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    entry_market = _parse_json(row.get("entry_market_snapshot"))
+
+    return {
+        "id": row.get("id"),
+        "symbol": row.get("symbol"),
+        "direction": row.get("direction"),
+        "entry_decision_event_id": row.get("entry_decision_event_id"),
+        "entry_price": row.get("entry_price"),
+        "exit_price": row.get("exit_price"),
+        "exit_qty": row.get("exit_qty"),
+        "realized_pnl": row.get("realized_pnl"),
+        "pnl_pct": row.get("pnl_pct"),
+        "exit_type": row.get("exit_type"),
+        "outcome": row.get("outcome"),
+        "sl_price": row.get("sl_price"),
+        "tp_price": row.get("tp_price"),
+        "tp_type": row.get("tp_type"),
+        "be_applied": bool(row.get("be_applied")),
+        "dca_legs_placed": row.get("dca_legs_placed"),
+        "entry_opened_at": entry_opened,
+        "entry_signal": entry_market.get("signal"),
+        "entry_confidence": entry_market.get("confidence"),
+        "entry_trend": entry_market.get("trend"),
+        "entry_trend_aligned": entry_market.get("trend_aligned"),
+        "entry_rsi": entry_market.get("rsi"),
+        "entry_macd_hist": entry_market.get("macd_hist"),
+        "entry_adx": entry_market.get("adx"),
+        "entry_htf_adx": entry_market.get("htf_adx"),
+        "entry_smc_pattern": entry_market.get("smc_pattern"),
+        "entry_smc_trend": entry_market.get("smc_trend"),
+        "entry_price_at_signal": entry_market.get("price"),
+        "entry_change_24h": entry_market.get("change_24h"),
+        "closed_at": created,
+    }
+
+
+def get_ml_trade_outcomes(
+    *,
+    days: int | None = 30,
+    symbol: str | None = None,
+    limit: int = 5000,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    if not db_store.is_enabled():
+        return [], 0
+
+    limit = max(1, min(limit, 50000))
+    offset = max(0, offset)
+    where_sql, params = _where_parts(days, symbol)
+
+    try:
+        conn = db_store.connect()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT COUNT(*) AS total FROM trade_outcomes WHERE {where_sql}",
+                    params,
+                )
+                total = int((cursor.fetchone() or {}).get("total") or 0)
+                cursor.execute(
+                    f"""
+                    SELECT
+                        id, symbol, direction, entry_price, exit_price, exit_qty,
+                        realized_pnl, pnl_pct, exit_type, outcome,
+                        sl_price, tp_price, tp_type, be_applied, dca_legs_placed,
+                        entry_opened_at, entry_market_snapshot, entry_decision_event_id,
+                        created_at
+                    FROM trade_outcomes
+                    WHERE {where_sql}
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT %s OFFSET %s
+                    """,
+                    [*params, limit, offset],
+                )
+                rows = cursor.fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return [], 0
+
+    return [_flatten_trade_outcome_row(row) for row in rows], total
+
+
+def trade_outcomes_to_csv(rows: list[dict[str, Any]]) -> str:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(ML_TRADE_OUTCOME_KEYS), extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return buffer.getvalue()
 
 
 def get_hourly_series(days: int | None = 7, symbol: str | None = None) -> list[dict[str, Any]]:
@@ -559,6 +747,7 @@ def build_suggestion_context(
             if row.get("event_type") == "indicator_blocked"
         ][:10],
         "active_config": get_latest_config_snapshot(),
+        "trade_outcomes": _trade_outcomes_summary(days_filter),
         "overridable_keys": sorted(
             [
                 "MIN_CONFIDENCE",

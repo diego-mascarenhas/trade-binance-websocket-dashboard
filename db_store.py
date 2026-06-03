@@ -533,3 +533,199 @@ def _log_decision_event_sync(
             conn.close()
     except Exception as exc:
         logger.warning("MySQL log_decision_event failed for %s/%s: %s", symbol, event_type, exc)
+
+
+def _parse_json_field(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode()
+    if isinstance(value, str) and value:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def fetch_last_valid_entry(
+    symbol: str,
+    *,
+    before: str | None = None,
+    lookback_hours: int = 48,
+) -> dict[str, Any] | None:
+    """Latest recorded valid_entry for symbol (optional upper time bound)."""
+    if not _credentials_configured() or not ensure_schema():
+        return None
+
+    symbol = symbol.upper()
+    params: list[Any] = [symbol]
+    time_clause = ""
+    if before:
+        time_clause = " AND created_at <= %s"
+        params.append(before)
+
+    params.append(max(lookback_hours, 1))
+
+    try:
+        conn = _connect()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT id, market_snapshot, created_at, config_version
+                    FROM decision_events
+                    WHERE symbol = %s
+                      AND event_type = 'valid_entry'
+                      AND outcome = 'recorded'
+                      {time_clause}
+                      AND created_at >= NOW() - INTERVAL %s HOUR
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    params,
+                )
+                row = cursor.fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("MySQL fetch_last_valid_entry failed for %s: %s", symbol, exc)
+        return None
+
+    if not row:
+        return None
+
+    created = row.get("created_at")
+    if hasattr(created, "strftime"):
+        created = created.strftime("%Y-%m-%d %H:%M:%S")
+
+    return {
+        "id": int(row["id"]),
+        "market_snapshot": _parse_json_field(row.get("market_snapshot")),
+        "created_at": created,
+        "config_version": row.get("config_version"),
+    }
+
+
+def log_trade_outcome(
+    symbol: str,
+    *,
+    direction: str,
+    entry_price: float | None,
+    exit_price: float,
+    exit_qty: str | float | None,
+    realized_pnl: float,
+    pnl_pct: float | None,
+    exit_type: str,
+    outcome: str,
+    sl_price: str | float | None = None,
+    tp_price: str | float | None = None,
+    tp_type: str | None = None,
+    be_applied: bool = False,
+    dca_legs_placed: int | None = None,
+    entry_opened_at: str | None = None,
+    entry_market_snapshot: dict[str, Any] | None = None,
+    entry_decision_event_id: int | None = None,
+    config_snapshot: dict[str, Any] | None = None,
+    trade_context: dict[str, Any] | None = None,
+) -> None:
+    if not DB_ENABLED:
+        return
+
+    thread = threading.Thread(
+        target=_log_trade_outcome_sync,
+        kwargs={
+            "symbol": symbol.upper(),
+            "direction": direction.upper(),
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "exit_qty": exit_qty,
+            "realized_pnl": realized_pnl,
+            "pnl_pct": pnl_pct,
+            "exit_type": exit_type,
+            "outcome": outcome,
+            "sl_price": sl_price,
+            "tp_price": tp_price,
+            "tp_type": tp_type,
+            "be_applied": be_applied,
+            "dca_legs_placed": dca_legs_placed,
+            "entry_opened_at": entry_opened_at,
+            "entry_market_snapshot": entry_market_snapshot,
+            "entry_decision_event_id": entry_decision_event_id,
+            "config_snapshot": config_snapshot or {},
+            "trade_context": trade_context,
+        },
+        daemon=True,
+        name=f"db-trade-outcome-{symbol}",
+    )
+    thread.start()
+
+
+def _log_trade_outcome_sync(
+    *,
+    symbol: str,
+    direction: str,
+    entry_price: float | None,
+    exit_price: float,
+    exit_qty: str | float | None,
+    realized_pnl: float,
+    pnl_pct: float | None,
+    exit_type: str,
+    outcome: str,
+    sl_price: str | float | None,
+    tp_price: str | float | None,
+    tp_type: str | None,
+    be_applied: bool,
+    dca_legs_placed: int | None,
+    entry_opened_at: str | None,
+    entry_market_snapshot: dict[str, Any] | None,
+    entry_decision_event_id: int | None,
+    config_snapshot: dict[str, Any],
+    trade_context: dict[str, Any] | None,
+) -> None:
+    if not _credentials_configured() or not ensure_schema():
+        return
+    try:
+        conn = _connect()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO trade_outcomes (
+                        symbol, direction, entry_price, exit_price, exit_qty,
+                        realized_pnl, pnl_pct, exit_type, outcome,
+                        sl_price, tp_price, tp_type, be_applied, dca_legs_placed,
+                        entry_opened_at, entry_market_snapshot, entry_decision_event_id,
+                        config_snapshot, trade_context
+                    ) VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s
+                    )
+                    """,
+                    (
+                        symbol,
+                        direction,
+                        entry_price,
+                        exit_price,
+                        exit_qty,
+                        realized_pnl,
+                        pnl_pct,
+                        exit_type,
+                        outcome,
+                        sl_price,
+                        tp_price,
+                        tp_type,
+                        1 if be_applied else 0,
+                        dca_legs_placed,
+                        entry_opened_at,
+                        _json_dumps(entry_market_snapshot) if entry_market_snapshot else None,
+                        entry_decision_event_id,
+                        _json_dumps(config_snapshot),
+                        _json_dumps(trade_context) if trade_context is not None else None,
+                    ),
+                )
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("MySQL log_trade_outcome failed for %s: %s", symbol, exc)

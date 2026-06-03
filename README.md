@@ -113,7 +113,14 @@ Hub and analytics share **one port** (`HUB_PORT`, default **8050**):
 - Hub: `http://127.0.0.1:8050/`
 - Analytics: `http://127.0.0.1:8050/analytics/`
 
-KPIs, hourly/daily charts, block-reason breakdowns, and **CSV export** for ML (RSI, ADX, confidence, trend, config snapshot).
+On a remote server (e.g. behind nginx on port 443), expose **only** `HUB_PORT` (8050). The hub loads pair cards via **`/api/hub-summaries`** (server-side proxy to `127.0.0.1:8051+`), not from the browser — do not open firewall ports 8051–8072 publicly.
+
+KPIs, hourly/daily charts, block-reason breakdowns, and **CSV export** for ML:
+
+- **Decision features** (`decision_events`): RSI, ADX, confidence, trend, config snapshot at signal time.
+- **Trade outcomes** (`trade_outcomes`): each **closed live position** — entry/exit, realized PnL, exit type (`tp`, `sl`, `trailing_tp`, `breakeven`), plan SL/TP, DCA legs, config snapshot, plus **`entry_market_snapshot`** (RSI, ADX, confidence, trend from the `valid_entry` that opened the trade) and **`entry_decision_event_id`** (FK-style link to `decision_events`).
+
+Closed trades are written when execution detects a flat position after an open (requires Binance API keys). The entry snapshot is staged on `valid_entry`, bound when the position opens, and falls back to the latest `decision_events` row if the bot restarted. Historical closes before this feature are not backfilled.
 
 Works even with `DB_ENABLED=false` (UI shows empty state). With DB on, `./run-all.sh` runs migrations then serves hub + analytics via `hub_server.py`.
 
@@ -121,6 +128,7 @@ Export for notebooks:
 
 ```bash
 curl -o features.csv "http://127.0.0.1:8050/api/export/features.csv?days=30"
+curl -o outcomes.csv "http://127.0.0.1:8050/api/export/trade-outcomes.csv?days=30"
 ```
 
 ### DeepSeek config suggestions

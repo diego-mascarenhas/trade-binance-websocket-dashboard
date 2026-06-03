@@ -13,13 +13,15 @@
             <div class="header-main">
                 <h1>Decision Analytics</h1>
                 <p class="subtitle">
-                    Statistics from <code>decision_events</code> — hourly/daily volume, block reasons,
-                    and ML-ready feature export (RSI, ADX, confidence, trend, config snapshot).
+                    Statistics from <code>decision_events</code> and closed trades in
+                    <code>trade_outcomes</code> — hourly/daily volume, block reasons, PnL labels,
+                    and ML-ready CSV exports.
                 </p>
             </div>
             <div class="header-actions">
                 <a class="nav-link" id="hub-link" href="/">Hub</a>
-                <button class="btn btn-primary" id="export-btn" type="button">Export CSV</button>
+                <button class="btn btn-primary" id="export-btn" type="button">Export decisions</button>
+                <button class="btn" id="export-outcomes-btn" type="button">Export outcomes</button>
                 <button class="btn" id="refresh-btn" type="button">Refresh</button>
             </div>
         </header>
@@ -90,7 +92,8 @@
                 <h2>ML feature columns</h2>
                 <p class="note" style="margin-bottom:10px;">
                     Flattened from <code>market_snapshot</code> + <code>config_snapshot</code>.
-                    Use CSV export for notebooks / scikit-learn / pandas.
+                    <strong>Export outcomes</strong> includes <code>entry_*</code> columns (RSI, ADX, confidence)
+                    from the linked <code>valid_entry</code> — no manual join needed.
                 </p>
                 <div id="feature-columns" class="bar-list"></div>
             </div>

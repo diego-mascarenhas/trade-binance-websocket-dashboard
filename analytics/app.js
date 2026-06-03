@@ -10,6 +10,7 @@ const statusNote = document.getElementById("status-note");
 const kpiGrid = document.getElementById("kpi-grid");
 const footer = document.getElementById("footer");
 const exportBtn = document.getElementById("export-btn");
+const exportOutcomesBtn = document.getElementById("export-outcomes-btn");
 const refreshBtn = document.getElementById("refresh-btn");
 const suggestionsBtn = document.getElementById("suggestions-btn");
 const suggestionsNote = document.getElementById("suggestions-note");
@@ -75,6 +76,15 @@ function formatNumber(value) {
     return Number(value).toLocaleString();
 }
 
+function formatPnl(value) {
+    if (value == null || Number.isNaN(Number(value))) {
+        return "—";
+    }
+    const num = Number(value);
+    const sign = num >= 0 ? "+" : "";
+    return `${sign}${num.toFixed(2)} USDT`;
+}
+
 function renderKpis(overview) {
     const cards = [
         ["Total events", overview.total_events],
@@ -85,17 +95,23 @@ function renderKpis(overview) {
         ["Dry-run orders", overview.order_dry_runs],
         ["Live orders", overview.order_live_opens],
         ["Symbols", overview.symbols_seen],
+        ["Closed trades", overview.closed_trades],
+        ["Wins", overview.trade_wins],
+        ["Losses", overview.trade_losses],
+        ["Realized PnL", overview.total_realized_pnl, "pnl"],
     ];
 
     kpiGrid.innerHTML = cards
-        .map(
-            ([label, value]) => `
+        .map((entry) => {
+            const [label, value, kind] = entry;
+            const display = kind === "pnl" ? formatPnl(value) : formatNumber(value);
+            return `
                 <div class="kpi">
                     <div class="kpi-label">${label}</div>
-                    <div class="kpi-value">${formatNumber(value)}</div>
+                    <div class="kpi-value">${display}</div>
                 </div>
-            `
-        )
+            `;
+        })
         .join("");
 }
 
@@ -486,6 +502,12 @@ async function refresh() {
 exportBtn.addEventListener("click", () => {
     window.location.href = `/api/export/features.csv?${queryParams().toString()}`;
 });
+
+if (exportOutcomesBtn) {
+    exportOutcomesBtn.addEventListener("click", () => {
+        window.location.href = `/api/export/trade-outcomes.csv?${queryParams().toString()}`;
+    });
+}
 
 refreshBtn.addEventListener("click", refresh);
 suggestionsBtn.addEventListener("click", () => loadSuggestions(true));

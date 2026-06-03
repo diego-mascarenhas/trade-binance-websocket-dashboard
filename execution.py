@@ -84,6 +84,9 @@ _maintenance_lock = threading.Lock()
 _last_maintenance: dict[str, float] = {}
 _fleet_exposure_lock = threading.Lock()
 _fleet_exposure_cache: tuple[float, dict[str, Any]] | None = None
+_fleet_positions_lock = threading.Lock()
+_fleet_positions_cache: tuple[float, dict[str, Any]] | None = None
+_last_position_api_error: str | None = None
 _hedge_mode_lock = threading.Lock()
 _hedge_mode: bool | None = None
 _last_execution_monotonic: float | None = None
@@ -167,6 +170,81 @@ def _update_trade_context(symbol: str, **fields: Any) -> dict[str, Any]:
         return dict(current)
 
 
+def stage_valid_entry_snapshot(symbol: str, market_snapshot: dict[str, Any]) -> None:
+    """Store RSI/ADX/confidence from the latest valid_entry until the position opens."""
+    if not market_snapshot:
+        return
+    _update_trade_context(
+        symbol.upper(),
+        pending_entry_market_snapshot=dict(market_snapshot),
+        pending_entry_at=time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+    )
+
+
+def _resolve_entry_link(symbol: str, ctx: dict[str, Any]) -> tuple[dict[str, Any] | None, int | None]:
+    snapshot = ctx.get("entry_market_snapshot")
+    if isinstance(snapshot, dict) and snapshot:
+        market = snapshot
+    else:
+        pending = ctx.get("pending_entry_market_snapshot")
+        market = pending if isinstance(pending, dict) and pending else None
+
+    event_id = ctx.get("entry_decision_event_id")
+    try:
+        event_id = int(event_id) if event_id is not None else None
+    except (TypeError, ValueError):
+        event_id = None
+
+    if market and event_id:
+        return market, event_id
+
+    if not db_store.is_enabled():
+        return market, event_id
+
+    row = db_store.fetch_last_valid_entry(
+        symbol,
+        before=ctx.get("entry_opened_at") or ctx.get("pending_entry_at"),
+    )
+    if not row:
+        return market, event_id
+
+    if not market:
+        db_market = row.get("market_snapshot")
+        market = db_market if isinstance(db_market, dict) and db_market else None
+    if not event_id:
+        event_id = row.get("id")
+    return market, event_id
+
+
+def _bind_entry_snapshot_for_open_position(symbol: str) -> None:
+    """Attach pending valid_entry features to the trade (first open only)."""
+    symbol = symbol.upper()
+    ctx = _get_trade_context(symbol)
+    if ctx.get("entry_market_snapshot"):
+        return
+
+    pending = ctx.get("pending_entry_market_snapshot")
+    fields: dict[str, Any] = {}
+    if isinstance(pending, dict) and pending:
+        fields["entry_market_snapshot"] = dict(pending)
+
+    if db_store.is_enabled():
+        row = db_store.fetch_last_valid_entry(
+            symbol,
+            before=ctx.get("entry_opened_at") or ctx.get("pending_entry_at"),
+        )
+        if row:
+            if "entry_market_snapshot" not in fields:
+                db_market = row.get("market_snapshot")
+                if isinstance(db_market, dict) and db_market:
+                    fields["entry_market_snapshot"] = db_market
+            if row.get("id"):
+                fields["entry_decision_event_id"] = int(row["id"])
+
+    if fields:
+        _update_trade_context(symbol, **fields)
+
+
 def record_trade_context(
     symbol: str,
     direction: str,
@@ -191,7 +269,11 @@ def record_trade_context(
         fields["dca_legs_placed"] = int(dca_legs_placed)
     if dca_max_legs is not None:
         fields["dca_max_legs"] = int(dca_max_legs)
+    existing = _get_trade_context(symbol)
+    if not existing.get("entry_opened_at"):
+        fields["entry_opened_at"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
     _update_trade_context(symbol, **fields)
+    _bind_entry_snapshot_for_open_position(symbol)
 
 
 def dca_legs_placed(symbol: str) -> int:
@@ -421,8 +503,83 @@ def _is_breakeven_exit(entry: float | None, exit_price: float, pnl: float) -> bo
     return price_ok and pnl_ok
 
 
+def _classify_closed_trade(
+    entry: float | None,
+    exit_price: float,
+    pnl: float,
+    tp_type: str,
+) -> tuple[str, str]:
+    if _is_breakeven_exit(entry, exit_price, pnl):
+        return "breakeven", "breakeven"
+    if pnl > 0:
+        if tp_type == "trailing":
+            return "trailing_tp", "win"
+        return "tp", "win"
+    if pnl < 0:
+        return "sl", "loss"
+    return "flat", "breakeven"
+
+
+def _compute_pnl_pct(entry: float | None, exit_qty: Any, pnl: float) -> float | None:
+    if entry is None or entry <= 0:
+        return None
+    try:
+        qty = float(exit_qty or 0)
+    except (TypeError, ValueError):
+        qty = 0.0
+    if qty <= 0:
+        return None
+    notional = entry * qty
+    if notional <= 0:
+        return None
+    return round(pnl / notional * 100, 4)
+
+
+def _persist_closed_trade_outcome(
+    symbol: str,
+    *,
+    direction: str,
+    entry: float | None,
+    exit_price: float,
+    exit_qty: Any,
+    pnl: float,
+    exit_type: str,
+    outcome: str,
+    sl: Any,
+    tp: Any,
+    tp_type: str,
+    ctx: dict[str, Any],
+) -> None:
+    try:
+        dca_legs = int(ctx.get("dca_legs_placed") or 0)
+    except (TypeError, ValueError):
+        dca_legs = 0
+    entry_market, entry_event_id = _resolve_entry_link(symbol, ctx)
+    db_store.log_trade_outcome(
+        symbol,
+        direction=direction,
+        entry_price=entry,
+        exit_price=exit_price,
+        exit_qty=exit_qty,
+        realized_pnl=pnl,
+        pnl_pct=_compute_pnl_pct(entry, exit_qty, pnl),
+        exit_type=exit_type,
+        outcome=outcome,
+        sl_price=sl,
+        tp_price=tp,
+        tp_type=tp_type,
+        be_applied=bool(ctx.get("be_applied")),
+        dca_legs_placed=dca_legs or None,
+        entry_opened_at=ctx.get("entry_opened_at"),
+        entry_market_snapshot=entry_market,
+        entry_decision_event_id=entry_event_id,
+        config_snapshot=symbol_config.get_config_snapshot(),
+        trade_context=dict(ctx),
+    )
+
+
 def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
-    if not _keys_configured() or not telegram.is_configured():
+    if not _keys_configured():
         return
 
     symbol = symbol.upper()
@@ -430,12 +587,18 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
     ctx = _get_trade_context(symbol)
 
     if snapshot.get("open"):
-        _update_trade_context(
-            symbol,
-            was_open=True,
-            direction=snapshot.get("direction") or ctx.get("direction"),
-            exit_notified=False,
-        )
+        open_fields: dict[str, Any] = {
+            "was_open": True,
+            "direction": snapshot.get("direction") or ctx.get("direction"),
+            "exit_notified": False,
+        }
+        if not ctx.get("entry_opened_at"):
+            open_fields["entry_opened_at"] = time.strftime(
+                "%Y-%m-%d %H:%M:%S UTC",
+                time.gmtime(),
+            )
+        _update_trade_context(symbol, **open_fields)
+        _bind_entry_snapshot_for_open_position(symbol)
         return
 
     if is_active or not ctx.get("was_open") or ctx.get("exit_notified"):
@@ -463,7 +626,24 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
 
     exit_price = float(trade["price"])
     pnl = float(trade["realized_pnl"])
+    exit_qty = trade.get("qty")
     pnl_label = _format_realized_pnl(pnl)
+    exit_type, outcome = _classify_closed_trade(entry, exit_price, pnl, tp_type)
+
+    _persist_closed_trade_outcome(
+        symbol,
+        direction=direction,
+        entry=entry,
+        exit_price=exit_price,
+        exit_qty=exit_qty,
+        pnl=pnl,
+        exit_type=exit_type,
+        outcome=outcome,
+        sl=sl,
+        tp=tp,
+        tp_type=tp_type,
+        ctx=ctx,
+    )
 
     _update_trade_context(
         symbol,
@@ -473,6 +653,8 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
         dca_max_legs=0,
         be_applied=False,
         position_peak_qty=None,
+        pending_entry_market_snapshot=None,
+        pending_entry_at=None,
     )
     _append_orders_log(
         "position_closed",
@@ -483,7 +665,12 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
         sl=sl,
         tp=tp,
         tp_type=tp_type,
+        exit_type=exit_type,
+        outcome=outcome,
     )
+
+    if not telegram.is_configured():
+        return
 
     if _is_breakeven_exit(entry, exit_price, pnl):
         msg = f"BREAK_EVEN #BE @ {exit_price} | PnL: {pnl_label}"
@@ -1330,14 +1517,91 @@ def has_limit_at_price(symbol: str, direction: str, entry: float) -> bool:
 
 
 def _get_all_position_risk() -> list[dict[str, Any]]:
+    global _last_position_api_error
     if not _keys_configured():
+        _last_position_api_error = "no_api_keys"
         return []
     try:
         resp = _fapi_request("GET", "/fapi/v2/positionRisk", {})
+        _last_position_api_error = None
         return resp if isinstance(resp, list) else []
     except RuntimeError as exc:
+        _last_position_api_error = str(exc)
         logger.warning("positionRisk (all symbols) failed: %s", exc)
         return []
+
+
+def keys_configured() -> bool:
+    return _keys_configured()
+
+
+def format_protection_display(pos: dict[str, Any]) -> str:
+    if pos.get("open"):
+        sl_mark = "✓" if pos.get("has_sl") else "✗"
+        if pos.get("tp_kind") == "trailing":
+            if pos.get("trailing_active"):
+                tp_part = "TP ✓ trail"
+            elif pos.get("trailing_pending") or pos.get("has_tp"):
+                tp_part = "TP ○ trail"
+            else:
+                tp_part = "TP ✗"
+        elif pos.get("has_tp"):
+            tp_part = "TP ✓"
+        else:
+            tp_part = "TP ✗"
+        return f"SL {sl_mark} · {tp_part}"
+    if pos.get("pending"):
+        ttl = ENTRY_LIMIT_TTL_SEC
+        if ttl > 0:
+            return f"Pending (TTL {ttl}s)"
+        return "Pending"
+    return "—"
+
+
+def get_fleet_open_positions_map(*, force: bool = False) -> dict[str, Any]:
+    """All open futures positions in one Binance call (for hub fleet overlay)."""
+    global _fleet_positions_cache
+
+    payload: dict[str, Any] = {
+        "keys_configured": _keys_configured(),
+        "api_error": _last_position_api_error,
+        "positions": {},
+    }
+    if not _keys_configured():
+        payload["api_error"] = "no_api_keys"
+        return payload
+
+    now = time.monotonic()
+    with _fleet_positions_lock:
+        if (
+            not force
+            and _fleet_positions_cache is not None
+            and now - _fleet_positions_cache[0] < EXECUTION_POSITION_CACHE_SEC
+        ):
+            return dict(_fleet_positions_cache[1])
+
+    positions: dict[str, dict[str, Any]] = {}
+    for row in _get_all_position_risk():
+        symbol = str(row.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        parsed = _parse_position_row(row)
+        if not parsed:
+            continue
+        snap = dict(parsed)
+        _attach_unrealized_pnl_pct(snap)
+        snap["source"] = "binance"
+        primary = _primary_position_direction(snap.get("direction"))
+        if primary:
+            snap.update(get_position_protection(symbol, primary))
+        snap["protection_display"] = format_protection_display(snap)
+        positions[symbol] = snap
+
+    payload["api_error"] = _last_position_api_error
+    payload["positions"] = positions
+    with _fleet_positions_lock:
+        _fleet_positions_cache = (now, dict(payload))
+    return dict(payload)
 
 
 def _get_all_open_orders() -> list[dict[str, Any]]:
@@ -1371,6 +1635,8 @@ def get_fleet_side_exposure(*, force: bool = False) -> dict[str, Any]:
     empty = {
         "enabled": FLEET_SIDE_BALANCE_MAX_PCT > 0,
         "max_pct": FLEET_SIDE_BALANCE_MAX_PCT,
+        "keys_configured": _keys_configured(),
+        "api_error": _last_position_api_error,
         "long_positions_usdt": 0.0,
         "short_positions_usdt": 0.0,
         "long_pending_usdt": 0.0,
@@ -1380,6 +1646,7 @@ def get_fleet_side_exposure(*, force: bool = False) -> dict[str, Any]:
         "imbalance_pct": 0.0,
     }
     if not _keys_configured():
+        empty["api_error"] = "no_api_keys"
         return empty
 
     now = time.monotonic()
@@ -1426,6 +1693,8 @@ def get_fleet_side_exposure(*, force: bool = False) -> dict[str, Any]:
     result = {
         "enabled": FLEET_SIDE_BALANCE_MAX_PCT > 0,
         "max_pct": FLEET_SIDE_BALANCE_MAX_PCT,
+        "keys_configured": True,
+        "api_error": _last_position_api_error,
         "long_positions_usdt": round(long_pos, 2),
         "short_positions_usdt": round(short_pos, 2),
         "long_pending_usdt": round(long_pending, 2),
