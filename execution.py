@@ -12,7 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any
 
 import db_store
@@ -71,7 +71,9 @@ LOG_DIR = os.getenv("LOG_DIR", "logs")
 TRADE_PLAN_EXECUTE_DCA = _env_bool("TRADE_PLAN_EXECUTE_DCA", "true")
 TRADE_PLAN_DCA_SIGNAL_DRIVEN = _env_bool("TRADE_PLAN_DCA_SIGNAL_DRIVEN", "true")
 TRADE_PLAN_TP1_RR = float(os.getenv("TRADE_PLAN_TP1_RR", "1.0"))
+TRADE_PLAN_SL_MIN_DISTANCE_PCT = float(os.getenv("TRADE_PLAN_SL_MIN_DISTANCE_PCT", "1.0"))
 TP_REPRICE_TOLERANCE_PCT = float(os.getenv("TP_REPRICE_TOLERANCE_PCT", "0.5"))
+SL_REPRICE_TOLERANCE_PCT = float(os.getenv("SL_REPRICE_TOLERANCE_PCT", "0.35"))
 
 _status_lock = threading.Lock()
 _maintenance_lock = threading.Lock()
@@ -888,7 +890,7 @@ def _place_protection_legs(
     if not REST_PLACE_SL_TP:
         return result
 
-    sl_price = round_price(symbol, sl)
+    sl_price = round_price_for_sl(symbol, direction, sl)
     tp_price = round_price(symbol, tp)
 
     if need_sl:
@@ -980,6 +982,14 @@ def reconcile_position_protection(
     except (TypeError, ValueError):
         entry_f = None
 
+    sl_changed = False
+    if entry_f is not None and entry_f > 0:
+        sl_val, sl_changed = resolve_sl_for_open_position(
+            pos_dir,
+            entry_f,
+            float(sl_val) if sl_val is not None and sl_val > 0 else None,
+        )
+
     tp_val, tp_recalc = _resolve_tp_for_open_position(
         symbol,
         pos_dir,
@@ -987,13 +997,14 @@ def reconcile_position_protection(
         sl_val=float(sl_val) if sl_val is not None and sl_val > 0 else None,
         tp_val=float(tp_val) if tp_val is not None and tp_val > 0 else None,
     )
-    if tp_recalc and tp_val is not None and sl_val is not None and entry_f is not None:
-        _persist_recalculated_tp(
+    if entry_f is not None and (tp_recalc or sl_changed) and tp_val is not None and sl_val is not None:
+        _persist_recalculated_protection(
             symbol,
             pos_dir,
             position_entry=entry_f,
             sl_val=float(sl_val),
             tp_val=float(tp_val),
+            reason="protection_recalculated",
         )
 
     protection = get_position_protection(symbol, pos_dir)
@@ -1027,6 +1038,20 @@ def reconcile_position_protection(
         summary.update(protection)
         need_tp = True
         summary["tp_repriced"] = True
+
+    if (
+        not need_sl
+        and sl_val is not None
+        and sl_val > 0
+        and entry_f is not None
+        and _sl_order_needs_refresh(symbol, pos_dir, float(sl_val), entry_f)
+    ):
+        _cancel_symbol_sl_orders(symbol, pos_dir)
+        _invalidate_position_cache(symbol)
+        protection = get_position_protection(symbol, pos_dir)
+        summary.update(protection)
+        need_sl = True
+        summary["sl_repriced"] = True
 
     if not need_sl and not need_tp:
         return summary
@@ -1551,12 +1576,67 @@ def round_price(symbol: str, value: float) -> str:
     return format(quantized, "f")
 
 
+def round_price_for_sl(symbol: str, direction: str, value: float) -> str:
+    """Round SL so it does not move closer to entry (SHORT → up, LONG → down)."""
+    filt = _load_symbol_filters(symbol)
+    tick = filt["tick_size"]
+    rounding = ROUND_UP if direction.upper() == "SHORT" else ROUND_DOWN
+    quantized = Decimal(str(value)).quantize(tick, rounding=rounding)
+    return format(quantized, "f")
+
+
 def _get_mark_price(symbol: str) -> float | None:
     snapshot = _fetch_exchange_exposure(symbol.upper())
     mark = snapshot.get("mark_price")
     if mark is not None and float(mark) > 0:
         return float(mark)
     return None
+
+
+def _sl_distance_pct(direction: str, entry: float, sl: float) -> float:
+    direction = direction.upper()
+    if entry <= 0:
+        return 0.0
+    if direction == "LONG":
+        return max(0.0, (entry - sl) / entry * 100)
+    if direction == "SHORT":
+        return max(0.0, (sl - entry) / entry * 100)
+    return 0.0
+
+
+def _sl_too_close_to_entry(direction: str, entry: float, sl: float) -> bool:
+    if entry <= 0 or sl <= 0:
+        return True
+    return _sl_distance_pct(direction, entry, sl) < TRADE_PLAN_SL_MIN_DISTANCE_PCT
+
+
+def resolve_sl_for_open_position(
+    direction: str,
+    entry: float,
+    sl_val: float | None,
+) -> tuple[float | None, bool]:
+    """Keep structural SL from plan but never closer than TRADE_PLAN_SL_MIN_DISTANCE_PCT to entry."""
+    if entry <= 0:
+        return sl_val, False
+    direction = direction.upper()
+    min_pct = TRADE_PLAN_SL_MIN_DISTANCE_PCT / 100
+    plan_sl = float(sl_val) if sl_val is not None and sl_val > 0 else None
+    if direction == "LONG":
+        min_dist_sl = entry * (1 - min_pct)
+        if plan_sl is None:
+            resolved = min_dist_sl
+        else:
+            resolved = min(plan_sl, min_dist_sl)
+    elif direction == "SHORT":
+        min_dist_sl = entry * (1 + min_pct)
+        if plan_sl is None:
+            resolved = min_dist_sl
+        else:
+            resolved = max(plan_sl, min_dist_sl)
+    else:
+        return sl_val, False
+    changed = plan_sl is None or abs(resolved - plan_sl) > 1e-12
+    return resolved, changed
 
 
 def recalculate_tp1_from_position(direction: str, entry: float, sl: float) -> float | None:
@@ -1647,6 +1727,74 @@ def _tp_order_needs_refresh(symbol: str, direction: str, target_tp: float) -> bo
     return False
 
 
+def _get_sl_trigger_from_orders(symbol: str, direction: str) -> float | None:
+    primary = _primary_position_direction(direction)
+    if not primary:
+        return None
+    want_ps = primary if is_hedge_mode() else None
+    for order in _get_open_algo_orders(symbol):
+        if want_ps:
+            pos_side = str(order.get("positionSide") or "").upper()
+            if pos_side and pos_side not in (want_ps, "BOTH"):
+                continue
+        if _algo_order_role(order, primary) != "sl":
+            continue
+        try:
+            trigger = float(order.get("triggerPrice") or 0)
+        except (TypeError, ValueError):
+            trigger = 0.0
+        if trigger > 0:
+            return trigger
+    return None
+
+
+def _sl_order_needs_refresh(
+    symbol: str,
+    direction: str,
+    target_sl: float,
+    position_entry: float,
+) -> bool:
+    if target_sl <= 0 or position_entry <= 0:
+        return False
+    if _sl_too_close_to_entry(direction, position_entry, target_sl):
+        return True
+    trigger = _get_sl_trigger_from_orders(symbol, direction)
+    if trigger is None or trigger <= 0:
+        return False
+    if _sl_too_close_to_entry(direction, position_entry, trigger):
+        return True
+    if abs(trigger - target_sl) / target_sl * 100 > SL_REPRICE_TOLERANCE_PCT:
+        return True
+    return False
+
+
+def _cancel_symbol_sl_orders(symbol: str, direction: str) -> None:
+    primary = _primary_position_direction(direction)
+    if not primary:
+        return
+    want_ps = primary if is_hedge_mode() else None
+    for order in _get_open_algo_orders(symbol):
+        if want_ps:
+            pos_side = str(order.get("positionSide") or "").upper()
+            if pos_side and pos_side not in (want_ps, "BOTH"):
+                continue
+        if _algo_order_role(order, primary) != "sl":
+            continue
+        algo_id = order.get("algoId")
+        if algo_id is None:
+            continue
+        try:
+            _cancel_algo_order(symbol, int(algo_id))
+            _append_orders_log(
+                "sl_cancelled_reprice",
+                symbol=symbol,
+                algoId=algo_id,
+                direction=primary,
+            )
+        except RuntimeError as exc:
+            logger.warning("%s: cancel SL algo %s failed: %s", symbol, algo_id, exc)
+
+
 def _cancel_symbol_tp_orders(symbol: str, direction: str) -> None:
     primary = _primary_position_direction(direction)
     if not primary:
@@ -1674,6 +1822,35 @@ def _cancel_symbol_tp_orders(symbol: str, direction: str) -> None:
             logger.warning("%s: cancel TP algo %s failed: %s", symbol, algo_id, exc)
 
 
+def _persist_recalculated_protection(
+    symbol: str,
+    direction: str,
+    *,
+    position_entry: float,
+    sl_val: float,
+    tp_val: float,
+    reason: str = "protection_recalculated",
+) -> None:
+    direction = direction.upper()
+    _update_trade_context(
+        symbol,
+        direction=direction,
+        entry=round_price(symbol, position_entry),
+        sl=round_price_for_sl(symbol, direction, sl_val),
+        tp=round_price(symbol, tp_val),
+    )
+    _append_orders_log(
+        reason,
+        symbol=symbol,
+        direction=direction,
+        entry=position_entry,
+        sl=sl_val,
+        tp=tp_val,
+        rr=TRADE_PLAN_TP1_RR,
+        sl_min_distance_pct=TRADE_PLAN_SL_MIN_DISTANCE_PCT,
+    )
+
+
 def _persist_recalculated_tp(
     symbol: str,
     direction: str,
@@ -1682,21 +1859,13 @@ def _persist_recalculated_tp(
     sl_val: float,
     tp_val: float,
 ) -> None:
-    _update_trade_context(
+    _persist_recalculated_protection(
         symbol,
-        direction=direction.upper(),
-        entry=round_price(symbol, position_entry),
-        sl=round_price(symbol, sl_val),
-        tp=round_price(symbol, tp_val),
-    )
-    _append_orders_log(
-        "tp_recalculated",
-        symbol=symbol,
-        direction=direction,
-        entry=position_entry,
-        sl=sl_val,
-        tp=tp_val,
-        rr=TRADE_PLAN_TP1_RR,
+        direction,
+        position_entry=position_entry,
+        sl_val=sl_val,
+        tp_val=tp_val,
+        reason="tp_recalculated",
     )
 
 
@@ -2058,7 +2227,7 @@ def _place_sl_tp_after_fill(
             return result
         fill_qty = waited
 
-    sl_price = round_price(symbol, sl)
+    sl_price = round_price_for_sl(symbol, direction, sl)
     qty = round_qty(symbol, float(fill_qty))
 
     fill_entry = None
@@ -2079,10 +2248,21 @@ def _place_sl_tp_after_fill(
                 fill_entry = None
     tp_use = tp
     if fill_entry and sl > 0:
+        sl_resolved, _ = resolve_sl_for_open_position(direction, fill_entry, sl)
+        if sl_resolved and sl_resolved > 0:
+            sl = float(sl_resolved)
+            sl_price = round_price_for_sl(symbol, direction, sl)
         recalc = recalculate_tp1_from_position(direction, fill_entry, sl)
         if recalc and recalc > 0:
             tp_use = _ensure_tp_ahead_of_mark(symbol, direction, recalc)
-            _persist_recalculated_tp(symbol, direction, position_entry=fill_entry, sl_val=sl, tp_val=tp_use)
+            _persist_recalculated_protection(
+                symbol,
+                direction,
+                position_entry=fill_entry,
+                sl_val=sl,
+                tp_val=tp_use,
+                reason="protection_after_fill",
+            )
     tp_price = round_price(symbol, tp_use)
 
     try:

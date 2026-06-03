@@ -1097,8 +1097,8 @@ def compute_trade_plan(
         "runner_pct": runner_pct,
         "breakeven_price": avg_entry,
         "breakeven_note": (
-            f"At TP1: close {TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% → SL to BE "
-            f"({format_price(avg_entry)}) on remaining {runner_pct:.0f}%"
+            f"At TP1: close {TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% manually → optional SL to BE "
+            f"({format_price(avg_entry)}) on runner {runner_pct:.0f}% (not auto yet)"
         ),
         "trail_pct": TRADE_PLAN_TRAIL_PCT,
         "trail_note": (
