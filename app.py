@@ -954,6 +954,34 @@ def compute_market_analysis(
     return analysis
 
 
+def trade_plan_for_position_reconcile(
+    exposure: dict,
+    *,
+    support: float | None,
+    resistance: float | None,
+    price: float | None,
+    market_analysis: dict | None,
+) -> dict:
+    """Build SL/TP from an open exchange position (for protection reconcile on WATCH)."""
+    raw_dir = exposure.get("direction")
+    if not raw_dir:
+        return {"active": False}
+    direction = str(raw_dir).split("+", 1)[0].strip().upper()
+    entry = exposure.get("entry")
+    if direction not in ("LONG", "SHORT") or entry is None or float(entry) <= 0:
+        return {"active": False}
+    return compute_trade_plan(
+        direction,
+        max(int(MIN_CONFIDENCE), 50),
+        float(entry),
+        support,
+        resistance,
+        price,
+        market_analysis,
+        min_confidence=0,
+    )
+
+
 def compute_trade_plan(
     signal: str,
     confidence: int,
@@ -1982,22 +2010,28 @@ def get_candles_df() -> pd.DataFrame:
             ),
             "log_dir": LOG_DIR,
         }
-        if _resolved_trade_plan.get("active"):
+        exposure = execution.get_exchange_exposure(SYMBOL)
+        maintain_plan = _resolved_trade_plan
+        if not maintain_plan.get("active") and exposure.get("open"):
+            maintain_plan = trade_plan_for_position_reconcile(
+                exposure,
+                support=support,
+                resistance=resistance,
+                price=latest_price,
+                market_analysis=market_analysis,
+            )
+        if maintain_plan.get("active"):
             execution.run_execution_maintenance(
                 SYMBOL,
-                direction=_resolved_trade_plan.get("signal"),
-                sl=float(_resolved_trade_plan["sl"])
-                if _resolved_trade_plan.get("sl")
-                else None,
-                tp=float(_resolved_trade_plan["tp1"])
-                if _resolved_trade_plan.get("tp1")
-                else None,
+                direction=maintain_plan.get("signal"),
+                sl=float(maintain_plan["sl"]) if maintain_plan.get("sl") else None,
+                tp=float(maintain_plan["tp1"]) if maintain_plan.get("tp1") else None,
             )
         else:
             execution.run_execution_maintenance(SYMBOL)
         metrics["execution"] = {
             **execution.get_execution_status(),
-            "position": execution.get_exchange_exposure(SYMBOL),
+            "position": exposure,
         }
 
     return pd.DataFrame(rows), ob, metrics
@@ -3099,6 +3133,32 @@ def hub_summary_route():
 @app.server.route("/api/reload-config", methods=["POST"])
 def reload_config_route():
     result = reload_symbol_config_from_db(force=True)
+    response = jsonify({"ok": True, "symbol": SYMBOL.upper(), **result})
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+
+@app.server.route("/api/reconcile-protection", methods=["POST"])
+def reconcile_protection_route():
+    """Force SL/TP reconcile for this symbol (live + keys required)."""
+    _, _, metrics = get_candles_df()
+    exposure = (metrics.get("execution") or {}).get("position") or {}
+    plan = metrics.get("trade_plan") or {}
+    if not plan.get("active") and exposure.get("open"):
+        plan = trade_plan_for_position_reconcile(
+            exposure,
+            support=metrics.get("support"),
+            resistance=metrics.get("resistance"),
+            price=metrics.get("price"),
+            market_analysis=metrics.get("market_analysis"),
+        )
+    result = execution.reconcile_position_protection(
+        SYMBOL,
+        direction=plan.get("signal") if plan.get("active") else exposure.get("direction"),
+        sl=float(plan["sl"]) if plan.get("active") and plan.get("sl") else None,
+        tp=float(plan["tp1"]) if plan.get("active") and plan.get("tp1") else None,
+    )
+    execution._invalidate_position_cache(SYMBOL)
     response = jsonify({"ok": True, "symbol": SYMBOL.upper(), **result})
     response.headers["Access-Control-Allow-Origin"] = "*"
     return response
