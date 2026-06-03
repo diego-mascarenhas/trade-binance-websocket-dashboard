@@ -89,10 +89,10 @@
             if (!data.position_open) {
                 return "stat-value";
             }
-            if (data.protection_ok) {
+            if (data.protection_ok || data.trailing_active) {
                 return "stat-value protection-ok";
             }
-            if (data.has_sl || data.has_tp) {
+            if (data.has_sl || data.has_tp || data.trailing_pending) {
                 return "stat-value protection-partial";
             }
             return "stat-value protection-miss";
@@ -259,7 +259,10 @@
                 }
                 if (data.position_open) {
                     counts.open += 1;
-                    if (!data.protection_ok) {
+                    const protected =
+                        data.protection_ok ||
+                        (data.tp_kind === "trailing" && data.trailing_active);
+                    if (!protected) {
                         counts.unprotected += 1;
                     }
                 }

@@ -2884,9 +2884,9 @@ def build_execution_panel_section(metrics: dict) -> list:
             elif pnl_pct < 0:
                 pnl_class = "kv-value pnl-down"
         prot_class = "kv-value"
-        if pos.get("protection_ok"):
+        if pos.get("protection_ok") or pos.get("trailing_active"):
             prot_class = "kv-value pnl-up"
-        elif pos.get("has_sl") or pos.get("has_tp"):
+        elif pos.get("has_sl") or pos.get("has_tp") or pos.get("trailing_pending"):
             prot_class = "kv-value change-down"
         children.extend(
             [
@@ -3183,8 +3183,18 @@ def build_telegram_status() -> str:
 def format_protection_display(pos: dict) -> str:
     if pos.get("open"):
         sl_mark = "✓" if pos.get("has_sl") else "✗"
-        tp_mark = "✓" if pos.get("has_tp") else "✗"
-        return f"SL {sl_mark} · TP {tp_mark}"
+        if pos.get("tp_kind") == "trailing":
+            if pos.get("trailing_active"):
+                tp_part = "TP ✓ trail"
+            elif pos.get("trailing_pending") or pos.get("has_tp"):
+                tp_part = "TP ○ trail"
+            else:
+                tp_part = "TP ✗"
+        elif pos.get("has_tp"):
+            tp_part = "TP ✓"
+        else:
+            tp_part = "TP ✗"
+        return f"SL {sl_mark} · {tp_part}"
     if pos.get("pending"):
         ttl = execution.ENTRY_LIMIT_TTL_SEC
         if ttl > 0:
@@ -3254,6 +3264,9 @@ def build_hub_summary() -> dict:
         "position_pnl_pct": position_pnl_pct,
         "has_sl": bool(pos.get("has_sl")),
         "has_tp": bool(pos.get("has_tp")),
+        "tp_kind": pos.get("tp_kind"),
+        "trailing_active": bool(pos.get("trailing_active")),
+        "trailing_pending": bool(pos.get("trailing_pending")),
         "protection_ok": bool(pos.get("protection_ok")),
         "protection_display": format_protection_display(pos),
         "trend_aligned": trend_aligned,

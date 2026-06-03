@@ -593,6 +593,9 @@ def get_exchange_exposure(symbol: str) -> dict[str, Any]:
         snapshot["has_tp"] = False
         snapshot["sl_count"] = 0
         snapshot["tp_count"] = 0
+        snapshot["tp_kind"] = None
+        snapshot["trailing_active"] = False
+        snapshot["trailing_pending"] = False
         snapshot["protection_ok"] = False
     with _position_snapshot_lock:
         _position_snapshot_cache[symbol] = (now, snapshot)
@@ -664,14 +667,29 @@ def _primary_position_direction(direction: str | None) -> str | None:
     return text
 
 
+def _trailing_tp_is_active(order: dict[str, Any]) -> bool:
+    """True when Binance reports the trailing stop as triggered / working."""
+    try:
+        trigger_time = int(order.get("triggerTime") or 0)
+    except (TypeError, ValueError):
+        trigger_time = 0
+    status = str(order.get("algoStatus") or order.get("status") or "").upper()
+    if trigger_time > 0:
+        return True
+    return status in ("TRIGGERED", "WORKING", "FILLED")
+
+
 def get_position_protection(symbol: str, direction: str | None) -> dict[str, Any]:
     """Whether open conditional orders cover SL and TP for the current position side."""
     primary = _primary_position_direction(direction)
-    result = {
+    result: dict[str, Any] = {
         "has_sl": False,
         "has_tp": False,
         "sl_count": 0,
         "tp_count": 0,
+        "tp_kind": None,
+        "trailing_active": False,
+        "trailing_pending": False,
         "protection_ok": False,
     }
     if not primary or not _keys_configured():
@@ -690,7 +708,23 @@ def get_position_protection(symbol: str, direction: str | None) -> dict[str, Any
         elif role == "tp":
             result["has_tp"] = True
             result["tp_count"] += 1
-    result["protection_ok"] = result["has_sl"] and result["has_tp"]
+            order_type = str(order.get("orderType") or order.get("type") or "").upper()
+            if order_type == "TRAILING_STOP_MARKET":
+                result["tp_kind"] = "trailing"
+                if _trailing_tp_is_active(order):
+                    result["trailing_active"] = True
+                else:
+                    result["trailing_pending"] = True
+            elif result["tp_kind"] != "trailing":
+                result["tp_kind"] = "fixed"
+
+    result["protection_ok"] = bool(
+        result["has_sl"]
+        and (
+            (result["tp_kind"] == "trailing" and result["trailing_active"])
+            or (result["has_tp"] and result["tp_kind"] != "trailing")
+        )
+    )
     return result
 
 
