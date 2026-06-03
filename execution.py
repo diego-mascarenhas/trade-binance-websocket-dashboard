@@ -70,6 +70,8 @@ BE_EXIT_PRICE_PCT = float(os.getenv("BE_EXIT_PRICE_PCT", "0.12"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 TRADE_PLAN_EXECUTE_DCA = _env_bool("TRADE_PLAN_EXECUTE_DCA", "true")
 TRADE_PLAN_DCA_SIGNAL_DRIVEN = _env_bool("TRADE_PLAN_DCA_SIGNAL_DRIVEN", "true")
+TRADE_PLAN_TP1_RR = float(os.getenv("TRADE_PLAN_TP1_RR", "1.0"))
+TP_REPRICE_TOLERANCE_PCT = float(os.getenv("TP_REPRICE_TOLERANCE_PCT", "0.5"))
 
 _status_lock = threading.Lock()
 _maintenance_lock = threading.Lock()
@@ -972,6 +974,28 @@ def reconcile_position_protection(
         except (TypeError, ValueError):
             tp_val = None
 
+    position_entry = snapshot.get("entry")
+    try:
+        entry_f = float(position_entry) if position_entry not in (None, "") else None
+    except (TypeError, ValueError):
+        entry_f = None
+
+    tp_val, tp_recalc = _resolve_tp_for_open_position(
+        symbol,
+        pos_dir,
+        position_entry=entry_f,
+        sl_val=float(sl_val) if sl_val is not None and sl_val > 0 else None,
+        tp_val=float(tp_val) if tp_val is not None and tp_val > 0 else None,
+    )
+    if tp_recalc and tp_val is not None and sl_val is not None and entry_f is not None:
+        _persist_recalculated_tp(
+            symbol,
+            pos_dir,
+            position_entry=entry_f,
+            sl_val=float(sl_val),
+            tp_val=float(tp_val),
+        )
+
     protection = get_position_protection(symbol, pos_dir)
     summary.update(protection)
 
@@ -990,6 +1014,20 @@ def reconcile_position_protection(
 
     need_sl = not protection["has_sl"]
     need_tp = not protection["has_tp"]
+
+    if (
+        not need_tp
+        and tp_val is not None
+        and tp_val > 0
+        and _tp_order_needs_refresh(symbol, pos_dir, float(tp_val))
+    ):
+        _cancel_symbol_tp_orders(symbol, pos_dir)
+        _invalidate_position_cache(symbol)
+        protection = get_position_protection(symbol, pos_dir)
+        summary.update(protection)
+        need_tp = True
+        summary["tp_repriced"] = True
+
     if not need_sl and not need_tp:
         return summary
 
@@ -1521,6 +1559,147 @@ def _get_mark_price(symbol: str) -> float | None:
     return None
 
 
+def recalculate_tp1_from_position(direction: str, entry: float, sl: float) -> float | None:
+    """TP1 from actual position entry and plan SL using TRADE_PLAN_TP1_RR."""
+    direction = direction.upper()
+    try:
+        entry_f = float(entry)
+        sl_f = float(sl)
+    except (TypeError, ValueError):
+        return None
+    if entry_f <= 0:
+        return None
+    if direction == "LONG":
+        risk = entry_f - sl_f
+        if risk <= 0:
+            return None
+        return entry_f + risk * TRADE_PLAN_TP1_RR
+    if direction == "SHORT":
+        risk = sl_f - entry_f
+        if risk <= 0:
+            return None
+        return entry_f - risk * TRADE_PLAN_TP1_RR
+    return None
+
+
+def _ensure_tp_ahead_of_mark(symbol: str, direction: str, tp: float) -> float:
+    """Nudge TP so Binance will accept it (mark not already through the target)."""
+    mark = _get_mark_price(symbol)
+    if mark is None or mark <= 0:
+        return tp
+    filt = _load_symbol_filters(symbol)
+    tick = float(filt["tick_size"])
+    cushion = tick * 2
+    direction = direction.upper()
+    if direction == "LONG" and mark >= tp:
+        return mark + cushion
+    if direction == "SHORT" and mark <= tp:
+        return max(mark - cushion, tick)
+    return tp
+
+
+def _resolve_tp_for_open_position(
+    symbol: str,
+    direction: str,
+    *,
+    position_entry: float | None,
+    sl_val: float | None,
+    tp_val: float | None,
+) -> tuple[float | None, bool]:
+    """Return (tp price, True if recalculated from position entry)."""
+    if position_entry is None or position_entry <= 0:
+        return tp_val, False
+    if sl_val is None or sl_val <= 0:
+        return tp_val, False
+    recalc = recalculate_tp1_from_position(direction, position_entry, sl_val)
+    if recalc is None or recalc <= 0:
+        return tp_val, False
+    adjusted = _ensure_tp_ahead_of_mark(symbol, direction, recalc)
+    changed = tp_val is None or abs(adjusted - float(tp_val)) > 1e-12
+    return adjusted, changed
+
+
+def _tp_order_needs_refresh(symbol: str, direction: str, target_tp: float) -> bool:
+    """True when open TP algo is stale vs target or would trigger immediately."""
+    primary = _primary_position_direction(direction)
+    if not primary or target_tp <= 0:
+        return False
+    mark = _get_mark_price(symbol)
+    want_ps = primary if is_hedge_mode() else None
+    found_tp = False
+    for order in _get_open_algo_orders(symbol):
+        if want_ps:
+            pos_side = str(order.get("positionSide") or "").upper()
+            if pos_side and pos_side not in (want_ps, "BOTH"):
+                continue
+        if _algo_order_role(order, primary) != "tp":
+            continue
+        found_tp = True
+        raw_trigger = order.get("activatePrice") or order.get("triggerPrice")
+        try:
+            trigger = float(raw_trigger or 0)
+        except (TypeError, ValueError):
+            trigger = 0.0
+        if trigger > 0 and mark is not None and _tp_would_trigger_immediately(primary, trigger, mark):
+            return True
+        if trigger > 0 and abs(trigger - target_tp) / target_tp * 100 > TP_REPRICE_TOLERANCE_PCT:
+            return True
+    return False
+
+
+def _cancel_symbol_tp_orders(symbol: str, direction: str) -> None:
+    primary = _primary_position_direction(direction)
+    if not primary:
+        return
+    want_ps = primary if is_hedge_mode() else None
+    for order in _get_open_algo_orders(symbol):
+        if want_ps:
+            pos_side = str(order.get("positionSide") or "").upper()
+            if pos_side and pos_side not in (want_ps, "BOTH"):
+                continue
+        if _algo_order_role(order, primary) != "tp":
+            continue
+        algo_id = order.get("algoId")
+        if algo_id is None:
+            continue
+        try:
+            _cancel_algo_order(symbol, int(algo_id))
+            _append_orders_log(
+                "tp_cancelled_reprice",
+                symbol=symbol,
+                algoId=algo_id,
+                direction=primary,
+            )
+        except RuntimeError as exc:
+            logger.warning("%s: cancel TP algo %s failed: %s", symbol, algo_id, exc)
+
+
+def _persist_recalculated_tp(
+    symbol: str,
+    direction: str,
+    *,
+    position_entry: float,
+    sl_val: float,
+    tp_val: float,
+) -> None:
+    _update_trade_context(
+        symbol,
+        direction=direction.upper(),
+        entry=round_price(symbol, position_entry),
+        sl=round_price(symbol, sl_val),
+        tp=round_price(symbol, tp_val),
+    )
+    _append_orders_log(
+        "tp_recalculated",
+        symbol=symbol,
+        direction=direction,
+        entry=position_entry,
+        sl=sl_val,
+        tp=tp_val,
+        rr=TRADE_PLAN_TP1_RR,
+    )
+
+
 def _tp_would_trigger_immediately(direction: str, tp: float, mark: float) -> bool:
     """True when TP trigger/activation would fire at current mark (Binance -2021)."""
     direction = direction.upper()
@@ -1880,8 +2059,31 @@ def _place_sl_tp_after_fill(
         fill_qty = waited
 
     sl_price = round_price(symbol, sl)
-    tp_price = round_price(symbol, tp)
     qty = round_qty(symbol, float(fill_qty))
+
+    fill_entry = None
+    if order_id is not None:
+        try:
+            order = _fapi_request("GET", "/fapi/v1/order", {"symbol": symbol.upper(), "orderId": order_id})
+            avg_price = float(order.get("avgPrice") or 0)
+            if avg_price > 0:
+                fill_entry = avg_price
+        except (RuntimeError, TypeError, ValueError):
+            pass
+    if fill_entry is None:
+        pos_snap = _fetch_exchange_exposure(symbol)
+        if pos_snap.get("open") and pos_snap.get("entry"):
+            try:
+                fill_entry = float(pos_snap["entry"])
+            except (TypeError, ValueError):
+                fill_entry = None
+    tp_use = tp
+    if fill_entry and sl > 0:
+        recalc = recalculate_tp1_from_position(direction, fill_entry, sl)
+        if recalc and recalc > 0:
+            tp_use = _ensure_tp_ahead_of_mark(symbol, direction, recalc)
+            _persist_recalculated_tp(symbol, direction, position_entry=fill_entry, sl_val=sl, tp_val=tp_use)
+    tp_price = round_price(symbol, tp_use)
 
     try:
         sl_resp = _place_stop_loss(symbol, direction, sl_price, qty)
