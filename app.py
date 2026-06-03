@@ -124,13 +124,18 @@ SMC_EQ_TOLERANCE_PCT = float(os.getenv("SMC_EQ_TOLERANCE_PCT", "0.08"))
 SMC_PD_DISCOUNT_MAX = float(os.getenv("SMC_PD_DISCOUNT_MAX", "38"))
 SMC_PD_PREMIUM_MIN = float(os.getenv("SMC_PD_PREMIUM_MIN", "62"))
 TRADE_PLAN_DCA_STEPS = int(os.getenv("TRADE_PLAN_DCA_STEPS", "2"))
-TRADE_PLAN_DCA_STEP_PCT = float(os.getenv("TRADE_PLAN_DCA_STEP_PCT", "0.12"))
-TRADE_PLAN_SL_BUFFER_PCT = float(os.getenv("TRADE_PLAN_SL_BUFFER_PCT", "0.06"))
+TRADE_PLAN_DCA_STEP_PCT = float(os.getenv("TRADE_PLAN_DCA_STEP_PCT", "2.5"))
+TRADE_PLAN_SL_BUFFER_PCT = float(os.getenv("TRADE_PLAN_SL_BUFFER_PCT", "0.25"))
 TRADE_PLAN_TP1_RR = float(os.getenv("TRADE_PLAN_TP1_RR", "1.0"))
 TRADE_PLAN_TP2_RR = float(os.getenv("TRADE_PLAN_TP2_RR", "2.0"))
 TRADE_PLAN_PARTIAL_CLOSE_PCT = float(os.getenv("TRADE_PLAN_PARTIAL_CLOSE_PCT", "70"))
 TRADE_PLAN_TRAIL_PCT = float(os.getenv("TRADE_PLAN_TRAIL_PCT", "0.25"))
 TRADE_PLAN_INITIAL_SIZE_PCT = float(os.getenv("TRADE_PLAN_INITIAL_SIZE_PCT", "50"))
+TRADE_PLAN_EXECUTE_DCA = os.getenv("TRADE_PLAN_EXECUTE_DCA", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 DB_CONFIG_POLL_SEC = int(os.getenv("DB_CONFIG_POLL_SEC", "0"))
 
@@ -1010,18 +1015,22 @@ def compute_trade_plan(
         offset = step * step_index
         dca_price = entry * (1 - offset) if is_long else entry * (1 + offset)
         if is_long and support:
-            dca_price = max(dca_price, float(support) * (1 - buffer))
+            structure = float(support) * (1 - buffer)
+            if structure < entry:
+                dca_price = min(dca_price, structure)
         elif not is_long and resistance:
-            dca_price = min(dca_price, float(resistance) * (1 + buffer))
+            structure = float(resistance) * (1 + buffer)
+            if structure > entry:
+                dca_price = max(dca_price, structure)
         dca_prices.append(dca_price)
 
     if is_long and fvg.get("type") == "BULL" and len(dca_prices) > 1:
         fvg_mid = (float(fvg["low"]) + float(fvg["high"])) / 2
-        if fvg_mid < entry:
+        if fvg_mid < entry and fvg_mid < dca_prices[1]:
             dca_prices[1] = fvg_mid
     elif not is_long and fvg.get("type") == "BEAR" and len(dca_prices) > 1:
         fvg_mid = (float(fvg["low"]) + float(fvg["high"])) / 2
-        if fvg_mid > entry:
+        if fvg_mid > entry and fvg_mid > dca_prices[1]:
             dca_prices[1] = fvg_mid
 
     total_slots = len(dca_prices)
@@ -1037,9 +1046,10 @@ def compute_trade_plan(
     for index, dca_price in enumerate(dca_prices[1:], start=1):
         legs.append(
             {
-                "label": f"DCA {index} · {dca_size:.0f}%",
+                "label": f"DCA {index} · {dca_size:.0f}% · on valid entry",
                 "price": dca_price,
                 "size_pct": dca_size,
+                "trigger": "valid_entry",
             }
         )
 
@@ -1072,7 +1082,11 @@ def compute_trade_plan(
     return {
         "active": True,
         "signal": signal,
-        "summary": f"Suggested {signal} plan · partial {TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% at TP1",
+        "summary": (
+            f"Suggested {signal} plan · DCA on each valid entry · partial {TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% at TP1"
+            if TRADE_PLAN_EXECUTE_DCA and len(legs) > 1
+            else f"Suggested {signal} plan · partial {TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% at TP1"
+        ),
         "entry": entry,
         "avg_entry": avg_entry,
         "legs": legs,
@@ -1341,7 +1355,29 @@ def record_valid_entry(
     )
     if trade_plan and trade_plan.get("active"):
         legs = trade_plan.get("legs") or []
-        size_pct = float(legs[0]["size_pct"]) if legs else float(trade_plan.get("partial_close_pct", 50))
+        use_dca = TRADE_PLAN_EXECUTE_DCA and len(legs) > 1
+        if use_dca and execution.TRADE_PLAN_DCA_SIGNAL_DRIVEN:
+            execution._sync_dca_leg_count(SYMBOL)
+            placed = execution.dca_legs_placed(SYMBOL)
+            if execution.has_open_position(SYMBOL):
+                leg_index = placed
+            else:
+                leg_index = 0
+            if leg_index >= len(legs):
+                log_decision_event(
+                    "valid_entry_blocked",
+                    outcome="blocked",
+                    block_reason="dca_max_legs",
+                    market_snapshot=market,
+                )
+                return
+            size_pct = float(legs[leg_index]["size_pct"])
+        elif use_dca:
+            size_pct = sum(float(leg["size_pct"]) for leg in legs)
+        else:
+            size_pct = float(legs[0]["size_pct"]) if legs else float(
+                trade_plan.get("partial_close_pct", 50)
+            )
         blocked, balance_reason = execution.fleet_side_balance_blocks(
             signal,
             execution.estimate_order_notional_usdt(size_pct),

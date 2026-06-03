@@ -208,6 +208,8 @@ def build_config_snapshot(module_globals: dict[str, Any]) -> dict[str, Any]:
     snapshot["execution_mode"] = execution.EXECUTION_MODE
     snapshot["position_size_usdt"] = execution.POSITION_SIZE_USDT
     snapshot["fleet_side_balance_max_pct"] = execution.FLEET_SIDE_BALANCE_MAX_PCT
+    snapshot["trade_plan_execute_dca"] = execution.TRADE_PLAN_EXECUTE_DCA
+    snapshot["trade_plan_dca_signal_driven"] = execution.TRADE_PLAN_DCA_SIGNAL_DRIVEN
     return snapshot
 
 
