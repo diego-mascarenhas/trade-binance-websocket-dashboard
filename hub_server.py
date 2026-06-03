@@ -90,7 +90,17 @@ def health():
         "db_ready": db_store.ensure_schema() if db_store.is_enabled() else False,
         "deepseek_enabled": deepseek_advisor.is_enabled(),
         "deepseek_configured": deepseek_advisor.is_configured(),
+        "binance_keys_configured": execution.keys_configured(),
     }
+    return _cors(jsonify(payload))
+
+
+@app.route("/api/account-performance")
+def account_performance():
+    """Live wallet + realized PnL averages + projection to MILLION_GOAL_USDT."""
+    days = _int_arg("days", execution.PNL_STATS_LOOKBACK_DAYS, minimum=0, maximum=3650)
+    lookback = execution.PNL_STATS_LOOKBACK_DAYS if days == 0 else days
+    payload = execution.get_performance_snapshot(_optional_symbol(), days=lookback)
     return _cors(jsonify(payload))
 
 

@@ -15,6 +15,8 @@ const refreshBtn = document.getElementById("refresh-btn");
 const suggestionsBtn = document.getElementById("suggestions-btn");
 const suggestionsNote = document.getElementById("suggestions-note");
 const suggestionsContent = document.getElementById("suggestions-content");
+const accountKpiGrid = document.getElementById("account-kpi-grid");
+const accountNote = document.getElementById("account-note");
 let deepseekAvailable = false;
 let lastSuggestions = [];
 
@@ -83,6 +85,200 @@ function formatPnl(value) {
     const num = Number(value);
     const sign = num >= 0 ? "+" : "";
     return `${sign}${num.toFixed(2)} USDT`;
+}
+
+function formatPct(value) {
+    if (value == null || Number.isNaN(Number(value))) {
+        return "—";
+    }
+    const num = Number(value);
+    const sign = num >= 0 ? "+" : "";
+    return `${sign}${num.toFixed(2)}%`;
+}
+
+function pnlClass(value) {
+    if (value == null || Number.isNaN(Number(value))) {
+        return "";
+    }
+    const num = Number(value);
+    if (num > 0) {
+        return "pnl-up";
+    }
+    if (num < 0) {
+        return "pnl-down";
+    }
+    return "";
+}
+
+function formatGoalLabel(goal) {
+    const num = Number(goal);
+    if (!Number.isFinite(num)) {
+        return "To goal";
+    }
+    if (num >= 1_000_000) {
+        const millions = num / 1_000_000;
+        return millions === Math.floor(millions) ? `To $${millions}M` : `To $${millions.toFixed(1)}M`;
+    }
+    return `To ${num.toLocaleString()} USDT`;
+}
+
+function formatDaysToGoal(perf) {
+    const wallet = perf.wallet_usdt;
+    const remaining = perf.million_remaining_usdt;
+    const daily = perf.daily_avg_usdt;
+    const days = perf.million_days_at_avg;
+    const goal = perf.million_goal_usdt;
+
+    if (wallet == null) {
+        return { value: "—", sub: null };
+    }
+    if (remaining != null && remaining <= 0) {
+        return { value: "Goal reached", sub: `${Number(goal).toLocaleString()} USDT` };
+    }
+    if (!daily || daily <= 0) {
+        return { value: "Need +daily avg", sub: "Close trades in range with positive PnL" };
+    }
+    if (days == null) {
+        return { value: "—", sub: null };
+    }
+    const dailyText = formatPnl(daily);
+    if (days < 365) {
+        return { value: `${Math.round(days)} days`, sub: `at ${dailyText}/day` };
+    }
+    return {
+        value: `${(days / 365.25).toFixed(1)} years`,
+        sub: `${Math.round(days)} days at ${dailyText}/day`,
+    };
+}
+
+function formatBaselineHint(perf) {
+    const baseline = perf.account_baseline_usdt;
+    if (baseline == null) {
+        return null;
+    }
+    const amount = `${Number(baseline).toLocaleString(undefined, { maximumFractionDigits: 2 })} USDT`;
+    const source = perf.account_baseline_source || "file";
+    if (source === "env") {
+        return `baseline ${amount} · .env`;
+    }
+    if (source === "auto_estimated") {
+        const when = perf.account_baseline_set_at ? ` · ${perf.account_baseline_set_at}` : "";
+        return `baseline ${amount} · estimated from history${when}`;
+    }
+    if (source === "auto_first_snapshot") {
+        const when = perf.account_baseline_set_at ? ` · since ${perf.account_baseline_set_at}` : "";
+        return `baseline ${amount} · first snapshot${when}`;
+    }
+    const when = perf.account_baseline_set_at ? ` · since ${perf.account_baseline_set_at}` : "";
+    return `baseline ${amount}${when}`;
+}
+
+function renderAccountKpis(perf) {
+    if (!accountKpiGrid) {
+        return;
+    }
+    if (!perf.configured) {
+        accountKpiGrid.innerHTML = "";
+        if (accountNote) {
+            accountNote.className = "note warn account-panel-note";
+            accountNote.textContent =
+                "Binance API keys not configured — set BINANCE_API_KEY and BINANCE_SECRET_KEY in .env, then restart ./run-all.sh.";
+        }
+        return;
+    }
+
+    const lookback = perf.lookback_days || 30;
+    const goalCard = formatDaysToGoal(perf);
+    const sourceHint = {
+        db: "trade_outcomes",
+        orders_log: "orders.log",
+        none: "no closes in range",
+    }[perf.stats_source || "none"];
+
+    const cards = [
+        {
+            label: "Wallet",
+            value: formatPnl(perf.wallet_usdt).replace("+", ""),
+            sub: perf.available_usdt != null ? `${formatPnl(perf.available_usdt).replace("+", "")} available` : null,
+        },
+        {
+            label: "Unrealized (all)",
+            value: formatPnl(perf.unrealized_usdt),
+            valueClass: pnlClass(perf.unrealized_usdt),
+        },
+        {
+            label: "ROI",
+            value: perf.account_roi_pct != null ? formatPct(perf.account_roi_pct) : "—",
+            valueClass: pnlClass(perf.account_roi_pct),
+            sub: formatBaselineHint(perf),
+        },
+        {
+            label: `Realized (${lookback}d)`,
+            value: formatPnl(perf.realized_total_usdt),
+            valueClass: pnlClass(perf.realized_total_usdt),
+            sub: `${formatNumber(perf.closed_trades || 0)} closes · ${sourceHint}`,
+        },
+        {
+            label: "Daily average",
+            value: perf.daily_avg_usdt != null ? formatPnl(perf.daily_avg_usdt) : "—",
+            valueClass: pnlClass(perf.daily_avg_usdt),
+            sub: `total / ${lookback} calendar days`,
+        },
+        {
+            label: formatGoalLabel(perf.million_goal_usdt),
+            value: goalCard.value,
+            valueClass: "goal-highlight",
+            sub: goalCard.sub,
+        },
+    ];
+
+    if (perf.pair_closed_trades > 0 && perf.pair_realized_total_usdt != null) {
+        const sym = (symbolEl.value.trim().toUpperCase() || "Pair").slice(0, 12);
+        cards.splice(4, 0, {
+            label: `${sym} (${lookback}d)`,
+            value: formatPnl(perf.pair_realized_total_usdt),
+            valueClass: pnlClass(perf.pair_realized_total_usdt),
+            sub:
+                perf.pair_daily_avg_usdt != null
+                    ? `${formatPnl(perf.pair_daily_avg_usdt)}/day`
+                    : null,
+        });
+    }
+
+    accountKpiGrid.innerHTML = cards
+        .map((card) => {
+            const valueClass = card.valueClass ? ` ${card.valueClass}` : "";
+            const sub = card.sub ? `<div class="kpi-sub">${card.sub}</div>` : "";
+            return `
+                <div class="kpi">
+                    <div class="kpi-label">${card.label}</div>
+                    <div class="kpi-value${valueClass}">${card.value}</div>
+                    ${sub}
+                </div>
+            `;
+        })
+        .join("");
+
+    if (accountNote) {
+        accountNote.className = "note account-panel-note";
+        accountNote.textContent =
+            "Live from Binance Futures · daily average follows Range and Symbol filters · refreshes every 60s.";
+    }
+}
+
+async function loadAccountPerformance() {
+    try {
+        const perf = await fetchJson("/api/account-performance");
+        renderAccountKpis(perf);
+    } catch (error) {
+        if (accountKpiGrid) {
+            accountKpiGrid.innerHTML = "";
+        }
+        if (accountNote) {
+            accountNote.className = "note warn account-panel-note";
+            accountNote.textContent = `Account performance unavailable: ${error.message}`;
+        }
+    }
 }
 
 function renderKpis(overview) {
@@ -431,10 +627,13 @@ async function refresh() {
     try {
         const health = await fetchJson("/api/health");
         deepseekAvailable = Boolean(health.deepseek_enabled);
+        await loadAccountPerformance();
+
         if (!health.db_enabled) {
             statusNote.className = "note warn";
             statusNote.textContent =
-                "DB_ENABLED=false — enable MySQL in .env and restart ./run-all.sh to collect decision_events.";
+                "DB_ENABLED=false — decision event charts need MySQL. Account performance above still works with Binance keys.";
+            kpiGrid.innerHTML = "";
             return;
         }
         if (!health.db_ready) {

@@ -185,6 +185,60 @@ def get_overview(days: int | None = 7) -> dict[str, Any]:
     return row
 
 
+def get_realized_pnl_daily_stats(
+    days: int = 30,
+    *,
+    symbol: str | None = None,
+) -> dict[str, Any]:
+    """Realized PnL over a lookback window and calendar daily average (total / days)."""
+    empty = {
+        "closed_trades": 0,
+        "total_realized_pnl": 0.0,
+        "daily_avg_usdt": None,
+        "source": "none",
+    }
+    if days <= 0:
+        return empty
+
+    symbol_filter = ""
+    params: list[Any] = [days]
+    if symbol:
+        symbol_filter = " AND symbol = %s"
+        params.append(symbol.upper())
+
+    if db_store.is_enabled():
+        try:
+            conn = db_store.connect()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        SELECT
+                            COUNT(*) AS closed_trades,
+                            COALESCE(SUM(realized_pnl), 0) AS total_realized_pnl
+                        FROM trade_outcomes
+                        WHERE created_at >= NOW() - INTERVAL %s DAY{symbol_filter}
+                        """,
+                        params,
+                    )
+                    stats = cursor.fetchone() or {}
+            finally:
+                conn.close()
+        except Exception:
+            return empty
+
+        total = float(stats.get("total_realized_pnl") or 0)
+        closed = int(stats.get("closed_trades") or 0)
+        return {
+            "closed_trades": closed,
+            "total_realized_pnl": total,
+            "daily_avg_usdt": total / days if closed else None,
+            "source": "db",
+        }
+
+    return empty
+
+
 def _trade_outcomes_summary(days: int | None) -> dict[str, Any]:
     if not db_store.is_enabled():
         return {

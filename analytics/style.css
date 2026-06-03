@@ -131,6 +131,31 @@ body {
     color: #6b7280;
 }
 
+.account-panel {
+    margin-bottom: 20px;
+}
+
+.account-panel-note {
+    margin-top: 0;
+    margin-bottom: 14px;
+}
+
+.account-kpi-grid {
+    margin-bottom: 0;
+}
+
+.kpi-value.pnl-up {
+    color: #22c55e;
+}
+
+.kpi-value.pnl-down {
+    color: #ef4444;
+}
+
+.kpi-value.goal-highlight {
+    color: #60a5fa;
+}
+
 .panel-grid {
     display: grid;
     grid-template-columns: 1.4fr 1fr;

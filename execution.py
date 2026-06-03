@@ -65,6 +65,9 @@ FLEET_SIDE_BALANCE_MAX_PCT = float(os.getenv("FLEET_SIDE_BALANCE_MAX_PCT", "20")
 FLEET_EXPOSURE_CACHE_SEC = float(os.getenv("FLEET_EXPOSURE_CACHE_SEC", "8"))
 EXECUTION_BLOCK_IF_OPEN = _env_bool("EXECUTION_BLOCK_IF_OPEN", "true")
 EXECUTION_POSITION_CACHE_SEC = float(os.getenv("EXECUTION_POSITION_CACHE_SEC", "5"))
+ACCOUNT_SNAPSHOT_CACHE_SEC = float(os.getenv("ACCOUNT_SNAPSHOT_CACHE_SEC", "15"))
+PNL_STATS_LOOKBACK_DAYS = max(1, int(os.getenv("PNL_STATS_LOOKBACK_DAYS", "30")))
+MILLION_GOAL_USDT = float(os.getenv("MILLION_GOAL_USDT", "1000000"))
 BE_EXIT_PNL_MAX_USDT = float(os.getenv("BE_EXIT_PNL_MAX_USDT", "0.15"))
 BE_EXIT_PRICE_PCT = float(os.getenv("BE_EXIT_PRICE_PCT", "0.12"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
@@ -121,6 +124,9 @@ _filters_lock = threading.Lock()
 _leverage_lock = threading.Lock()
 _position_snapshot_lock = threading.Lock()
 _position_snapshot_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_account_snapshot_lock = threading.Lock()
+_account_snapshot_cache: tuple[float, dict[str, Any]] | None = None
+_baseline_lock = threading.Lock()
 _trade_context_lock = threading.Lock()
 _trade_context: dict[str, dict[str, Any]] = {}
 
@@ -715,6 +721,253 @@ def get_execution_status() -> dict[str, Any]:
     if status.get("message") in (None, "", "Execution disabled", "Ready (dry)", "Ready (live)"):
         status["message"] = _execution_status_message()
     return status
+
+
+def _optional_env_float(name: str) -> float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r — ignored", name, raw)
+        return None
+
+
+def get_account_wallet_snapshot(force: bool = False) -> dict[str, Any]:
+    """Cached Binance Futures wallet totals (shared across all pairs)."""
+    global _account_snapshot_cache
+    if not _keys_configured():
+        return {
+            "configured": False,
+            "wallet_usdt": None,
+            "available_usdt": None,
+            "unrealized_usdt": None,
+            "margin_balance_usdt": None,
+        }
+
+    now = time.monotonic()
+    with _account_snapshot_lock:
+        if (
+            not force
+            and _account_snapshot_cache
+            and now - _account_snapshot_cache[0] < ACCOUNT_SNAPSHOT_CACHE_SEC
+        ):
+            return dict(_account_snapshot_cache[1])
+
+    snapshot = {
+        "configured": True,
+        "wallet_usdt": None,
+        "available_usdt": None,
+        "unrealized_usdt": None,
+        "margin_balance_usdt": None,
+    }
+    try:
+        account = _fapi_request("GET", "/fapi/v2/account", {})
+        snapshot["wallet_usdt"] = float(account.get("totalWalletBalance", 0) or 0)
+        snapshot["available_usdt"] = float(account.get("availableBalance", 0) or 0)
+        snapshot["unrealized_usdt"] = float(account.get("totalUnrealizedProfit", 0) or 0)
+        snapshot["margin_balance_usdt"] = float(account.get("totalMarginBalance", 0) or 0)
+    except RuntimeError as exc:
+        logger.warning("Account snapshot failed: %s", exc)
+
+    with _account_snapshot_lock:
+        _account_snapshot_cache = (now, snapshot)
+    return dict(snapshot)
+
+
+def _realized_pnl_from_orders_log(days: int, symbol: str | None = None) -> dict[str, Any]:
+    """Fallback when DB is off: sum position_closed events from orders.log."""
+    path = os.path.join(LOG_DIR, "orders.log")
+    if not os.path.isfile(path):
+        return {
+            "closed_trades": 0,
+            "total_realized_pnl": 0.0,
+            "daily_avg_usdt": None,
+            "source": "none",
+        }
+
+    cutoff = time.time() - days * 86400
+    total = 0.0
+    closed = 0
+    sym = symbol.upper() if symbol else None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("event") != "position_closed":
+                    continue
+                if sym and str(record.get("symbol", "")).upper() != sym:
+                    continue
+                ts_raw = str(record.get("ts") or "")
+                try:
+                    ts_struct = time.strptime(ts_raw.replace(" UTC", ""), "%Y-%m-%d %H:%M:%S")
+                    ts_epoch = time.mktime(ts_struct)
+                except ValueError:
+                    continue
+                if ts_epoch < cutoff:
+                    continue
+                pnl = record.get("realized_pnl")
+                if pnl is None:
+                    continue
+                total += float(pnl)
+                closed += 1
+    except OSError:
+        logger.exception("Failed reading orders.log for PnL stats")
+
+    return {
+        "closed_trades": closed,
+        "total_realized_pnl": total,
+        "daily_avg_usdt": total / days if closed else None,
+        "source": "orders_log" if closed else "none",
+    }
+
+
+def _resolve_realized_pnl_stats(days: int, symbol: str | None = None) -> dict[str, Any]:
+    try:
+        import db_store
+        import db_analytics
+
+        if db_store.is_enabled():
+            return db_analytics.get_realized_pnl_daily_stats(days, symbol=symbol)
+    except Exception:
+        logger.exception("DB realized PnL stats failed")
+
+    return _realized_pnl_from_orders_log(days, symbol=symbol)
+
+
+def _account_baseline_path() -> str:
+    return os.path.join(LOG_DIR, "account_baseline.json")
+
+
+def _load_account_baseline_file() -> dict[str, Any]:
+    path = _account_baseline_path()
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        logger.warning("Could not read account_baseline.json: %s", exc)
+        return {}
+
+
+def _save_account_baseline_file(payload: dict[str, Any]) -> None:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with open(_account_baseline_path(), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def _resolve_account_baseline(
+    wallet_usdt: float | None,
+    unrealized_usdt: float | None,
+) -> tuple[float | None, str, str | None]:
+    """Baseline for account ROI. Env override, else persisted file, else auto on first snapshot."""
+    env_baseline = _optional_env_float("ACCOUNT_BASELINE_USDT")
+    if env_baseline is not None and env_baseline > 0:
+        return env_baseline, "env", None
+
+    if wallet_usdt is None or wallet_usdt <= 0:
+        return None, "none", None
+
+    with _baseline_lock:
+        stored = _load_account_baseline_file()
+        stored_baseline = stored.get("baseline_usdt")
+        if stored_baseline is not None:
+            try:
+                baseline = float(stored_baseline)
+            except (TypeError, ValueError):
+                baseline = 0.0
+            if baseline > 0:
+                return baseline, str(stored.get("source") or "file"), stored.get("set_at")
+
+        all_time = _resolve_realized_pnl_stats(3650, symbol=None)
+        realized = float(all_time.get("total_realized_pnl") or 0)
+        unrealized = float(unrealized_usdt or 0)
+        if realized != 0 or unrealized != 0:
+            estimated = wallet_usdt - realized - unrealized
+            if estimated > 0:
+                baseline = estimated
+                source = "auto_estimated"
+            else:
+                baseline = wallet_usdt
+                source = "auto_first_snapshot"
+        else:
+            baseline = wallet_usdt
+            source = "auto_first_snapshot"
+
+        set_at = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+        try:
+            _save_account_baseline_file(
+                {
+                    "baseline_usdt": baseline,
+                    "set_at": set_at,
+                    "source": source,
+                    "wallet_usdt_at_set": wallet_usdt,
+                }
+            )
+        except OSError:
+            logger.exception("Failed writing account_baseline.json")
+
+        return baseline, source, set_at
+
+
+def get_performance_snapshot(
+    symbol: str | None = None,
+    *,
+    days: int | None = None,
+) -> dict[str, Any]:
+    """Wallet, realized PnL averages, ROI baseline, and projection to MILLION_GOAL_USDT."""
+    wallet = get_account_wallet_snapshot()
+    lookback = PNL_STATS_LOOKBACK_DAYS if days is None else max(1, int(days))
+    account_stats = _resolve_realized_pnl_stats(lookback, symbol=None)
+    pair_stats = _resolve_realized_pnl_stats(lookback, symbol=symbol) if symbol else None
+
+    wallet_usdt = wallet.get("wallet_usdt")
+    daily_avg = account_stats.get("daily_avg_usdt")
+    goal = MILLION_GOAL_USDT
+    remaining = None
+    days_to_goal = None
+    if wallet_usdt is not None:
+        remaining = max(0.0, goal - wallet_usdt)
+        if daily_avg and daily_avg > 0 and remaining > 0:
+            days_to_goal = remaining / daily_avg
+        elif remaining <= 0:
+            days_to_goal = 0.0
+
+    baseline, baseline_source, baseline_set_at = _resolve_account_baseline(
+        wallet_usdt,
+        wallet.get("unrealized_usdt"),
+    )
+    account_roi_pct = None
+    if baseline and baseline > 0 and wallet_usdt is not None:
+        account_roi_pct = (wallet_usdt - baseline) / baseline * 100.0
+
+    return {
+        **wallet,
+        "lookback_days": lookback,
+        "million_goal_usdt": goal,
+        "million_remaining_usdt": remaining,
+        "million_days_at_avg": days_to_goal,
+        "account_roi_pct": account_roi_pct,
+        "account_baseline_usdt": baseline,
+        "account_baseline_source": baseline_source,
+        "account_baseline_set_at": baseline_set_at,
+        "realized_total_usdt": account_stats.get("total_realized_pnl"),
+        "daily_avg_usdt": daily_avg,
+        "closed_trades": account_stats.get("closed_trades", 0),
+        "stats_source": account_stats.get("source", "none"),
+        "pair_realized_total_usdt": pair_stats.get("total_realized_pnl") if pair_stats else None,
+        "pair_daily_avg_usdt": pair_stats.get("daily_avg_usdt") if pair_stats else None,
+        "pair_closed_trades": pair_stats.get("closed_trades", 0) if pair_stats else 0,
+    }
 
 
 def _set_status(**fields: Any) -> None:
