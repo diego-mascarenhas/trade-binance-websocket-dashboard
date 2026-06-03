@@ -54,11 +54,18 @@ h1 {
     border-radius: 10px;
     color: #c7d0db;
     font-size: 0.85rem;
-    white-space: normal;
-    min-width: 220px;
-    max-width: 440px;
-    text-align: right;
     line-height: 1.35;
+    flex: 1 1 280px;
+    min-width: 0;
+    max-width: 440px;
+}
+
+.meta-primary,
+.meta-blocks {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
 }
 
 .meta-primary {
@@ -66,10 +73,61 @@ h1 {
     color: #e8ecf1;
 }
 
-.meta-blocks {
-    margin-top: 6px;
+.meta-chip {
+    display: inline-block;
+    padding: 4px 8px;
+    border-radius: 6px;
+    background: #2a2f3a;
     font-size: 0.78rem;
+    line-height: 1.25;
+    white-space: nowrap;
+}
+
+.meta-chip-warn {
+    background: rgba(255, 193, 7, 0.12);
     color: #ffc107;
+    border: 1px solid rgba(255, 193, 7, 0.28);
+}
+
+.meta-blocks {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid #2a2f3a;
+}
+
+.meta-blocks-label {
+    flex: 0 0 100%;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: #9aa4b2;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+@media (max-width: 720px) {
+    .shell {
+        padding: 16px 14px 32px;
+    }
+
+    .header {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 12px;
+    }
+
+    h1 {
+        font-size: 1.4rem;
+    }
+
+    .meta {
+        flex: 1 1 auto;
+        max-width: none;
+        width: 100%;
+    }
+
+    .grid {
+        grid-template-columns: 1fr;
+    }
 }
 
 .protection-ok {

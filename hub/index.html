@@ -324,9 +324,18 @@
                 blocks.push("DB on");
             }
 
+            const chip = (text, extra = "") =>
+                `<span class="meta-chip ${extra}">${text}</span>`;
+
             meta.innerHTML = `
-                <div class="meta-primary">${parts.join(" · ")}</div>
-                ${blocks.length ? `<div class="meta-blocks">Blocked: ${blocks.join(" · ")}</div>` : ""}
+                <div class="meta-primary">${parts.map((p) => chip(p)).join("")}</div>
+                ${
+                    blocks.length
+                        ? `<div class="meta-blocks"><span class="meta-blocks-label">Blocked</span>${blocks
+                              .map((b) => chip(b, "meta-chip-warn"))
+                              .join("")}</div>`
+                        : ""
+                }
             `;
         }
 
@@ -341,7 +350,7 @@
                 if (!Array.isArray(pairs) || pairs.length === 0) {
                     throw new Error("No pairs configured");
                 }
-                meta.innerHTML = `<div class="meta-primary">${pairs.length} pairs</div>`;
+                meta.innerHTML = `<div class="meta-primary"><span class="meta-chip">${pairs.length} pairs</span></div>`;
                 const cards = pairs.map((pair) => {
                     const article = cardShell(pair);
                     grid.appendChild(article);
