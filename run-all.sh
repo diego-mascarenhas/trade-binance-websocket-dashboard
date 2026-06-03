@@ -3,7 +3,8 @@
 # Usage:
 #   ./run-all.sh              # default pairs
 #   ./run-all.sh stop         # stop hub + dashboards started by this script
-#   PAIRS="DOGEUSDT:8051,BNBUSDT:8052" ./run-all.sh
+#   PAIRS="DOGEUSDT:8051,BNBUSDT:8052" ./run-all.sh   # override + rewrite hub/pairs.json
+#   Edit hub/pairs.json directly — used on start unless PAIRS= is set
 #   HUB_PORT=8050 ./run-all.sh
 
 set -euo pipefail
@@ -19,23 +20,17 @@ VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
 
 DEFAULT_PAIRS=(
     "ADAUSDT:8051"
-    "APTUSDT:8052"
-    "ARBUSDT:8053"
     "ATOMUSDT:8054"
     "AVAXUSDT:8055"
     "BNBUSDT:8056"
-    "BTCUSDT:8057"
     "DOGEUSDT:8058"
     "DOTUSDT:8059"
     "ETCUSDT:8060"
     "ETHUSDT:8061"
-    "FILUSDT:8062"
-    "INJUSDT:8063"
     "LINKUSDT:8064"
     "LTCUSDT:8065"
     "NEARUSDT:8066"
     "OPUSDT:8067"
-    "POLUSDT:8068"
     "SOLUSDT:8069"
     "SUIUSDT:8070"
     "TRXUSDT:8071"
@@ -83,14 +78,36 @@ t.set_fleet_running(False, updated_by='run-all')
 
 parse_pairs() {
     PAIR_LINES=()
+    WRITE_PAIRS_JSON=0
+
     if [[ -n "${PAIRS:-}" ]]; then
         IFS=',' read -r -a _raw_pairs <<< "$PAIRS"
         for item in "${_raw_pairs[@]}"; do
             item="${item// /}"
             [[ -n "$item" ]] && PAIR_LINES+=("$item")
         done
-    else
+        WRITE_PAIRS_JSON=1
+    elif [[ -f "$PAIRS_FILE" ]] && [[ -x "$VENV_PYTHON" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && PAIR_LINES+=("$line")
+        done < <(
+            "$VENV_PYTHON" -c "
+import json
+from pathlib import Path
+rows = json.loads(Path('$PAIRS_FILE').read_text(encoding='utf-8'))
+for row in rows:
+    print(f\"{row['symbol']}:{row['port']}\")
+"
+        )
+        if [[ ${#PAIR_LINES[@]} -gt 0 ]]; then
+            log "Using hub/pairs.json (${#PAIR_LINES[@]} pairs)"
+        fi
+    fi
+
+    if [[ ${#PAIR_LINES[@]} -eq 0 ]]; then
         PAIR_LINES=("${DEFAULT_PAIRS[@]}")
+        WRITE_PAIRS_JSON=1
+        log "Using built-in default pairs (${#PAIR_LINES[@]})"
     fi
 
     if [[ ${#PAIR_LINES[@]} -eq 0 ]]; then
@@ -209,7 +226,9 @@ fi
 
 parse_pairs
 : > "$PID_FILE"
-write_pairs_json
+if [[ "${WRITE_PAIRS_JSON}" == "1" ]]; then
+    write_pairs_json
+fi
 run_db_migrate
 start_hub
 start_dashboards

@@ -381,25 +381,27 @@ def _maybe_apply_breakeven_sl(symbol: str, snapshot: dict[str, Any]) -> bool:
         return False
 
     _cancel_symbol_sl_orders(symbol, pos_dir)
+    be_sl = _ensure_sl_behind_mark(symbol, direction, be_sl)
     sl_price = round_price_for_sl(symbol, direction, be_sl)
-    try:
-        sl_resp = _place_stop_loss(symbol, pos_dir, sl_price, qty)
-        _append_orders_log(
-            "be_sl_applied",
-            symbol=symbol,
-            direction=pos_dir,
-            entry=entry,
-            sl=sl_price,
-            qty=qty,
-            closed_pct=round(closed_pct, 2),
-            peak_qty=str(peak),
-            response=sl_resp,
-        )
-    except RuntimeError as exc:
-        logger.error("%s: BE SL placement failed: %s", symbol, exc)
-        _append_orders_log("be_sl_failed", symbol=symbol, error=str(exc))
-        telegram.notify_sl_tp_failed(symbol, pos_dir, "BE SL", str(exc))
+    placed, skipped = _place_sl_for_position(symbol, pos_dir, sl_price, qty, log_suffix="_be")
+    if not placed:
+        if skipped:
+            logger.info("%s: BE SL skipped (mark through stop)", symbol)
+        else:
+            logger.error("%s: BE SL placement failed", symbol)
+            telegram.notify_sl_tp_failed(symbol, pos_dir, "BE SL", "placement failed")
         return False
+
+    _append_orders_log(
+        "be_sl_applied",
+        symbol=symbol,
+        direction=pos_dir,
+        entry=entry,
+        sl=sl_price,
+        qty=qty,
+        closed_pct=round(closed_pct, 2),
+        peak_qty=str(peak),
+    )
 
     _update_trade_context(
         symbol,
@@ -1236,14 +1238,23 @@ def _place_protection_legs(
     tp_price = round_price(symbol, tp)
 
     if need_sl:
-        try:
-            sl_resp = _place_stop_loss(symbol, direction, sl_price, qty)
-            _append_orders_log("sl_reconciled", symbol=symbol, response=sl_resp)
+        sl_adj = _ensure_sl_behind_mark(symbol, direction, sl)
+        sl_price = round_price_for_sl(symbol, direction, sl_adj)
+        placed, skipped = _place_sl_for_position(
+            symbol,
+            direction,
+            sl_price,
+            qty,
+            log_suffix="_reconciled",
+        )
+        if placed:
             result["sl"] = True
-        except RuntimeError as exc:
-            logger.error("SL reconcile failed for %s: %s", symbol, exc)
-            _append_orders_log("sl_reconcile_failed", symbol=symbol, error=str(exc))
-            telegram.notify_sl_tp_failed(symbol, direction, "SL (reconcile)", str(exc))
+        elif skipped:
+            result["sl"] = True
+        else:
+            logger.error("SL reconcile failed for %s", symbol)
+            _append_orders_log("sl_reconcile_failed", symbol=symbol, error="placement_failed")
+            telegram.notify_sl_tp_failed(symbol, direction, "SL (reconcile)", "placement failed")
 
     if need_tp:
         try:
@@ -1354,6 +1365,9 @@ def reconcile_position_protection(
             tp_val=float(tp_val),
             reason="protection_recalculated",
         )
+
+    if sl_val is not None and sl_val > 0:
+        sl_val = _ensure_sl_behind_mark(symbol, pos_dir, float(sl_val))
 
     protection = get_position_protection(symbol, pos_dir)
     summary.update(protection)
@@ -2195,6 +2209,9 @@ def _sl_order_needs_refresh(
     trigger = _get_sl_trigger_from_orders(symbol, direction)
     if trigger is None or trigger <= 0:
         return False
+    mark = _get_mark_price(symbol)
+    if mark is not None and _sl_would_trigger_immediately(direction, trigger, mark):
+        return True
     if _sl_too_close_to_entry(direction, position_entry, trigger):
         return True
     if abs(trigger - target_sl) / target_sl * 100 > SL_REPRICE_TOLERANCE_PCT:
@@ -2301,6 +2318,127 @@ def _persist_recalculated_tp(
         tp_val=tp_val,
         reason="tp_recalculated",
     )
+
+
+def _sl_would_trigger_immediately(direction: str, sl: float, mark: float) -> bool:
+    """True when SL trigger would fire at current mark (Binance -2021)."""
+    direction = direction.upper()
+    if direction == "LONG":
+        return mark <= sl
+    return mark >= sl
+
+
+def _ensure_sl_behind_mark(symbol: str, direction: str, sl: float) -> float:
+    """Nudge SL so Binance accepts it (mark not already through the stop)."""
+    mark = _get_mark_price(symbol)
+    if mark is None or mark <= 0:
+        return sl
+    filt = _load_symbol_filters(symbol)
+    tick = float(filt["tick_size"])
+    cushion = tick * 2
+    direction = direction.upper()
+    if direction == "LONG" and _sl_would_trigger_immediately(direction, sl, mark):
+        return max(mark - cushion, tick)
+    if direction == "SHORT" and _sl_would_trigger_immediately(direction, sl, mark):
+        return mark + cushion
+    return sl
+
+
+def _place_sl_for_position(
+    symbol: str,
+    direction: str,
+    sl_price: str,
+    qty: str,
+    *,
+    log_suffix: str = "",
+) -> tuple[bool, bool]:
+    """Place SL if valid vs mark. Returns (placed, skipped_immediate)."""
+    symbol = symbol.upper()
+    direction = direction.upper()
+    try:
+        sl_val = float(sl_price)
+    except (TypeError, ValueError):
+        sl_val = 0.0
+
+    mark = _get_mark_price(symbol)
+    sl_use = sl_val
+    if mark is not None and sl_val > 0 and _sl_would_trigger_immediately(direction, sl_val, mark):
+        original = sl_val
+        sl_use = _ensure_sl_behind_mark(symbol, direction, sl_val)
+        if abs(sl_use - original) > 1e-12:
+            sl_price = round_price_for_sl(symbol, direction, sl_use)
+            sl_val = float(sl_price)
+            _append_orders_log(
+                "sl_repriced_for_mark",
+                symbol=symbol,
+                direction=direction,
+                original=original,
+                sl=sl_price,
+                mark=mark,
+                context=log_suffix or "protection",
+            )
+
+    if mark is not None and sl_val > 0 and _sl_would_trigger_immediately(direction, sl_val, mark):
+        _append_orders_log(
+            "sl_skip_immediate",
+            symbol=symbol,
+            direction=direction,
+            sl=sl_price,
+            mark=mark,
+            context=log_suffix or "protection",
+        )
+        logger.info(
+            "%s: skip SL%s — mark %.8g already at/through stop %.8g (%s)",
+            symbol,
+            f" ({log_suffix})" if log_suffix else "",
+            mark,
+            sl_val,
+            direction,
+        )
+        return False, True
+
+    try:
+        sl_resp = _place_stop_loss(symbol, direction, sl_price, qty)
+        event = f"sl{log_suffix}" if log_suffix else "sl_placed"
+        _append_orders_log(event, symbol=symbol, response=sl_resp, sl=sl_price, mark=mark)
+        return True, False
+    except RuntimeError as exc:
+        if _is_immediate_trigger_error(exc):
+            retry_sl = round_price_for_sl(
+                symbol,
+                direction,
+                _ensure_sl_behind_mark(symbol, direction, sl_val),
+            )
+            if retry_sl != sl_price:
+                try:
+                    mark = _get_mark_price(symbol)
+                    retry_val = float(retry_sl)
+                    if mark is None or not _sl_would_trigger_immediately(direction, retry_val, mark):
+                        sl_resp = _place_stop_loss(symbol, direction, retry_sl, qty)
+                        _append_orders_log(
+                            f"sl{log_suffix or '_placed'}",
+                            symbol=symbol,
+                            response=sl_resp,
+                            sl=retry_sl,
+                            mark=mark,
+                            repriced=True,
+                        )
+                        return True, False
+                except RuntimeError as retry_exc:
+                    if not _is_immediate_trigger_error(retry_exc):
+                        raise
+            _append_orders_log(
+                "sl_skip_immediate",
+                symbol=symbol,
+                direction=direction,
+                sl=sl_price,
+                mark=mark,
+                error=str(exc),
+                context=log_suffix or "protection",
+            )
+            logger.info("%s: SL skipped (immediate trigger): %s", symbol, exc)
+            return False, True
+        raise
 
 
 def _tp_would_trigger_immediately(direction: str, tp: float, mark: float) -> bool:
@@ -2699,14 +2837,21 @@ def _place_sl_tp_after_fill(
             )
     tp_price = round_price(symbol, tp_use)
 
-    try:
-        sl_resp = _place_stop_loss(symbol, direction, sl_price, qty)
-        _append_orders_log("sl_placed", symbol=symbol, response=sl_resp)
+    placed_sl, skipped_sl = _place_sl_for_position(symbol, direction, sl_price, qty, log_suffix="_placed")
+    if placed_sl:
         result["sl"] = True
-    except RuntimeError as exc:
-        logger.error("SL placement failed for %s: %s", symbol, exc)
-        _append_orders_log("sl_failed", symbol=symbol, sl=sl_price, qty=qty, error=str(exc))
-        telegram.notify_sl_tp_failed(symbol, direction, "SL", str(exc))
+    elif skipped_sl:
+        _append_orders_log(
+            "sl_skipped_after_fill",
+            symbol=symbol,
+            direction=direction,
+            sl=sl_price,
+            qty=qty,
+            reason="mark_through_stop",
+        )
+    else:
+        logger.error("SL placement failed for %s", symbol)
+        telegram.notify_sl_tp_failed(symbol, direction, "SL", "reconcile failed")
 
     try:
         placed, skipped = _place_tp_for_position(symbol, direction, tp_price, qty, log_suffix="_placed")
