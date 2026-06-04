@@ -307,11 +307,25 @@ def notify_be_sl_applied(
     entry_price: str,
     runner_pct: float,
     closed_pct: float,
+    *,
+    trigger: str = "partial_close",
+    trigger_detail: str = "",
+    profit_pct: float | None = None,
 ) -> None:
+    profit_line = (
+        f"PnL +{profit_pct:.2f}%\n" if profit_pct is not None and float(profit_pct) > 0 else ""
+    )
+    if trigger == "signal":
+        context = f"Trigger: {trigger_detail or 'market'}\n{profit_line}"
+    else:
+        context = (
+            f"~{closed_pct:.0f}% closed · runner {runner_pct:.0f}%\n"
+            f"{profit_line}"
+        )
     send_shield(
         f"{symbol.upper()} futures\n"
         f"BREAK_EVEN SL · {direction}\n"
-        f"~{closed_pct:.0f}% closed · runner {runner_pct:.0f}%\n"
+        f"{context}"
         f"SL → {sl_price} (entry {entry_price})"
     )
 

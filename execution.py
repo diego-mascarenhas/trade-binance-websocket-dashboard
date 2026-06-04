@@ -81,6 +81,17 @@ TRADE_PLAN_AUTO_BE = _env_bool("TRADE_PLAN_AUTO_BE", "true")
 TRADE_PLAN_PARTIAL_CLOSE_PCT = float(os.getenv("TRADE_PLAN_PARTIAL_CLOSE_PCT", "70"))
 TRADE_PLAN_BE_BUFFER_PCT = float(os.getenv("TRADE_PLAN_BE_BUFFER_PCT", "0.05"))
 PARTIAL_CLOSE_DETECT_TOLERANCE_PCT = float(os.getenv("PARTIAL_CLOSE_DETECT_TOLERANCE_PCT", "8"))
+BE_TRIGGER_PARTIAL = _env_bool("BE_TRIGGER_PARTIAL", "true")
+BE_TRIGGER_SIGNAL = _env_bool("BE_TRIGGER_SIGNAL", "true")
+BE_MIN_PROFIT_PCT = float(os.getenv("BE_MIN_PROFIT_PCT", "0.25"))
+BE_MIN_PROFIT_USDT = float(os.getenv("BE_MIN_PROFIT_USDT", "0"))
+BE_ON_HTF_NEUTRAL = _env_bool("BE_ON_HTF_NEUTRAL", "true")
+BE_ON_HTF_AGAINST = _env_bool("BE_ON_HTF_AGAINST", "true")
+BE_ON_SMC_RANGING = _env_bool("BE_ON_SMC_RANGING", "true")
+BE_ON_RSI_EXIT = _env_bool("BE_ON_RSI_EXIT", "true")
+BE_ON_EMA_FLIP = _env_bool("BE_ON_EMA_FLIP", "false")
+BE_RSI_LONG_EXIT_MAX = float(os.getenv("BE_RSI_LONG_EXIT_MAX", os.getenv("RSI_LONG_MAX", "70")))
+BE_RSI_SHORT_EXIT_MIN = float(os.getenv("BE_RSI_SHORT_EXIT_MIN", os.getenv("RSI_SHORT_MIN", "30")))
 TP_REPRICE_TOLERANCE_PCT = float(os.getenv("TP_REPRICE_TOLERANCE_PCT", "0.5"))
 SL_REPRICE_TOLERANCE_PCT = float(os.getenv("SL_REPRICE_TOLERANCE_PCT", "0.35"))
 
@@ -342,10 +353,196 @@ def _update_position_peak_qty(symbol: str, snapshot: dict[str, Any]) -> tuple[De
     return peak, current
 
 
-def _maybe_apply_breakeven_sl(symbol: str, snapshot: dict[str, Any]) -> bool:
+def _be_meets_min_profit(snapshot: dict[str, Any]) -> bool:
+    """Require minimum unrealized gain before signal-based BE (not used for partial-close BE)."""
+    try:
+        pnl_pct = snapshot.get("unrealized_pnl_pct")
+        if pnl_pct is not None and float(pnl_pct) < BE_MIN_PROFIT_PCT:
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    if BE_MIN_PROFIT_USDT > 0:
+        try:
+            pnl_usdt = snapshot.get("unrealized_pnl")
+            if pnl_usdt is None or float(pnl_usdt) < BE_MIN_PROFIT_USDT:
+                return False
+        except (TypeError, ValueError):
+            return False
+
+    try:
+        if snapshot.get("unrealized_pnl") is not None and float(snapshot["unrealized_pnl"]) <= 0:
+            return False
+    except (TypeError, ValueError):
+        pass
+    return True
+
+
+def _be_signal_trigger_reason(
+    direction: str,
+    market_analysis: dict[str, Any] | None,
+) -> str | None:
+    """Why signal-based BE fired (any enabled rule). None if no rule matched."""
+    if not market_analysis:
+        return None
+
+    direction = direction.upper()
+    htf = str(market_analysis.get("htf_bias") or "NEUTRAL").upper()
+    smc = market_analysis.get("smc") if isinstance(market_analysis.get("smc"), dict) else {}
+    smc_trend = str(smc.get("trend") or "RANGING").upper()
+    rsi = market_analysis.get("rsi")
+    ema_cross = str(market_analysis.get("ema_cross") or "")
+    hits: list[str] = []
+
+    if direction == "LONG":
+        if BE_ON_HTF_NEUTRAL and htf == "NEUTRAL":
+            hits.append("htf_neutral")
+        if BE_ON_HTF_AGAINST and htf == "BEARISH":
+            hits.append("htf_bearish")
+        if BE_ON_SMC_RANGING and smc_trend == "RANGING":
+            hits.append("smc_ranging")
+        if BE_ON_RSI_EXIT and rsi is not None:
+            try:
+                if float(rsi) < BE_RSI_LONG_EXIT_MAX:
+                    hits.append(f"rsi_{float(rsi):.0f}")
+            except (TypeError, ValueError):
+                pass
+        if BE_ON_EMA_FLIP and ema_cross == "Bear cross":
+            hits.append("ema_bear_cross")
+    elif direction == "SHORT":
+        if BE_ON_HTF_NEUTRAL and htf == "NEUTRAL":
+            hits.append("htf_neutral")
+        if BE_ON_HTF_AGAINST and htf == "BULLISH":
+            hits.append("htf_bullish")
+        if BE_ON_SMC_RANGING and smc_trend == "RANGING":
+            hits.append("smc_ranging")
+        if BE_ON_RSI_EXIT and rsi is not None:
+            try:
+                if float(rsi) > BE_RSI_SHORT_EXIT_MIN:
+                    hits.append(f"rsi_{float(rsi):.0f}")
+            except (TypeError, ValueError):
+                pass
+        if BE_ON_EMA_FLIP and ema_cross == "Bull cross":
+            hits.append("ema_bull_cross")
+
+    return ",".join(hits) if hits else None
+
+
+def _be_partial_close_trigger(
+    symbol: str,
+    snapshot: dict[str, Any],
+) -> tuple[bool, float, float, float]:
+    """True when ~TP1 partial size has been closed (legacy BE path)."""
+    peak, current = _update_position_peak_qty(symbol, snapshot)
+    if peak <= 0 or current <= 0:
+        return False, 0.0, peak, current
+
+    closed_pct = float((peak - current) / peak * 100)
+    trigger_threshold = max(
+        TRADE_PLAN_PARTIAL_CLOSE_PCT - PARTIAL_CLOSE_DETECT_TOLERANCE_PCT,
+        50.0,
+    )
+    if closed_pct < trigger_threshold:
+        return False, closed_pct, peak, current
+    return True, closed_pct, peak, current
+
+
+def _apply_breakeven_sl(
+    symbol: str,
+    snapshot: dict[str, Any],
+    *,
+    trigger: str,
+    trigger_detail: str,
+    closed_pct: float,
+    peak: Decimal,
+    current: Decimal,
+) -> bool:
+    symbol = symbol.upper()
+    ctx = _get_trade_context(symbol)
+    direction = _primary_position_direction(snapshot.get("direction")) or _primary_position_direction(
+        ctx.get("direction")
+    )
+    if direction not in ("LONG", "SHORT"):
+        return False
+
+    entry_raw = snapshot.get("entry") or ctx.get("entry")
+    try:
+        entry = float(entry_raw) if entry_raw not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        entry = 0.0
+    if entry <= 0:
+        logger.warning("%s: cannot apply BE — missing entry", symbol)
+        return False
+
+    pos_dir = direction
+    qty = _position_qty_string(symbol, pos_dir)
+    if not qty:
+        return False
+
+    _cancel_symbol_sl_orders(symbol, pos_dir)
+    be_sl = _ensure_sl_behind_mark(symbol, direction, breakeven_sl_price(direction, entry))
+    sl_price = round_price_for_sl(symbol, direction, be_sl)
+    placed, skipped = _place_sl_for_position(symbol, pos_dir, sl_price, qty, log_suffix="_be")
+    if not placed:
+        if skipped:
+            logger.info("%s: BE SL skipped (mark through stop)", symbol)
+        else:
+            logger.error("%s: BE SL placement failed", symbol)
+            telegram.notify_sl_tp_failed(symbol, pos_dir, "BE SL", "placement failed")
+        return False
+
+    pnl_pct = snapshot.get("unrealized_pnl_pct")
+    _append_orders_log(
+        "be_sl_applied",
+        symbol=symbol,
+        direction=pos_dir,
+        entry=entry,
+        sl=sl_price,
+        qty=qty,
+        trigger=trigger,
+        trigger_detail=trigger_detail,
+        closed_pct=round(closed_pct, 2),
+        peak_qty=str(peak),
+        unrealized_pnl_pct=pnl_pct,
+    )
+
+    _update_trade_context(
+        symbol,
+        be_applied=True,
+        sl=sl_price,
+        entry=round_price(symbol, entry),
+        direction=pos_dir,
+    )
+    _invalidate_position_cache(symbol)
+    runner_pct = max(0.0, float(current / peak * 100)) if peak > 0 else 100.0
+    if telegram.is_configured():
+        telegram.notify_be_sl_applied(
+            symbol,
+            pos_dir,
+            sl_price,
+            format_price_human(entry),
+            runner_pct,
+            closed_pct,
+            trigger=trigger,
+            trigger_detail=trigger_detail,
+            profit_pct=pnl_pct,
+        )
+    _set_status(
+        message=f"BE SL ({trigger}) · {symbol} {pos_dir} @ {sl_price}",
+        last_event="be_sl_applied",
+    )
+    return True
+
+
+def _maybe_apply_breakeven_sl(
+    symbol: str,
+    snapshot: dict[str, Any],
+    market_analysis: dict[str, Any] | None = None,
+) -> bool:
     """
-    After ~TRADE_PLAN_PARTIAL_CLOSE_PCT of the position is closed, move SL to break-even
-    on the remaining qty (default on).
+    Move SL to break-even when:
+    - signal: HTF neutral/against, SMC ranging, RSI exit, etc. + min profit (BE_TRIGGER_SIGNAL)
+    - partial: ~TRADE_PLAN_PARTIAL_CLOSE_PCT of qty closed after TP1 (BE_TRIGGER_PARTIAL)
     """
     if not TRADE_PLAN_AUTO_BE or not REST_PLACE_SL_TP:
         return False
@@ -363,79 +560,37 @@ def _maybe_apply_breakeven_sl(symbol: str, snapshot: dict[str, Any]) -> bool:
     if direction not in ("LONG", "SHORT"):
         return False
 
+    _attach_unrealized_pnl_pct(snapshot)
     peak, current = _update_position_peak_qty(symbol, snapshot)
-    if peak <= 0 or current <= 0:
-        return False
+    closed_pct = float((peak - current) / peak * 100) if peak > 0 else 0.0
 
-    closed_pct = float((peak - current) / peak * 100)
-    trigger_threshold = max(
-        TRADE_PLAN_PARTIAL_CLOSE_PCT - PARTIAL_CLOSE_DETECT_TOLERANCE_PCT,
-        50.0,
-    )
-    if closed_pct < trigger_threshold:
-        return False
+    if BE_TRIGGER_SIGNAL and market_analysis and _be_meets_min_profit(snapshot):
+        signal_reason = _be_signal_trigger_reason(direction, market_analysis)
+        if signal_reason:
+            return _apply_breakeven_sl(
+                symbol,
+                snapshot,
+                trigger="signal",
+                trigger_detail=signal_reason,
+                closed_pct=closed_pct,
+                peak=peak,
+                current=current,
+            )
 
-    entry_raw = snapshot.get("entry") or ctx.get("entry")
-    try:
-        entry = float(entry_raw) if entry_raw not in (None, "") else 0.0
-    except (TypeError, ValueError):
-        entry = 0.0
-    if entry <= 0:
-        logger.warning("%s: cannot apply BE — missing entry", symbol)
-        return False
+    if BE_TRIGGER_PARTIAL:
+        partial_ok, partial_closed, peak, current = _be_partial_close_trigger(symbol, snapshot)
+        if partial_ok:
+            return _apply_breakeven_sl(
+                symbol,
+                snapshot,
+                trigger="partial_close",
+                trigger_detail=f"closed_{partial_closed:.0f}pct",
+                closed_pct=partial_closed,
+                peak=peak,
+                current=current,
+            )
 
-    be_sl = breakeven_sl_price(direction, entry)
-    pos_dir = direction
-    qty = _position_qty_string(symbol, pos_dir)
-    if not qty:
-        return False
-
-    _cancel_symbol_sl_orders(symbol, pos_dir)
-    be_sl = _ensure_sl_behind_mark(symbol, direction, be_sl)
-    sl_price = round_price_for_sl(symbol, direction, be_sl)
-    placed, skipped = _place_sl_for_position(symbol, pos_dir, sl_price, qty, log_suffix="_be")
-    if not placed:
-        if skipped:
-            logger.info("%s: BE SL skipped (mark through stop)", symbol)
-        else:
-            logger.error("%s: BE SL placement failed", symbol)
-            telegram.notify_sl_tp_failed(symbol, pos_dir, "BE SL", "placement failed")
-        return False
-
-    _append_orders_log(
-        "be_sl_applied",
-        symbol=symbol,
-        direction=pos_dir,
-        entry=entry,
-        sl=sl_price,
-        qty=qty,
-        closed_pct=round(closed_pct, 2),
-        peak_qty=str(peak),
-    )
-
-    _update_trade_context(
-        symbol,
-        be_applied=True,
-        sl=sl_price,
-        entry=round_price(symbol, entry),
-        direction=pos_dir,
-    )
-    _invalidate_position_cache(symbol)
-    runner_pct = max(0.0, float(current / peak * 100))
-    if telegram.is_configured():
-        telegram.notify_be_sl_applied(
-            symbol,
-            pos_dir,
-            sl_price,
-            format_price_human(entry),
-            runner_pct,
-            closed_pct,
-        )
-    _set_status(
-        message=f"BE SL · {symbol} {pos_dir} @ {sl_price} · runner {runner_pct:.0f}%",
-        last_event="be_sl_applied",
-    )
-    return True
+    return False
 
 
 def format_price_human(price: float) -> str:
@@ -1777,6 +1932,7 @@ def run_execution_maintenance(
     direction: str | None = None,
     sl: float | None = None,
     tp: float | None = None,
+    market_analysis: dict[str, Any] | None = None,
 ) -> None:
     """Periodic: cancel stale entry limits; repair missing SL/TP on open positions."""
     if not EXECUTION_ENABLED or not _keys_configured() or EXECUTION_MODE != "live":
@@ -1794,7 +1950,7 @@ def run_execution_maintenance(
     _sync_dca_leg_count(symbol)
     snapshot = _fetch_exchange_exposure(symbol)
     if snapshot.get("open"):
-        _maybe_apply_breakeven_sl(symbol, snapshot)
+        _maybe_apply_breakeven_sl(symbol, snapshot, market_analysis)
     reconcile_position_protection(symbol, direction=direction, sl=sl, tp=tp)
 
 

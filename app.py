@@ -1084,6 +1084,23 @@ def compute_trade_plan(
     risk_pct = abs(avg_entry - sl) / avg_entry * 100
     reward_tp1_pct = abs(tp1 - avg_entry) / avg_entry * 100
 
+    if not execution.TRADE_PLAN_AUTO_BE:
+        breakeven_note = (
+            f"At TP1: close {TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% → SL to BE "
+            f"({format_price(avg_entry)}) on runner {runner_pct:.0f}% (auto BE off)"
+        )
+    elif execution.BE_TRIGGER_SIGNAL:
+        breakeven_note = (
+            f"Signal BE: HTF neutral/against, SMC ranging, RSI — min +"
+            f"{execution.BE_MIN_PROFIT_PCT:.2f}% · or ~{TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% "
+            f"closed → SL {format_price(avg_entry)}"
+        )
+    else:
+        breakeven_note = (
+            f"At ~{TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% closed → auto SL to BE "
+            f"({format_price(avg_entry)}) on runner {runner_pct:.0f}%"
+        )
+
     return {
         "active": True,
         "signal": signal,
@@ -1101,15 +1118,7 @@ def compute_trade_plan(
         "partial_close_pct": TRADE_PLAN_PARTIAL_CLOSE_PCT,
         "runner_pct": runner_pct,
         "breakeven_price": avg_entry,
-        "breakeven_note": (
-            f"At ~{TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% closed → auto SL to BE "
-            f"({format_price(avg_entry)}) on runner {runner_pct:.0f}%"
-            if execution.TRADE_PLAN_AUTO_BE
-            else (
-                f"At TP1: close {TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% → SL to BE "
-                f"({format_price(avg_entry)}) on runner {runner_pct:.0f}% (auto BE off)"
-            )
-        ),
+        "breakeven_note": breakeven_note,
         "trail_pct": TRADE_PLAN_TRAIL_PCT,
         "trail_note": (
             f"Trail remaining {runner_pct:.0f}% at {TRADE_PLAN_TRAIL_PCT:.2f}% "
@@ -2157,9 +2166,10 @@ def get_candles_df() -> pd.DataFrame:
                 direction=maintain_plan.get("signal"),
                 sl=float(maintain_plan["sl"]) if maintain_plan.get("sl") else None,
                 tp=float(maintain_plan["tp1"]) if maintain_plan.get("tp1") else None,
+                market_analysis=market_analysis,
             )
         else:
-            execution.run_execution_maintenance(SYMBOL)
+            execution.run_execution_maintenance(SYMBOL, market_analysis=market_analysis)
         metrics["execution"] = {
             **execution.get_execution_status(),
             "position": exposure,
