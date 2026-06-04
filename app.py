@@ -1091,9 +1091,8 @@ def compute_trade_plan(
         )
     elif execution.BE_TRIGGER_SIGNAL:
         breakeven_note = (
-            f"Signal BE: HTF neutral/against, SMC ranging, RSI — min +"
-            f"{execution.BE_MIN_PROFIT_PCT:.2f}% · or ~{TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}% "
-            f"closed → SL {format_price(avg_entry)}"
+            f"Profit lock: SL locks min +{execution.BE_MIN_PROFIT_PCT:.2f}% "
+            f"(or current PnL) on HTF/SMC/RSI signal · partial ~{TRADE_PLAN_PARTIAL_CLOSE_PCT:.0f}%"
         )
     else:
         breakeven_note = (

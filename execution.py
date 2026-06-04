@@ -92,6 +92,9 @@ BE_ON_RSI_EXIT = _env_bool("BE_ON_RSI_EXIT", "true")
 BE_ON_EMA_FLIP = _env_bool("BE_ON_EMA_FLIP", "false")
 BE_RSI_LONG_EXIT_MAX = float(os.getenv("BE_RSI_LONG_EXIT_MAX", os.getenv("RSI_LONG_MAX", "70")))
 BE_RSI_SHORT_EXIT_MIN = float(os.getenv("BE_RSI_SHORT_EXIT_MIN", os.getenv("RSI_SHORT_MIN", "30")))
+BE_USE_SPREAD = _env_bool("BE_USE_SPREAD", "true")
+BE_SPREAD_MULTIPLIER = float(os.getenv("BE_SPREAD_MULTIPLIER", "1.0"))
+BE_LOCK_CURRENT_PROFIT = _env_bool("BE_LOCK_CURRENT_PROFIT", "true")
 TP_REPRICE_TOLERANCE_PCT = float(os.getenv("TP_REPRICE_TOLERANCE_PCT", "0.5"))
 SL_REPRICE_TOLERANCE_PCT = float(os.getenv("SL_REPRICE_TOLERANCE_PCT", "0.35"))
 
@@ -314,17 +317,93 @@ def reset_dca_state(symbol: str) -> None:
     )
 
 
-def breakeven_sl_price(direction: str, entry: float) -> float:
-    """SL at break-even (+ buffer) for the remaining runner."""
+def _fetch_book_spread(symbol: str) -> float | None:
+    """Best ask − best bid from Binance bookTicker (live spread)."""
+    try:
+        data = _fapi_public_get("/fapi/v1/ticker/bookTicker", {"symbol": symbol.upper()})
+        bid = float(data.get("bidPrice") or 0)
+        ask = float(data.get("askPrice") or 0)
+        if bid > 0 and ask > 0 and ask >= bid:
+            return ask - bid
+    except (RuntimeError, TypeError, ValueError) as exc:
+        logger.debug("%s: bookTicker spread unavailable: %s", symbol, exc)
+    return None
+
+
+def _spread_offset(spread_abs: float | None) -> float:
+    if BE_USE_SPREAD and spread_abs is not None and spread_abs > 0:
+        return spread_abs * BE_SPREAD_MULTIPLIER
+    return 0.0
+
+
+def _resolve_lock_profit_pct(snapshot: dict[str, Any]) -> float:
+    """% gain to lock when moving SL (min floor + optional full unrealized)."""
+    lock = max(0.0, BE_MIN_PROFIT_PCT)
+    try:
+        unrealized_pct = float(snapshot.get("unrealized_pnl_pct") or 0)
+    except (TypeError, ValueError):
+        unrealized_pct = 0.0
+    if BE_LOCK_CURRENT_PROFIT and unrealized_pct > lock:
+        lock = unrealized_pct
+    return lock
+
+
+def profit_protect_sl_price(
+    direction: str,
+    entry: float,
+    *,
+    lock_profit_pct: float,
+    spread_abs: float | None = None,
+) -> float:
+    """
+    Stop that locks at least lock_profit_pct unrealized gain.
+
+    SHORT in profit: SL below entry (stop buy when price rallies to lock level).
+    LONG in profit: SL above entry (stop sell when price dips to lock level).
+    """
     direction = direction.upper()
-    buffer = TRADE_PLAN_BE_BUFFER_PCT / 100
     if entry <= 0:
         return entry
-    if direction == "LONG":
-        return entry * (1 - buffer)
+
+    spread_part = _spread_offset(spread_abs)
+    pct_offset = entry * (TRADE_PLAN_BE_BUFFER_PCT / 100)
+    lock = max(0.0, float(lock_profit_pct))
+
+    if lock <= 0:
+        if direction == "LONG":
+            return entry - spread_part - pct_offset
+        if direction == "SHORT":
+            return entry + spread_part + pct_offset
+        return entry
+
     if direction == "SHORT":
-        return entry * (1 + buffer)
+        return entry * (1 - lock / 100) - spread_part - pct_offset
+    if direction == "LONG":
+        return entry * (1 + lock / 100) - spread_part - pct_offset
     return entry
+
+
+def breakeven_sl_price(
+    direction: str,
+    entry: float,
+    *,
+    spread_abs: float | None = None,
+) -> float:
+    """Legacy entry-level BE (0% lock). Prefer profit_protect_sl_price when in profit."""
+    return profit_protect_sl_price(
+        direction,
+        entry,
+        lock_profit_pct=0.0,
+        spread_abs=spread_abs,
+    )
+
+
+def round_price_for_profit_sl(symbol: str, direction: str, value: float) -> str:
+    """Round protective stop — favor locking more profit (DOWN)."""
+    filt = _load_symbol_filters(symbol)
+    tick = filt["tick_size"]
+    quantized = Decimal(str(value)).quantize(tick, rounding=ROUND_DOWN)
+    return format(quantized, "f")
 
 
 def _position_qty_decimal(snapshot: dict[str, Any]) -> Decimal:
@@ -480,8 +559,16 @@ def _apply_breakeven_sl(
         return False
 
     _cancel_symbol_sl_orders(symbol, pos_dir)
-    be_sl = _ensure_sl_behind_mark(symbol, direction, breakeven_sl_price(direction, entry))
-    sl_price = round_price_for_sl(symbol, direction, be_sl)
+    spread_abs = _fetch_book_spread(symbol)
+    lock_pct = _resolve_lock_profit_pct(snapshot)
+    be_raw = profit_protect_sl_price(
+        direction,
+        entry,
+        lock_profit_pct=lock_pct,
+        spread_abs=spread_abs,
+    )
+    be_sl = _ensure_sl_behind_mark(symbol, direction, be_raw)
+    sl_price = round_price_for_profit_sl(symbol, direction, be_sl)
     placed, skipped = _place_sl_for_position(symbol, pos_dir, sl_price, qty, log_suffix="_be")
     if not placed:
         if skipped:
@@ -504,6 +591,9 @@ def _apply_breakeven_sl(
         closed_pct=round(closed_pct, 2),
         peak_qty=str(peak),
         unrealized_pnl_pct=pnl_pct,
+        spread_abs=spread_abs,
+        be_raw=be_raw,
+        lock_profit_pct=round(lock_pct, 4),
     )
 
     _update_trade_context(
@@ -526,9 +616,11 @@ def _apply_breakeven_sl(
             trigger=trigger,
             trigger_detail=trigger_detail,
             profit_pct=pnl_pct,
+            spread_abs=spread_abs,
+            lock_profit_pct=lock_pct,
         )
     _set_status(
-        message=f"BE SL ({trigger}) · {symbol} {pos_dir} @ {sl_price}",
+        message=f"Profit lock SL ({trigger}) · {symbol} {pos_dir} @ {sl_price} · lock {lock_pct:.2f}%",
         last_event="be_sl_applied",
     )
     return True
@@ -1810,7 +1902,15 @@ def reconcile_position_protection(
     sl_changed = False
     if entry_f is not None and entry_f > 0:
         if ctx.get("be_applied") in (True, "true", "1", 1):
-            be_sl = breakeven_sl_price(pos_dir, entry_f)
+            _attach_unrealized_pnl_pct(snapshot)
+            lock_pct = _resolve_lock_profit_pct(snapshot)
+            spread_abs = _fetch_book_spread(symbol)
+            be_sl = profit_protect_sl_price(
+                pos_dir,
+                entry_f,
+                lock_profit_pct=lock_pct,
+                spread_abs=spread_abs,
+            )
             if sl_val is None or abs(float(sl_val or 0) - be_sl) > 1e-12:
                 sl_val = be_sl
                 sl_changed = True
