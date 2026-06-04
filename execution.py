@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 import hashlib
 import hmac
 import json
@@ -70,6 +71,7 @@ PNL_STATS_LOOKBACK_DAYS = max(1, int(os.getenv("PNL_STATS_LOOKBACK_DAYS", "30"))
 MILLION_GOAL_USDT = float(os.getenv("MILLION_GOAL_USDT", "1000000"))
 BE_EXIT_PNL_MAX_USDT = float(os.getenv("BE_EXIT_PNL_MAX_USDT", "0.15"))
 BE_EXIT_PRICE_PCT = float(os.getenv("BE_EXIT_PRICE_PCT", "0.12"))
+EXIT_NOTIFY_MAX_AGE_SEC = max(60, int(os.getenv("EXIT_NOTIFY_MAX_AGE_SEC", "900")))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 TRADE_PLAN_EXECUTE_DCA = _env_bool("TRADE_PLAN_EXECUTE_DCA", "true")
 TRADE_PLAN_DCA_SIGNAL_DRIVEN = _env_bool("TRADE_PLAN_DCA_SIGNAL_DRIVEN", "true")
@@ -727,9 +729,28 @@ def _format_realized_pnl(pnl: float) -> str:
     return f"{sign}{pnl:.2f} USDT"
 
 
-def _fetch_last_realized_trade(symbol: str) -> dict[str, Any] | None:
+def _entry_opened_at_ms(ctx: dict[str, Any]) -> int | None:
+    raw = ctx.get("entry_opened_at")
+    if not raw:
+        return None
+    try:
+        opened = time.strptime(str(raw).strip(), "%Y-%m-%d %H:%M:%S UTC")
+        return int(calendar.timegm(opened) * 1000)
+    except ValueError:
+        return None
+
+
+def _fetch_last_realized_trade(
+    symbol: str,
+    *,
+    since_ms: int | None = None,
+    max_age_sec: int | None = None,
+    exclude_trade_id: Any = None,
+) -> dict[str, Any] | None:
     if not _keys_configured():
         return None
+    max_age_sec = EXIT_NOTIFY_MAX_AGE_SEC if max_age_sec is None else max_age_sec
+    cutoff_ms = int(time.time() * 1000) - max_age_sec * 1000
     try:
         resp = _fapi_request("GET", "/fapi/v1/userTrades", {"symbol": symbol.upper(), "limit": 30})
     except RuntimeError as exc:
@@ -738,6 +759,18 @@ def _fetch_last_realized_trade(symbol: str) -> dict[str, Any] | None:
     if not isinstance(resp, list):
         return None
     for row in reversed(resp):
+        try:
+            trade_ms = int(row.get("time") or 0)
+        except (TypeError, ValueError):
+            trade_ms = 0
+        if trade_ms <= 0 or trade_ms < cutoff_ms:
+            continue
+        if since_ms is not None and trade_ms < since_ms:
+            continue
+        trade_id = row.get("id")
+        if exclude_trade_id is not None and trade_id is not None:
+            if str(trade_id) == str(exclude_trade_id):
+                continue
         try:
             pnl = float(row.get("realizedPnl", 0) or 0)
         except (TypeError, ValueError):
@@ -750,7 +783,13 @@ def _fetch_last_realized_trade(symbol: str) -> dict[str, Any] | None:
             price = 0.0
         if price <= 0:
             continue
-        return {"price": price, "qty": row.get("qty"), "realized_pnl": pnl}
+        return {
+            "price": price,
+            "qty": row.get("qty"),
+            "realized_pnl": pnl,
+            "trade_id": trade_id,
+            "time_ms": trade_ms,
+        }
     return None
 
 
@@ -850,6 +889,7 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
             "was_open": True,
             "direction": snapshot.get("direction") or ctx.get("direction"),
             "exit_notified": False,
+            "last_exit_trade_id": None,
         }
         if not ctx.get("entry_opened_at"):
             open_fields["entry_opened_at"] = time.strftime(
@@ -870,8 +910,16 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
     entry_raw = ctx.get("entry")
     entry = float(entry_raw) if entry_raw not in (None, "") else None
 
-    trade = _fetch_last_realized_trade(symbol)
+    trade = _fetch_last_realized_trade(
+        symbol,
+        since_ms=_entry_opened_at_ms(ctx),
+        exclude_trade_id=ctx.get("last_exit_trade_id"),
+    )
     if not trade:
+        logger.info(
+            "%s: position flat but no recent realized fill (was_open stale or already notified)",
+            symbol,
+        )
         _update_trade_context(
             symbol,
             was_open=False,
@@ -908,6 +956,7 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
         symbol,
         was_open=False,
         exit_notified=True,
+        last_exit_trade_id=trade.get("trade_id"),
         dca_legs_placed=0,
         dca_max_legs=0,
         be_applied=False,
