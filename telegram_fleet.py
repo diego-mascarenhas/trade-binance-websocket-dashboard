@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import fapi_watch
 import telegram_notify as telegram
 
 logger = logging.getLogger(__name__)
@@ -178,6 +179,7 @@ def main() -> None:
     telegram.set_fleet_running(True, updated_by="run-all")
     telegram.notify_fleet_started(len(pairs), HUB_PORT)
     telegram.start_command_listener(build_fleet_status)
+    fapi_watch.start_background_watch()
 
     stop = False
 
@@ -193,6 +195,7 @@ def main() -> None:
     while not stop:
         time.sleep(1)
 
+    fapi_watch.stop_background_watch()
     telegram.shutdown_fleet()
 
 

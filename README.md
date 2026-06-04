@@ -202,6 +202,17 @@ curl -s --max-time 5 "https://api.telegram.org"
 
 If that times out, fix firewall/DNS — **trades on Binance still work**; only Telegram alerts/commands are affected.
 
+### Futures API block watcher (403 / CloudFront)
+
+With `./run-all.sh`, `telegram_fleet.py` runs `fapi_watch` in a background thread (default every **5 min**). On block it pauses trading (same as `/stop`) and sends Telegram; on recovery it notifies but does not auto-resume (`/start`).
+
+```bash
+# Optional one-off / dry-run (cron not required)
+.venv/bin/python scripts/check_fapi_health.py --dry-run
+```
+
+Env: `FAPI_WATCH_ENABLED`, `FAPI_WATCH_INTERVAL_SEC` (probe interval), `FAPI_WATCH_COOLDOWN_SEC` (min gap between repeat Telegram alerts while still blocked).
+
 ## Hosting
 
 The dashboard can run on any machine with Python (local dev, VPS, or dedicated server). If you need hosting, you can rent a VPS at **REVISION ALPHA**.
