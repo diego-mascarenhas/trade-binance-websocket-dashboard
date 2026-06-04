@@ -2385,6 +2385,46 @@ def estimate_order_notional_usdt(size_pct: float = 100.0) -> float:
     return _calculate_notional_usdt() * (max(float(size_pct), 0.0) / 100.0)
 
 
+def wallet_pct_from_notional_usdt(notional_usdt: float) -> float:
+    """Convert a USDT order size into % of the wallet slice used for sizing."""
+    base = _calculate_notional_usdt()
+    if base <= 0:
+        return 0.0
+    return max(float(notional_usdt), 0.0) / base * 100.0
+
+
+def calculate_quantity_for_notional(
+    symbol: str,
+    entry_price: float,
+    notional_usdt: float,
+) -> str:
+    """Qty from explicit USDT notional (DCA adds anchored to entry volume)."""
+    if entry_price <= 0:
+        raise ValueError("Invalid entry price for quantity")
+    if notional_usdt <= 0:
+        raise ValueError("Invalid order notional")
+    qty = float(notional_usdt) / entry_price
+    filt = _load_symbol_filters(symbol)
+    qty_str = round_qty(symbol, qty)
+    if Decimal(qty_str) < filt["min_qty"]:
+        qty_str = format(filt["min_qty"], "f")
+    if Decimal(qty_str) * Decimal(str(entry_price)) < filt["min_notional"]:
+        raise ValueError(f"Order notional below minimum for {symbol}")
+    return qty_str
+
+
+def resolve_leg_order_quantity(
+    symbol: str,
+    entry_price: float,
+    *,
+    size_pct: float,
+    size_usdt: float | None = None,
+) -> str:
+    if size_usdt is not None and float(size_usdt) > 0:
+        return calculate_quantity_for_notional(symbol, entry_price, float(size_usdt))
+    return _calculate_quantity(symbol, entry_price, size_pct)
+
+
 def _position_adverse_for_dca(
     symbol: str,
     direction: str,
@@ -3642,6 +3682,7 @@ def _execute_open(
     *,
     leg_index: int = 0,
     dca_max_legs: int = 0,
+    size_usdt: float | None = None,
 ) -> None:
     global _last_execution_monotonic
 
@@ -3656,7 +3697,12 @@ def _execute_open(
     qty_entry = _entry_price_for_quantity(symbol, entry, use_market=use_market)
     price_str = round_price(symbol, entry)
     try:
-        qty = _calculate_quantity(symbol, qty_entry, size_pct)
+        qty = resolve_leg_order_quantity(
+            symbol,
+            qty_entry,
+            size_pct=size_pct,
+            size_usdt=size_usdt,
+        )
     except ValueError as exc:
         _set_status(message=str(exc), last_event="error")
         _append_orders_log("error", symbol=symbol, error=str(exc))
@@ -3670,6 +3716,7 @@ def _execute_open(
         "tp": round_price(symbol, tp),
         "qty": qty,
         "size_pct": size_pct,
+        "size_usdt": size_usdt,
         "mode": EXECUTION_MODE,
         "entry_type": "MARKET" if use_market else "LIMIT",
         "leverage_mode": LEVERAGE_MODE,
@@ -3827,6 +3874,8 @@ def _execute_signal_dca_add(
     max_legs: int,
     reasons: str,
     plan_fingerprint: str,
+    *,
+    size_usdt: float | None = None,
 ) -> None:
     """Place one add-on limit when a new valid entry fires with an open position."""
     global _last_execution_monotonic
@@ -3847,7 +3896,12 @@ def _execute_signal_dca_add(
 
     price_str = round_price(symbol, entry)
     try:
-        qty = _calculate_quantity(symbol, entry, size_pct)
+        qty = resolve_leg_order_quantity(
+            symbol,
+            entry,
+            size_pct=size_pct,
+            size_usdt=size_usdt,
+        )
     except ValueError as exc:
         _set_status(message=str(exc), last_event="error")
         _append_orders_log("error", symbol=symbol, error=str(exc), leg=leg_index)
@@ -4063,8 +4117,14 @@ def _execute_open_dca(
         use_market = _use_market_for_first_leg(index)
         qty_price = _entry_price_for_quantity(symbol, price, use_market=use_market)
         price_str = round_price(symbol, price)
+        leg_usdt = leg.get("size_usdt")
         try:
-            qty = _calculate_quantity(symbol, qty_price, size_pct)
+            qty = resolve_leg_order_quantity(
+                symbol,
+                qty_price,
+                size_pct=size_pct,
+                size_usdt=float(leg_usdt) if leg_usdt is not None else None,
+            )
         except ValueError as exc:
             _set_status(message=str(exc), last_event="error")
             _append_orders_log("error", symbol=symbol, error=str(exc), leg=index)
@@ -4082,6 +4142,7 @@ def _execute_open_dca(
                 "price": price_str,
                 "qty": qty,
                 "size_pct": size_pct,
+                "size_usdt": leg_usdt,
                 "entry_type": "MARKET" if use_market else "LIMIT",
             }
             placed.append(row)
@@ -4221,6 +4282,7 @@ def try_execute_valid_entry(
         leg = legs[leg_index]
         entry_price = resolve_dca_leg_entry_price(leg_index, leg, float(entry))
         size_pct = float(leg["size_pct"])
+        leg_usdt = float(leg["size_usdt"]) if leg.get("size_usdt") is not None else None
         fingerprint = f"{signal}|{sl:.2f}|{tp:.2f}|leg{leg_index}|{entry_price:.4f}"
         if leg_index == 0:
             allowed, block_reason = can_place_new_order(
@@ -4241,6 +4303,7 @@ def try_execute_valid_entry(
                 plan_fingerprint=fingerprint,
                 leg_index=0,
                 dca_max_legs=len(legs),
+                size_usdt=leg_usdt,
                 thread_name=f"exec-{symbol}-{signal}-leg0",
             )
             return
@@ -4267,6 +4330,7 @@ def try_execute_valid_entry(
                 len(legs),
                 reasons,
                 fingerprint,
+                size_usdt=leg_usdt,
                 thread_name=f"exec-dca-add-{symbol}-{signal}-leg{leg_index}",
             )
             return
@@ -4294,8 +4358,14 @@ def try_execute_valid_entry(
         )
         return
     else:
-        size_pct = float(legs[0]["size_pct"]) if legs else float(trade_plan.get("partial_close_pct", 50))
-        entry_price = float(legs[0]["price"]) if legs else float(entry)
+        first_leg = legs[0] if legs else {}
+        size_pct = float(first_leg.get("size_pct") or trade_plan.get("partial_close_pct", 50))
+        leg_usdt = (
+            float(first_leg["size_usdt"])
+            if first_leg.get("size_usdt") is not None
+            else None
+        )
+        entry_price = float(first_leg.get("price") or entry)
         fingerprint = f"{signal}|{sl:.2f}|{tp:.2f}|{entry_price:.4f}"
         allowed, block_reason = can_place_new_order(symbol, signal, entry_price, size_pct=size_pct)
         if not allowed:
@@ -4311,5 +4381,6 @@ def try_execute_valid_entry(
             size_pct,
             reasons,
             fingerprint,
+            size_usdt=leg_usdt,
             thread_name=f"exec-{symbol}-{signal}",
         )

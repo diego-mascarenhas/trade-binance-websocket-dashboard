@@ -136,6 +136,21 @@ TRADE_PLAN_TP2_RR = float(os.getenv("TRADE_PLAN_TP2_RR", "2.0"))
 TRADE_PLAN_PARTIAL_CLOSE_PCT = float(os.getenv("TRADE_PLAN_PARTIAL_CLOSE_PCT", "70"))
 TRADE_PLAN_TRAIL_PCT = float(os.getenv("TRADE_PLAN_TRAIL_PCT", "0.25"))
 TRADE_PLAN_INITIAL_SIZE_PCT = float(os.getenv("TRADE_PLAN_INITIAL_SIZE_PCT", "50"))
+TRADE_PLAN_DCA_COMPENSATION = os.getenv("TRADE_PLAN_DCA_COMPENSATION", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# Each 1% adverse price band → add entry_notional × 1 USDT (2.5% band on 32 USDT → +80 USDT)
+TRADE_PLAN_DCA_COMP_USDT_PER_PCT = float(os.getenv("TRADE_PLAN_DCA_COMP_USDT_PER_PCT", "1"))
+TRADE_PLAN_DCA_DISTANCE_WEIGHTED = os.getenv(
+    "TRADE_PLAN_DCA_DISTANCE_WEIGHTED", "false"
+).lower() in ("1", "true", "yes")
+TRADE_PLAN_DCA_EQUAL_SPLIT = os.getenv("TRADE_PLAN_DCA_EQUAL_SPLIT", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 TRADE_PLAN_EXECUTE_DCA = os.getenv("TRADE_PLAN_EXECUTE_DCA", "true").lower() in (
     "1",
     "true",
@@ -992,6 +1007,109 @@ def trade_plan_for_position_reconcile(
     )
 
 
+def dca_distance_from_entry_pct(entry_price: float, leg_price: float) -> float:
+    if entry_price <= 0:
+        return 0.0
+    return abs(float(leg_price) - entry_price) / entry_price * 100.0
+
+
+def dca_leg_distance_weights(entry_price: float, dca_prices: list[float]) -> list[float]:
+    """Legacy: weight each DCA level by distance (for splitting the remainder slice only)."""
+    if entry_price <= 0 or not dca_prices:
+        return []
+    return [max(dca_distance_from_entry_pct(entry_price, price), 0.01) for price in dca_prices]
+
+
+def build_dca_leg_allocations(
+    entry_price: float,
+    dca_prices: list[float],
+    entry_notional_usdt: float,
+    initial_size_pct: float,
+) -> list[dict[str, float]]:
+    """
+    Each DCA adds on top of entry notional: entry_usdt + entry_usdt × (band % × scale).
+
+    scale=1 (default): 2.5% band on 32 USDT → +32×2.5 = +80 USDT (not 32×0.025).
+    """
+    if not dca_prices or entry_notional_usdt <= 0:
+        return []
+
+    rows: list[dict[str, float]] = []
+    cumulative_usdt = entry_notional_usdt
+
+    if TRADE_PLAN_DCA_COMPENSATION and not TRADE_PLAN_DCA_EQUAL_SPLIT:
+        prev_dist = 0.0
+        for price in dca_prices:
+            dist_pct = dca_distance_from_entry_pct(entry_price, price)
+            band_pct = max(dist_pct - prev_dist, 0.0)
+            increment_usdt = (
+                entry_notional_usdt * band_pct * TRADE_PLAN_DCA_COMP_USDT_PER_PCT
+            )
+            cumulative_usdt += increment_usdt
+            rows.append(
+                {
+                    "increment_usdt": increment_usdt,
+                    "cumulative_usdt": cumulative_usdt,
+                    "band_pct": band_pct,
+                    "dist_pct": dist_pct,
+                    "increment_pct": execution.wallet_pct_from_notional_usdt(increment_usdt),
+                }
+            )
+            prev_dist = dist_pct
+        return rows
+
+    if TRADE_PLAN_DCA_EQUAL_SPLIT:
+        remaining = max(0.0, 100.0 - initial_size_pct)
+        each_pct = remaining / len(dca_prices)
+        for _ in dca_prices:
+            increment_usdt = execution.estimate_order_notional_usdt(each_pct)
+            cumulative_usdt += increment_usdt
+            rows.append(
+                {
+                    "increment_usdt": increment_usdt,
+                    "cumulative_usdt": cumulative_usdt,
+                    "band_pct": 0.0,
+                    "dist_pct": 0.0,
+                    "increment_pct": each_pct,
+                }
+            )
+        return rows
+
+    remaining = max(0.0, 100.0 - initial_size_pct)
+    if TRADE_PLAN_DCA_DISTANCE_WEIGHTED:
+        weights = dca_leg_distance_weights(entry_price, dca_prices)
+        total = sum(weights)
+        if total > 0:
+            for w in weights:
+                increment_pct = remaining * (w / total)
+                increment_usdt = execution.estimate_order_notional_usdt(increment_pct)
+                cumulative_usdt += increment_usdt
+                rows.append(
+                    {
+                        "increment_usdt": increment_usdt,
+                        "cumulative_usdt": cumulative_usdt,
+                        "band_pct": 0.0,
+                        "dist_pct": 0.0,
+                        "increment_pct": increment_pct,
+                    }
+                )
+            return rows
+    each_pct = remaining / len(dca_prices) if dca_prices else 0.0
+    for _ in dca_prices:
+        increment_usdt = execution.estimate_order_notional_usdt(each_pct)
+        cumulative_usdt += increment_usdt
+        rows.append(
+            {
+                "increment_usdt": increment_usdt,
+                "cumulative_usdt": cumulative_usdt,
+                "band_pct": 0.0,
+                "dist_pct": 0.0,
+                "increment_pct": each_pct,
+            }
+        )
+    return rows
+
+
 def compute_trade_plan(
     signal: str,
     confidence: int,
@@ -1038,27 +1156,63 @@ def compute_trade_plan(
         if fvg_mid > entry and fvg_mid > dca_prices[1]:
             dca_prices[1] = fvg_mid
 
-    total_slots = len(dca_prices)
-    remaining_size = max(0.0, 100.0 - TRADE_PLAN_INITIAL_SIZE_PCT)
-    dca_size = remaining_size / max(total_slots - 1, 1) if total_slots > 1 else 0.0
+    entry_price = dca_prices[0]
+    initial_pct = TRADE_PLAN_INITIAL_SIZE_PCT
+    entry_notional_usdt = execution.estimate_order_notional_usdt(initial_pct)
+    dca_allocations = build_dca_leg_allocations(
+        entry_price,
+        dca_prices[1:],
+        entry_notional_usdt,
+        initial_pct,
+    )
+    if TRADE_PLAN_DCA_COMPENSATION and not TRADE_PLAN_DCA_EQUAL_SPLIT:
+        size_mode = "usdt+dist%"
+    elif TRADE_PLAN_DCA_EQUAL_SPLIT:
+        size_mode = "equal-remainder"
+    elif TRADE_PLAN_DCA_DISTANCE_WEIGHTED:
+        size_mode = "distance-remainder"
+    else:
+        size_mode = "equal-remainder"
     legs: list[dict] = [
         {
-            "label": f"Entry · {TRADE_PLAN_INITIAL_SIZE_PCT:.0f}%",
-            "price": dca_prices[0],
-            "size_pct": TRADE_PLAN_INITIAL_SIZE_PCT,
+            "label": f"Entry · {initial_pct:.0f}% wallet · ~{entry_notional_usdt:.2f} USDT",
+            "price": entry_price,
+            "size_pct": initial_pct,
+            "size_usdt": entry_notional_usdt,
+            "cumulative_usdt": entry_notional_usdt,
         }
     ]
-    for index, dca_price in enumerate(dca_prices[1:], start=1):
+    for index, (dca_price, alloc) in enumerate(
+        zip(dca_prices[1:], dca_allocations, strict=False),
+        start=1,
+    ):
+        inc = float(alloc["increment_usdt"])
+        cum = float(alloc["cumulative_usdt"])
+        band = float(alloc.get("band_pct") or 0.0)
+        dist_pct = float(alloc.get("dist_pct") or 0.0)
         legs.append(
             {
-                "label": f"DCA {index + 1} · {dca_size:.0f}% · if position adverse",
+                "label": (
+                    f"DCA {index + 1} · +{inc:.2f} USDT "
+                    f"({entry_notional_usdt:.0f}×{band:.2f}%={inc:.0f}) · pos ~{cum:.0f} USDT"
+                ),
                 "price": dca_price,
-                "size_pct": dca_size,
+                "size_pct": float(alloc["increment_pct"]),
+                "size_usdt": inc,
+                "cumulative_usdt": cum,
+                "distance_from_entry_pct": dist_pct,
+                "comp_band_pct": band,
                 "trigger": "valid_entry_adverse",
             }
         )
 
-    avg_entry = sum(leg["price"] * leg["size_pct"] for leg in legs) / 100.0
+    total_usdt = sum(float(leg.get("size_usdt") or 0) for leg in legs)
+    if total_usdt > 0:
+        avg_entry = (
+            sum(float(leg["price"]) * float(leg["size_usdt"]) for leg in legs) / total_usdt
+        )
+    else:
+        avg_entry = entry_price
 
     if is_long:
         structure_sl = float(support) * (1 - buffer) if support else entry * (1 - step * (TRADE_PLAN_DCA_STEPS + 1))
@@ -1111,6 +1265,7 @@ def compute_trade_plan(
         "entry": entry,
         "avg_entry": avg_entry,
         "legs": legs,
+        "entry_base_usdt": entry_notional_usdt,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
@@ -1409,16 +1564,20 @@ def record_valid_entry(
                     )
                     return
             size_pct = float(leg["size_pct"])
+            leg_notional = float(leg["size_usdt"]) if leg.get("size_usdt") is not None else None
         elif use_dca:
             size_pct = sum(float(leg["size_pct"]) for leg in legs)
+            leg_notional = None
         else:
-            size_pct = float(legs[0]["size_pct"]) if legs else float(
-                trade_plan.get("partial_close_pct", 50)
-            )
-        blocked, balance_reason = execution.fleet_side_balance_blocks(
-            signal,
-            execution.estimate_order_notional_usdt(size_pct),
+            first = legs[0] if legs else {}
+            size_pct = float(first.get("size_pct") or trade_plan.get("partial_close_pct", 50))
+            leg_notional = float(first["size_usdt"]) if first.get("size_usdt") is not None else None
+        order_notional = (
+            leg_notional
+            if leg_notional is not None
+            else execution.estimate_order_notional_usdt(size_pct)
         )
+        blocked, balance_reason = execution.fleet_side_balance_blocks(signal, order_notional)
         if blocked:
             log_decision_event(
                 "valid_entry_blocked",
@@ -3178,7 +3337,14 @@ def build_trade_plan_panel_children(metrics: dict) -> list:
         panel_section("Entry"),
     ]
     for leg in plan.get("legs") or []:
-        plan_details.append(kv_row(leg["label"], format_price(leg["price"]), strong=True))
+        usdt_hint = ""
+        if leg.get("size_usdt") is not None:
+            usdt_hint = f"~{float(leg['size_usdt']):.2f} USDT"
+            if leg.get("cumulative_usdt") is not None:
+                usdt_hint += f" · pos ~{float(leg['cumulative_usdt']):.2f} USDT"
+        plan_details.append(
+            kv_row(leg["label"], format_price(leg["price"]), strong=True, hint=usdt_hint or None)
+        )
     plan_details.append(kv_row("Avg entry", format_price(plan["avg_entry"]), strong=True))
 
     plan_details.append(panel_section("Targets"))
