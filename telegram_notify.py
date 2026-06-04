@@ -230,11 +230,15 @@ def notify_live_open(
     sl: str,
     tp_label: str,
     vol_usdt: str,
+    *,
+    entry_order_type: str = "LIMIT",
 ) -> None:
+    order_label = "MARKET" if str(entry_order_type).upper() == "MARKET" else "LIMIT"
+    sl_tp_note = " · SL/TP after fill" if order_label == "MARKET" else ""
     send_position(
         direction,
         f"{symbol.upper()} futures\n"
-        f"LIMIT #OPEN {direction}\n"
+        f"{order_label} #OPEN {direction}{sl_tp_note}\n"
         f"Entry: {entry} | {tp_label} | SL: {sl} | Vol: {vol_usdt} USDT",
     )
 

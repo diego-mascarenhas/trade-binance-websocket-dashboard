@@ -61,6 +61,7 @@ TP_TRAILING_CALLBACK_RATE = float(os.getenv("TP_TRAILING_CALLBACK_RATE", "0.5"))
 EXECUTION_ORDER_COOLDOWN = int(os.getenv("EXECUTION_ORDER_COOLDOWN", "180"))
 EXECUTION_MAINTENANCE_SEC = float(os.getenv("EXECUTION_MAINTENANCE_SEC", "15"))
 ENTRY_LIMIT_TTL_SEC = int(os.getenv("ENTRY_LIMIT_TTL_SEC", "600"))
+ENTRY_FIRST_LEG_MARKET = _env_bool("ENTRY_FIRST_LEG_MARKET", "true")
 PROTECTION_RECONCILE_ENABLED = _env_bool("PROTECTION_RECONCILE_ENABLED", "true")
 FLEET_SIDE_BALANCE_MAX_PCT = float(os.getenv("FLEET_SIDE_BALANCE_MAX_PCT", "20"))
 FLEET_EXPOSURE_CACHE_SEC = float(os.getenv("FLEET_EXPOSURE_CACHE_SEC", "8"))
@@ -3303,6 +3304,19 @@ def _set_leverage(symbol: str) -> int:
     return lev
 
 
+def _use_market_for_first_leg(leg_index: int) -> bool:
+    return ENTRY_FIRST_LEG_MARKET and leg_index == 0
+
+
+def _entry_price_for_quantity(symbol: str, planned_entry: float, *, use_market: bool) -> float:
+    if not use_market:
+        return planned_entry
+    mark = _get_mark_price(symbol)
+    if mark is not None and mark > 0:
+        return float(mark)
+    return planned_entry
+
+
 def _place_limit_entry(
     symbol: str,
     direction: str,
@@ -3323,6 +3337,30 @@ def _place_limit_entry(
             "timeInForce": "GTC",
             "quantity": quantity,
             "price": price,
+            "newClientOrderId": client_id,
+        },
+        direction,
+    )
+    return _fapi_request("POST", "/fapi/v1/order", params)
+
+
+def _place_market_entry(
+    symbol: str,
+    direction: str,
+    quantity: str,
+    *,
+    leg_index: int | None = None,
+) -> dict[str, Any]:
+    side = "BUY" if direction == "LONG" else "SELL"
+    client_id = f"mkt_{int(time.time())}"[:36]
+    if leg_index is not None:
+        client_id = f"mk{leg_index}_{int(time.time())}"[:36]
+    params = _apply_position_params(
+        {
+            "symbol": symbol.upper(),
+            "side": side,
+            "type": "MARKET",
+            "quantity": quantity,
             "newClientOrderId": client_id,
         },
         direction,
@@ -3614,9 +3652,11 @@ def _execute_open(
         _set_status(message=f"Blocked: {block_reason}", last_event=block_reason)
         return
 
+    use_market = _use_market_for_first_leg(leg_index)
+    qty_entry = _entry_price_for_quantity(symbol, entry, use_market=use_market)
     price_str = round_price(symbol, entry)
     try:
-        qty = _calculate_quantity(symbol, entry, size_pct)
+        qty = _calculate_quantity(symbol, qty_entry, size_pct)
     except ValueError as exc:
         _set_status(message=str(exc), last_event="error")
         _append_orders_log("error", symbol=symbol, error=str(exc))
@@ -3631,6 +3671,7 @@ def _execute_open(
         "qty": qty,
         "size_pct": size_pct,
         "mode": EXECUTION_MODE,
+        "entry_type": "MARKET" if use_market else "LIMIT",
         "leverage_mode": LEVERAGE_MODE,
         "leverage": resolve_leverage_for_symbol(symbol),
         "reasons": reasons,
@@ -3657,7 +3698,10 @@ def _execute_open(
                 callbackRate=TP_TRAILING_CALLBACK_RATE if TP_ORDER_TYPE == "trailing" else None,
             )
         _set_status(
-            message=f"DRY-RUN {direction} {symbol} entry {price_str} qty {qty}",
+            message=(
+                f"DRY-RUN {direction} {symbol} "
+                f"{'MARKET' if use_market else 'LIMIT'} entry {price_str} qty {qty}"
+            ),
             last_event="dry_run_open",
             last_at=time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
             last_symbol=symbol,
@@ -3694,11 +3738,28 @@ def _execute_open(
         applied_lev = _set_leverage(symbol)
         payload["leverage"] = applied_lev
         payload["hedge_mode"] = is_hedge_mode()
-        response = _place_limit_entry(symbol, direction, price_str, qty, leg_index=leg_index if dca_max_legs else None)
+        if use_market:
+            response = _place_market_entry(
+                symbol,
+                direction,
+                qty,
+                leg_index=leg_index if dca_max_legs else None,
+            )
+        else:
+            response = _place_limit_entry(
+                symbol,
+                direction,
+                price_str,
+                qty,
+                leg_index=leg_index if dca_max_legs else None,
+            )
         order_id = response.get("orderId")
         _append_orders_log("live_open", orderId=order_id, **payload)
         _set_status(
-            message=f"LIVE {direction} {symbol} orderId {order_id}",
+            message=(
+                f"LIVE {direction} {symbol} "
+                f"{'MARKET' if use_market else 'LIMIT'} orderId {order_id}"
+            ),
             last_event="live_open",
             last_at=time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
             last_symbol=symbol,
@@ -3712,7 +3773,15 @@ def _execute_open(
             TP_ORDER_TYPE == "trailing",
             TP_TRAILING_CALLBACK_RATE,
         )
-        telegram.notify_live_open(symbol, direction, price_str, payload["sl"], tp_label, vol_usdt)
+        telegram.notify_live_open(
+            symbol,
+            direction,
+            price_str if not use_market else f"~{round_price(symbol, qty_entry)} (market)",
+            payload["sl"],
+            tp_label,
+            vol_usdt,
+            entry_order_type="MARKET" if use_market else "LIMIT",
+        )
         record_trade_context(
             symbol,
             direction,
@@ -3730,9 +3799,15 @@ def _execute_open(
             symbol,
             "order_live_open",
             outcome="live",
-            market_snapshot={"signal": direction, "entry": price_str, "orderId": order_id, "leg": leg_index},
+            market_snapshot={
+                "signal": direction,
+                "entry": price_str,
+                "entry_type": payload["entry_type"],
+                "orderId": order_id,
+                "leg": leg_index,
+            },
         )
-        if order_id is not None:
+        if order_id is not None and REST_PLACE_SL_TP:
             _place_sl_tp_after_fill(symbol, direction, sl, tp, qty, int(order_id))
     except RuntimeError as exc:
         logger.error("Order failed for %s: %s", symbol, exc)
@@ -3985,15 +4060,20 @@ def _execute_open_dca(
     for index, leg in enumerate(legs):
         price = float(leg["price"])
         size_pct = float(leg["size_pct"])
+        use_market = _use_market_for_first_leg(index)
+        qty_price = _entry_price_for_quantity(symbol, price, use_market=use_market)
         price_str = round_price(symbol, price)
         try:
-            qty = _calculate_quantity(symbol, price, size_pct)
+            qty = _calculate_quantity(symbol, qty_price, size_pct)
         except ValueError as exc:
             _set_status(message=str(exc), last_event="error")
             _append_orders_log("error", symbol=symbol, error=str(exc), leg=index)
             return
         try:
-            response = _place_limit_entry(symbol, direction, price_str, qty, leg_index=index)
+            if use_market:
+                response = _place_market_entry(symbol, direction, qty, leg_index=index)
+            else:
+                response = _place_limit_entry(symbol, direction, price_str, qty, leg_index=index)
             order_id = response.get("orderId")
             row = {
                 "leg": index,
@@ -4002,9 +4082,12 @@ def _execute_open_dca(
                 "price": price_str,
                 "qty": qty,
                 "size_pct": size_pct,
+                "entry_type": "MARKET" if use_market else "LIMIT",
             }
             placed.append(row)
             _append_orders_log("live_dca_leg", **row, symbol=symbol, direction=direction)
+            if use_market and order_id is not None and REST_PLACE_SL_TP:
+                _place_sl_tp_after_fill(symbol, direction, sl, tp, qty, int(order_id))
         except RuntimeError as exc:
             logger.error("DCA leg %s failed for %s: %s", index, symbol, exc)
             _append_orders_log("live_dca_leg_failed", symbol=symbol, leg=index, error=str(exc))
@@ -4031,8 +4114,9 @@ def _execute_open_dca(
         tp=tp_price,
         tp_type=TP_ORDER_TYPE,
     )
+    entry_summary = "market+limits" if any(r.get("entry_type") == "MARKET" for r in placed) else "limits"
     _set_status(
-        message=f"LIVE DCA {direction} {symbol} · {len(placed)} limits · SL/TP on fill",
+        message=f"LIVE DCA {direction} {symbol} · {len(placed)} legs ({entry_summary}) · SL/TP on fill",
         last_event="live_dca",
         last_at=time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         last_symbol=symbol,
@@ -4047,13 +4131,15 @@ def _execute_open_dca(
     total_pct = sum(float(leg["size_pct"]) for leg in placed)
     vol_usdt = f"{estimate_order_notional_usdt(total_pct):.2f}"
     tp_label = "Trailing TP" if TP_ORDER_TYPE == "trailing" else "TP"
+    first_type = placed[0].get("entry_type", "LIMIT") if placed else "LIMIT"
     telegram.notify_live_open(
         symbol,
         direction,
-        f"{round_price(symbol, avg_entry)} · {len(placed)} limits (DCA)",
+        f"{round_price(symbol, avg_entry)} · {len(placed)} legs (DCA)",
         sl_price,
         tp_label,
         vol_usdt,
+        entry_order_type=first_type,
     )
     reconcile_position_protection(symbol, direction=direction, sl=sl, tp=tp)
 
