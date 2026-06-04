@@ -108,6 +108,9 @@ HTF_INTERVAL = os.getenv("HTF_INTERVAL", "15m")
 HTF_CANDLES = int(os.getenv("HTF_CANDLES", "120"))
 REQUIRE_TREND_ALIGN = os.getenv("REQUIRE_TREND_ALIGN", "true").lower() in ("1", "true", "yes")
 SIGNAL_COOLDOWN_SEC = int(os.getenv("SIGNAL_COOLDOWN_SEC", "180"))
+WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "20"))
+WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "90"))
+DEPTH_METRICS_INTERVAL_SEC = float(os.getenv("DEPTH_METRICS_INTERVAL_SEC", "0.25"))
 EMA_FAST = int(os.getenv("EMA_FAST", "9"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
 HTF_EMA_TREND = int(os.getenv("HTF_EMA_TREND", "50"))
@@ -1734,14 +1737,23 @@ def update_metrics(
     update_trading_signal(ob_bids, ob_asks, latest_price, change_24h)
 
 
-def sync_orderbook_state(bid_map: dict[float, float], ask_map: dict[float, float]) -> None:
+def sync_orderbook_maps(bid_map: dict[float, float], ask_map: dict[float, float]) -> None:
     global orderbook, analysis_orderbook
 
     display_bids, display_asks = map_to_levels(bid_map, ask_map, DEPTH_LEVELS)
     full_bids, full_asks = map_to_levels(bid_map, ask_map)
     orderbook = {"bids": display_bids, "asks": display_asks}
     analysis_orderbook = {"bids": full_bids, "asks": full_asks}
-    update_metrics(display_bids, display_asks, full_bids, full_asks)
+
+
+def sync_orderbook_state(bid_map: dict[float, float], ask_map: dict[float, float]) -> None:
+    sync_orderbook_maps(bid_map, ask_map)
+    update_metrics(
+        orderbook["bids"],
+        orderbook["asks"],
+        analysis_orderbook["bids"],
+        analysis_orderbook["asks"],
+    )
 
 
 async def fetch_depth_snapshot(session: aiohttp.ClientSession) -> dict:
@@ -1859,6 +1871,10 @@ def _websocket_reconnect_delay(exc: Exception, attempt: int) -> float:
             return max(60.0, until_s - time.time() + 5.0)
         return min(600.0, 90.0 * (2 ** min(attempt, 3)))
 
+    if "pong timeout" in lower or "1008" in message:
+        base = min(90.0, 5.0 * (2 ** min(attempt, 5)))
+        return base + random.uniform(0.0, min(8.0, base * 0.2))
+
     base = min(120.0, 3.0 * (2 ** min(attempt, 6)))
     return base + random.uniform(0.0, min(15.0, base * 0.25))
 
@@ -1869,6 +1885,7 @@ async def ws_loop() -> None:
     depth_buffer: list[dict] = []
     last_htf_interval = HTF_INTERVAL
     reconnect_attempt = 0
+    last_depth_metrics_mono = 0.0
 
     stagger_s = (hash(SYMBOL.upper()) % 30) + random.uniform(0.0, 2.0)
     logger.info("%s: WebSocket stagger %.1fs (reduces REST burst on fleet start)", SYMBOL.upper(), stagger_s)
@@ -1914,9 +1931,10 @@ async def ws_loop() -> None:
 
                 async with websockets.connect(
                     stream_url,
-                    ping_interval=30,
-                    ping_timeout=60,
+                    ping_interval=WS_PING_INTERVAL,
+                    ping_timeout=WS_PING_TIMEOUT,
                     close_timeout=10,
+                    max_queue=512,
                 ) as ws:
                     logger.info("WebSocket connected for %s", SYMBOL.upper())
                     ws_status = "buffering depth"
@@ -2000,8 +2018,20 @@ async def ws_loop() -> None:
                             apply_depth_update(data, bid_map, ask_map)
                             last_update_id = data["u"]
 
+                            now_mono = time.monotonic()
                             with state_lock:
-                                sync_orderbook_state(bid_map, ask_map)
+                                sync_orderbook_maps(bid_map, ask_map)
+                                if (
+                                    now_mono - last_depth_metrics_mono
+                                    >= DEPTH_METRICS_INTERVAL_SEC
+                                ):
+                                    last_depth_metrics_mono = now_mono
+                                    update_metrics(
+                                        orderbook["bids"],
+                                        orderbook["asks"],
+                                        analysis_orderbook["bids"],
+                                        analysis_orderbook["asks"],
+                                    )
 
             except Exception as exc:
                 delay = _websocket_reconnect_delay(exc, reconnect_attempt)

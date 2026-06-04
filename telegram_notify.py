@@ -26,6 +26,9 @@ TELEGRAM_POLL_INTERVAL = float(os.getenv("TELEGRAM_POLL_INTERVAL", "2"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 
 STOP_NOTIFY_COOLDOWN_SEC = 30.0
+ORDER_FAIL_NOTIFY_COOLDOWN_SEC = float(os.getenv("ORDER_FAIL_NOTIFY_COOLDOWN", "120"))
+_order_fail_lock = threading.Lock()
+_last_order_fail: dict[str, tuple[float, str]] = {}
 _pause_lock = threading.Lock()
 _update_offset = 0
 _listener_stop = threading.Event()
@@ -236,8 +239,43 @@ def notify_live_open(
     )
 
 
-def notify_order_failed(symbol: str, direction: str) -> None:
-    send_raw(f"❌ {symbol.upper()} futures — ORDER FAILED ({direction})")
+def summarize_binance_error(detail: str) -> str:
+    """Short human-readable line from Binance JSON or raw error text."""
+    text = (detail or "").strip()
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            code = payload.get("code")
+            msg = payload.get("msg")
+            if code is not None and msg:
+                return f"Binance {code}: {msg}"
+    except json.JSONDecodeError:
+        pass
+    if len(text) > 420:
+        return text[:420] + "…"
+    return text
+
+
+def notify_order_failed(symbol: str, direction: str, detail: str = "") -> None:
+    summary = summarize_binance_error(detail)
+    key = symbol.upper()
+    now = time.monotonic()
+    with _order_fail_lock:
+        prev = _last_order_fail.get(key)
+        if (
+            prev
+            and now - prev[0] < ORDER_FAIL_NOTIFY_COOLDOWN_SEC
+            and prev[1] == summary
+        ):
+            return
+        _last_order_fail[key] = (now, summary)
+
+    body = f"❌ {key} futures — ORDER FAILED ({direction})"
+    if summary:
+        body = f"{body}\n{summary}"
+    send_raw(body)
 
 
 def notify_sl_tp_failed(symbol: str, direction: str, leg: str, detail: str) -> None:

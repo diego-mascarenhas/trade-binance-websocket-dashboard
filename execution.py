@@ -95,6 +95,8 @@ _last_position_api_error: str | None = None
 _hedge_mode_lock = threading.Lock()
 _hedge_mode: bool | None = None
 _last_execution_monotonic: float | None = None
+_execution_inflight_lock = threading.Lock()
+_execution_inflight_symbol: str | None = None
 
 
 def _execution_status_message() -> str:
@@ -711,6 +713,66 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
         return
 
     telegram.notify_position_closed(symbol, f"#CLOSED {direction} @ {exit_price} | PnL: {pnl_label}")
+
+
+def _notify_order_failed(symbol: str, direction: str, exc: Exception) -> None:
+    telegram.notify_order_failed(symbol, direction, str(exc))
+
+
+def _reserve_execution_attempt(symbol: str) -> bool:
+    """One live order attempt at a time; cooldown starts when attempt is reserved."""
+    global _last_execution_monotonic, _execution_inflight_symbol
+
+    symbol = symbol.upper()
+    now = time.monotonic()
+    with _execution_inflight_lock:
+        if _execution_inflight_symbol:
+            return False
+        if (
+            _last_execution_monotonic is not None
+            and now - _last_execution_monotonic < EXECUTION_ORDER_COOLDOWN
+        ):
+            return False
+        _execution_inflight_symbol = symbol
+        _last_execution_monotonic = now
+    return True
+
+
+def _release_execution_attempt(symbol: str) -> None:
+    global _execution_inflight_symbol
+
+    symbol = symbol.upper()
+    with _execution_inflight_lock:
+        if _execution_inflight_symbol == symbol:
+            _execution_inflight_symbol = None
+
+
+def _run_execution_thread(target, *args, **kwargs) -> None:
+    symbol = (args[0] if args else kwargs.get("symbol", "")).upper()
+    thread_name = kwargs.pop("thread_name", f"exec-{symbol}")
+
+    if not _reserve_execution_attempt(symbol):
+        _append_orders_log(
+            "skip_inflight_or_cooldown",
+            symbol=symbol,
+            signal=kwargs.get("direction") or (args[1] if len(args) > 1 else None),
+        )
+        _log_execution_decision(
+            symbol,
+            "order_skip",
+            block_reason="execution_inflight_or_cooldown",
+            market_snapshot={"signal": kwargs.get("direction") or (args[1] if len(args) > 1 else None)},
+        )
+        return
+
+    def runner() -> None:
+        try:
+            target(*args, **kwargs)
+        finally:
+            _release_execution_attempt(symbol)
+
+    thread = threading.Thread(target=runner, daemon=True, name=thread_name)
+    thread.start()
 
 
 def get_execution_status() -> dict[str, Any]:
@@ -3371,7 +3433,7 @@ def _execute_open(
         logger.error("Order failed for %s: %s", symbol, exc)
         _append_orders_log("live_open_failed", symbol=symbol, error=str(exc), **payload)
         _set_status(message=f"Order failed: {exc}", last_event="error")
-        telegram.notify_order_failed(symbol, direction)
+        _notify_order_failed(symbol, direction, exc)
 
 
 def _execute_signal_dca_add(
@@ -3506,7 +3568,7 @@ def _execute_signal_dca_add(
         logger.error("DCA add failed for %s leg %s: %s", symbol, leg_index, exc)
         _append_orders_log("live_dca_add_failed", symbol=symbol, leg=leg_index, error=str(exc))
         _set_status(message=f"DCA add failed: {exc}", last_event="error")
-        telegram.notify_order_failed(symbol, direction)
+        _notify_order_failed(symbol, direction, exc)
 
 
 def _execute_open_dca(
@@ -3642,7 +3704,7 @@ def _execute_open_dca(
             logger.error("DCA leg %s failed for %s: %s", index, symbol, exc)
             _append_orders_log("live_dca_leg_failed", symbol=symbol, leg=index, error=str(exc))
             _set_status(message=f"DCA leg {index} failed: {exc}", last_event="error")
-            telegram.notify_order_failed(symbol, direction)
+            _notify_order_failed(symbol, direction, exc)
             return
 
     _append_orders_log(
@@ -3732,16 +3794,6 @@ def try_execute_valid_entry(
         _log_execution_decision(symbol, "order_skip", block_reason="no_plan", market_snapshot={"signal": signal})
         return
 
-    global _last_execution_monotonic
-    now = time.monotonic()
-    if (
-        _last_execution_monotonic is not None
-        and now - _last_execution_monotonic < EXECUTION_ORDER_COOLDOWN
-    ):
-        _append_orders_log("skip_cooldown", symbol=symbol.upper(), signal=signal)
-        _log_execution_decision(symbol, "order_skip", block_reason="execution_cooldown", market_snapshot={"signal": signal})
-        return
-
     sl = float(trade_plan.get("sl", 0))
     tp = float(trade_plan.get("tp1", 0))
     if sl <= 0 or tp <= 0:
@@ -3786,23 +3838,21 @@ def try_execute_valid_entry(
             if not allowed:
                 _log_skip_order(symbol, signal, block_reason, entry=entry_price)
                 return
-            thread = threading.Thread(
-                target=_execute_open,
-                kwargs={
-                    "symbol": symbol,
-                    "direction": signal,
-                    "entry": entry_price,
-                    "sl": sl,
-                    "tp": tp,
-                    "size_pct": size_pct,
-                    "reasons": reasons,
-                    "plan_fingerprint": fingerprint,
-                    "leg_index": 0,
-                    "dca_max_legs": len(legs),
-                },
-                daemon=True,
-                name=f"exec-{symbol}-{signal}-leg0",
+            _run_execution_thread(
+                _execute_open,
+                symbol=symbol,
+                direction=signal,
+                entry=entry_price,
+                sl=sl,
+                tp=tp,
+                size_pct=size_pct,
+                reasons=reasons,
+                plan_fingerprint=fingerprint,
+                leg_index=0,
+                dca_max_legs=len(legs),
+                thread_name=f"exec-{symbol}-{signal}-leg0",
             )
+            return
         else:
             allowed, block_reason = can_place_dca_add(
                 symbol,
@@ -3814,23 +3864,21 @@ def try_execute_valid_entry(
             if not allowed:
                 _log_skip_order(symbol, signal, block_reason, entry=entry_price)
                 return
-            thread = threading.Thread(
-                target=_execute_signal_dca_add,
-                args=(
-                    symbol,
-                    signal,
-                    entry_price,
-                    sl,
-                    tp,
-                    size_pct,
-                    leg_index,
-                    len(legs),
-                    reasons,
-                    fingerprint,
-                ),
-                daemon=True,
-                name=f"exec-dca-add-{symbol}-{signal}-leg{leg_index}",
+            _run_execution_thread(
+                _execute_signal_dca_add,
+                symbol,
+                signal,
+                entry_price,
+                sl,
+                tp,
+                size_pct,
+                leg_index,
+                len(legs),
+                reasons,
+                fingerprint,
+                thread_name=f"exec-dca-add-{symbol}-{signal}-leg{leg_index}",
             )
+            return
     elif use_dca:
         bundle_legs = legs
         if TRADE_PLAN_DCA_ADVERSE_ONLY:
@@ -3841,12 +3889,19 @@ def try_execute_valid_entry(
         if not allowed:
             _log_skip_order(symbol, signal, block_reason, entry=avg_entry)
             return
-        thread = threading.Thread(
-            target=_execute_open_dca,
-            args=(symbol, signal, sl, tp, bundle_legs, reasons, fingerprint, avg_entry),
-            daemon=True,
-            name=f"exec-dca-{symbol}-{signal}",
+        _run_execution_thread(
+            _execute_open_dca,
+            symbol,
+            signal,
+            sl,
+            tp,
+            bundle_legs,
+            reasons,
+            fingerprint,
+            avg_entry,
+            thread_name=f"exec-dca-{symbol}-{signal}",
         )
+        return
     else:
         size_pct = float(legs[0]["size_pct"]) if legs else float(trade_plan.get("partial_close_pct", 50))
         entry_price = float(legs[0]["price"]) if legs else float(entry)
@@ -3855,10 +3910,15 @@ def try_execute_valid_entry(
         if not allowed:
             _log_skip_order(symbol, signal, block_reason, entry=entry_price)
             return
-        thread = threading.Thread(
-            target=_execute_open,
-            args=(symbol, signal, entry_price, sl, tp, size_pct, reasons, fingerprint),
-            daemon=True,
-            name=f"exec-{symbol}-{signal}",
+        _run_execution_thread(
+            _execute_open,
+            symbol,
+            signal,
+            entry_price,
+            sl,
+            tp,
+            size_pct,
+            reasons,
+            fingerprint,
+            thread_name=f"exec-{symbol}-{signal}",
         )
-    thread.start()
