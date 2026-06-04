@@ -1962,6 +1962,28 @@ async def ws_loop() -> None:
                     reconnect_attempt = 0
                     logger.info("Order book synced at updateId=%s", last_update_id)
 
+                    with state_lock:
+                        need_kline_refill = len(candles) < 10
+                    if need_kline_refill:
+                        try:
+                            refill = await fetch_historical_klines(
+                                session, current_ltf, min(MAX_CANDLES, 500)
+                            )
+                            with state_lock:
+                                candles.clear()
+                                candles.extend(refill)
+                            logger.warning(
+                                "%s: refilled %s klines after WS connect (chart recovery)",
+                                SYMBOL.upper(),
+                                len(refill),
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "%s: kline refill after connect failed: %s",
+                                SYMBOL.upper(),
+                                exc,
+                            )
+
                     async for raw in ws:
                         if ws_force_reconnect.is_set():
                             logger.info("%s: config change — reconnecting WebSocket", SYMBOL.upper())
@@ -2148,31 +2170,40 @@ def get_candles_df() -> pd.DataFrame:
                 )
             ),
             "log_dir": LOG_DIR,
+            "candles_count": len(candles),
+            "ob_bid_levels": len(ob["bids"]),
+            "ob_ask_levels": len(ob["asks"]),
         }
-        exposure = execution.get_exchange_exposure(SYMBOL)
-        maintain_plan = _resolved_trade_plan
-        if not maintain_plan.get("active") and exposure.get("open"):
-            maintain_plan = trade_plan_for_position_reconcile(
-                exposure,
-                support=support,
-                resistance=resistance,
-                price=latest_price,
-                market_analysis=market_analysis,
-            )
-        if maintain_plan.get("active"):
-            execution.run_execution_maintenance(
-                SYMBOL,
-                direction=maintain_plan.get("signal"),
-                sl=float(maintain_plan["sl"]) if maintain_plan.get("sl") else None,
-                tp=float(maintain_plan["tp1"]) if maintain_plan.get("tp1") else None,
-                market_analysis=market_analysis,
-            )
-        else:
-            execution.run_execution_maintenance(SYMBOL, market_analysis=market_analysis)
-        metrics["execution"] = {
-            **execution.get_execution_status(),
-            "position": exposure,
-        }
+        resolved_trade_plan = _resolved_trade_plan
+        snapshot_support = support
+        snapshot_resistance = resistance
+        snapshot_price = latest_price
+        snapshot_market_analysis = market_analysis
+
+    exposure = execution.get_exchange_exposure(SYMBOL)
+    maintain_plan = resolved_trade_plan
+    if not maintain_plan.get("active") and exposure.get("open"):
+        maintain_plan = trade_plan_for_position_reconcile(
+            exposure,
+            support=snapshot_support,
+            resistance=snapshot_resistance,
+            price=snapshot_price,
+            market_analysis=snapshot_market_analysis,
+        )
+    if maintain_plan.get("active"):
+        execution.run_execution_maintenance(
+            SYMBOL,
+            direction=maintain_plan.get("signal"),
+            sl=float(maintain_plan["sl"]) if maintain_plan.get("sl") else None,
+            tp=float(maintain_plan["tp1"]) if maintain_plan.get("tp1") else None,
+            market_analysis=snapshot_market_analysis,
+        )
+    else:
+        execution.run_execution_maintenance(SYMBOL, market_analysis=snapshot_market_analysis)
+    metrics["execution"] = {
+        **execution.get_execution_status(),
+        "position": exposure,
+    }
 
     return pd.DataFrame(rows), ob, metrics
 
@@ -2616,6 +2647,7 @@ def build_figure() -> go.Figure:
         template="plotly_dark",
         height=900,
         barmode="overlay",
+        uirevision="live-chart",
         xaxis_rangeslider_visible=False,
         legend_orientation="h",
         legend=dict(y=1.02, x=0, orientation="h"),
@@ -3019,6 +3051,12 @@ def build_metrics_panel_children(metrics: dict) -> list:
         kv_row("Volume delta", delta_text, strong=True),
         panel_section("Connection"),
         kv_row("WebSocket", metrics.get("status", "—"), strong=True),
+        kv_row("Candles buffered", str(metrics.get("candles_count", "—")), strong=True),
+        kv_row(
+            "OB levels",
+            f"{metrics.get('ob_bid_levels', 0)} bids · {metrics.get('ob_ask_levels', 0)} asks",
+            strong=True,
+        ),
     ]
 
 
@@ -3256,7 +3294,11 @@ app.layout = html.Div(
             ],
             className="panels",
         ),
-        dcc.Graph(id="live-chart", config={"displayModeBar": True}),
+        dcc.Graph(
+            id="live-chart",
+            config={"displayModeBar": True, "responsive": True},
+            style={"minHeight": "900px"},
+        ),
         dcc.Interval(id="interval", interval=1500, n_intervals=0),
     ],
     className="app-shell",
@@ -3266,6 +3308,31 @@ app.layout = html.Div(
 @app.server.route("/api/hub-summary")
 def hub_summary_route():
     response = jsonify(build_hub_summary())
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+
+@app.server.route("/api/chart-health")
+def chart_health_route():
+    """Diagnostics for blank chart / missing order-book depth panel."""
+    with state_lock:
+        bid_levels = len(orderbook.get("bids") or [])
+        ask_levels = len(orderbook.get("asks") or [])
+        candle_count = len(candles)
+        payload = {
+            "symbol": SYMBOL.upper(),
+            "interval": INTERVAL,
+            "htf_interval": HTF_INTERVAL,
+            "ws_status": ws_status,
+            "candles_count": candle_count,
+            "has_forming_candle": forming_candle is not None,
+            "ob_bid_levels": bid_levels,
+            "ob_ask_levels": ask_levels,
+            "latest_price": latest_price,
+            "price_chart_ok": candle_count > 0 or forming_candle is not None,
+            "depth_chart_ok": bid_levels > 0 and ask_levels > 0,
+        }
+    response = jsonify(payload)
     response.headers["Access-Control-Allow-Origin"] = "*"
     return response
 

@@ -1,5 +1,6 @@
-dash>=2.17.0
-plotly>=5.22.0
+# Pin Dash 2 + Plotly 5 — Plotly 6 / Dash 4 break the live candlestick + depth subplots.
+dash==2.18.2
+plotly==5.24.1
 pandas>=2.2.0
 websockets>=12.0
 aiohttp>=3.9.0
