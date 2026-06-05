@@ -81,8 +81,9 @@ def _pnl_badge(pct: float | None) -> str:
     return f"<b>{_esc(f'{pct:+.2f}%')}</b>"
 
 
-def _section_header(emoji: str, title: str, count: int) -> str:
-    return f"{emoji} <b>{title}</b> ({count})\n{SEP_SECTION}"
+def _section_header(emoji: str, title: str, count: int, *, leading_blank: bool = False) -> str:
+    lead = "\n" if leading_blank else ""
+    return f"{lead}{emoji} <b>{title}</b> ({count})\n{SEP_SECTION}"
 
 
 def _join_symbol_blocks(blocks: list[str]) -> str:
@@ -156,13 +157,15 @@ def build_fleet_status() -> str:
         parts.append(_join_symbol_blocks(trade_blocks[:10]))
     if watch_blocks:
         has_content = True
-        parts.append(_section_header("👀", "WATCH", len(watch_blocks)))
+        parts.append(_section_header("👀", "WATCH", len(watch_blocks), leading_blank=has_content))
         parts.append(_join_symbol_blocks(watch_blocks[:15]))
     if open_blocks:
         has_content = True
-        parts.append(_section_header("💼", "OPEN", len(open_blocks)))
+        parts.append(_section_header("💼", "OPEN", len(open_blocks), leading_blank=has_content))
         parts.append(_join_symbol_blocks(open_blocks[:10]))
     if offline:
+        if has_content:
+            parts.append("")
         parts.append(SEP_SECTION)
         parts.append(f"⚠️ Offline: <b>{offline}</b>")
     if not has_content:
