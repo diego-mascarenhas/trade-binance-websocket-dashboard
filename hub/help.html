@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ayuda — Estrategia Binance Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="shell help-shell">
+        <header class="header help-header">
+            <div>
+                <h1>Guía de estrategia</h1>
+                <p class="subtitle">Señales, SMC, ejecución, variables de entorno y protección anti-baneo.</p>
+                <nav class="help-nav-top">
+                    <a class="header-link" href="/">← Hub</a>
+                    <a class="header-link" href="/analytics/">Analytics</a>
+                </nav>
+            </div>
+        </header>
+
+        <nav class="help-toc" aria-label="Índice">
+            <h2>Índice</h2>
+            <ol>
+                <li><a href="#arquitectura">Arquitectura</a></li>
+                <li><a href="#pipeline">Pipeline de señales</a></li>
+                <li><a href="#orderbook">Señal por order book</a></li>
+                <li><a href="#analisis">Análisis HTF / SMC / patrones</a></li>
+                <li><a href="#filtros">Filtros y bloqueos</a></li>
+                <li><a href="#plan">Plan de trade (SL, TP, DCA, BE)</a></li>
+                <li><a href="#ejecucion">Ejecución en Binance Futures</a></li>
+                <li><a href="#hub">Interpretar el Hub</a></li>
+                <li><a href="#esperas">¿Cuánto tarda en haber señales?</a></li>
+                <li><a href="#antiban">Anti-baneo y rate limits</a></li>
+                <li><a href="#telegram">Telegram y flota</a></li>
+                <li><a href="#variables">Variables de entorno</a></li>
+            </ol>
+        </nav>
+
+        <main class="help-content">
+
+            <section id="arquitectura" class="help-section">
+                <h2>1. Arquitectura</h2>
+                <p>El sistema combina <strong>datos en vivo de Binance Spot</strong> (WebSocket: velas, depth, miniTicker) con <strong>ejecución opcional en Binance Futures</strong> (REST).</p>
+                <ul>
+                    <li><strong>Un proceso por par</strong> (<code>app.py SYMBOL --port 805x</code>): stream WS, cálculo de señal, dashboard individual.</li>
+                    <li><strong>Hub central</strong> (<code>hub_server.py</code>, puerto <code>HUB_PORT</code>, default 8050): tarjetas de todos los pares vía proxy interno.</li>
+                    <li><strong>Flota</strong> (<code>./run-all.sh</code>): arranca hub + 16 dashboards + listener Telegram + <code>fapi_watch</code>.</li>
+                    <li><strong>Analytics</strong> (<code>/analytics/</code>): KPIs, bloqueos, export CSV para ML (requiere MySQL opcional).</li>
+                </ul>
+                <p>Los puertos 8051–8072 solo deben ser accesibles en <code>127.0.0.1</code>. El hub los consulta por proxy; no abras esos puertos al firewall público.</p>
+            </section>
+
+            <section id="pipeline" class="help-section">
+                <h2>2. Pipeline de señales</h2>
+                <p>Hay tres niveles distintos. Confundirlos explica la mayoría de dudas:</p>
+
+                <div class="help-table-wrap">
+                    <table class="help-table">
+                        <thead>
+                            <tr>
+                                <th>Nivel</th>
+                                <th>Condición</th>
+                                <th>Qué hace</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><span class="badge badge-neutral">NEUTRAL</span></td>
+                                <td>Sin LONG/SHORT o confianza &lt; mínimo</td>
+                                <td>Solo observación. No hay plan activo.</td>
+                            </tr>
+                            <tr>
+                                <td><span class="badge badge-watch">WATCH</span></td>
+                                <td>LONG o SHORT pero confianza &lt; <code>MIN_CONFIDENCE</code> (default 50%)</td>
+                                <td>Se muestra dirección tentativa. No es entrada válida.</td>
+                            </tr>
+                            <tr>
+                                <td><span class="badge badge-trade">TRADE</span></td>
+                                <td>LONG/SHORT y confianza ≥ <code>MIN_CONFIDENCE</code></td>
+                                <td>Setup visible en hub. Aún puede bloquearse antes de ejecutar.</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Valid entry</strong></td>
+                                <td>TRADE + alineación HTF + filtros + debounce + plan activo + cooldown</td>
+                                <td>Registra entrada, alerta Telegram y (si está activo) envía orden Futures.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <p>Flujo resumido:</p>
+                <pre class="help-diagram">Depth WS → candidato (LONG/SHORT/NEUTRAL)
+         → debounce (N lecturas iguales)
+         → filtros RSI/ADX/MACD
+         → alineación con tendencia HTF
+         → plan de trade activo
+         → valid entry → ejecución (si EXECUTION_ENABLED)</pre>
+            </section>
+
+            <section id="orderbook" class="help-section">
+                <h2>3. Señal por order book</h2>
+                <p>La señal principal usa el <strong>libro de órdenes</strong> (muros de volumen como soporte/resistencia dinámicos):</p>
+                <ol>
+                    <li>Se identifican el muro de compra más grande (soporte) y el de venta (resistencia).</li>
+                    <li>Se calcula la posición del precio en el rango soporte–resistencia (0–100%).</li>
+                    <li>Con <strong>histeresis</strong> para evitar flip-flop:
+                        <ul>
+                            <li><strong>LONG</strong> entra si posición ≤ <code>SIGNAL_ZONE_LONG_ENTER</code> (default 20%). Sale a NEUTRAL si sube por encima de <code>SIGNAL_ZONE_LONG_EXIT</code> (35%).</li>
+                            <li><strong>SHORT</strong> entra si posición ≥ <code>SIGNAL_ZONE_SHORT_ENTER</code> (80%). Sale a NEUTRAL si baja de <code>SIGNAL_ZONE_SHORT_EXIT</code> (65%).</li>
+                        </ul>
+                    </li>
+                </ol>
+
+                <h3>Confianza por zona OB</h3>
+                <ul>
+                    <li>Cerca de soporte (LONG): <strong>65%</strong> + 15% extra si 24h &lt; −3% (reversal).</li>
+                    <li>Cerca de resistencia (SHORT): <strong>65%</strong> + 15% extra si 24h &gt; +3%.</li>
+                </ul>
+
+                <h3>Fallback por cambio 24h</h3>
+                <p>Si no hay señal de zona, usa <code>@miniTicker</code>:</p>
+                <ul>
+                    <li>24h &gt; +5% → SHORT 50% (extremo alcista)</li>
+                    <li>24h &lt; −5% → LONG 50% (extremo bajista)</li>
+                    <li>24h &gt; +2% → LONG 40% (no alcanza TRADE por defecto)</li>
+                    <li>24h &lt; −2% → SHORT 40%</li>
+                </ul>
+                <p class="help-note">Sin bids/asks (WS en <em>connecting</em>) no se calcula señal: el proceso retorna antes de analizar el libro.</p>
+            </section>
+
+            <section id="analisis" class="help-section">
+                <h2>4. Análisis HTF / SMC / patrones</h2>
+
+                <h3>Tendencia HTF (<code>HTF_INTERVAL</code>, default 15m)</h3>
+                <p>EMA rápida (<code>EMA_FAST</code> 9), lenta (<code>EMA_SLOW</code> 21) y de tendencia (<code>HTF_EMA_TREND</code> 50):</p>
+                <ul>
+                    <li><strong>BULLISH</strong>: cierre &gt; EMA50 y EMA9 &gt; EMA21</li>
+                    <li><strong>BEARISH</strong>: cierre &lt; EMA50 y EMA9 &lt; EMA21</li>
+                    <li><strong>NEUTRAL</strong>: resto de casos</li>
+                </ul>
+
+                <h3>SMC (Smart Money Concepts)</h3>
+                <p>En velas HTF y LTF detecta estructura: <strong>BOS</strong>, <strong>CHoCH</strong>, variantes internas (<code>iBOS</code>, <code>iCHoCH</code>), liquidez igual (<strong>EQH/EQL</strong>), sweeps y zona Premium/Discount.</p>
+                <ul>
+                    <li>Swings fractales: <code>SMC_SWING_LEFT/RIGHT</code> (HTF), <code>SMC_INT_SWING_LEFT/RIGHT</code> (LTF).</li>
+                    <li>Lookback rupturas: <code>SMC_BREAK_LOOKBACK_HTF</code> (3), <code>SMC_BREAK_LOOKBACK_LTF</code> (12).</li>
+                    <li>Premium/Discount: ≤ <code>SMC_PD_DISCOUNT_MAX</code> (38%) = Discount; ≥ <code>SMC_PD_PREMIUM_MIN</code> (62%) = Premium.</li>
+                    <li>Tolerancia EQ: <code>SMC_EQ_TOLERANCE_PCT</code> (0.08%).</li>
+                </ul>
+
+                <h3>Patrones de vela (gráfico individual)</h3>
+                <ul>
+                    <li><strong>Hammer</strong> → confirma LONG (cuerpo pequeño, mecha inferior larga, contexto bajista o cerca de soporte).</li>
+                    <li><strong>Shooting Star</strong> → confirma SHORT (contexto alcista o cerca de resistencia).</li>
+                    <li>Rango mínimo de vela: <code>MIN_PATTERN_RANGE_PCT</code> (0.02%).</li>
+                </ul>
+                <p>Los patrones refuerzan visualización; la señal operativa principal sigue siendo order book + 24h.</p>
+            </section>
+
+            <section id="filtros" class="help-section">
+                <h2>5. Filtros y bloqueos</h2>
+                <p>Con <code>INDICATOR_FILTERS_ENABLED=true</code> (default), antes de un <em>valid entry</em>:</p>
+
+                <div class="help-table-wrap">
+                    <table class="help-table">
+                        <thead>
+                            <tr>
+                                <th>Filtro</th>
+                                <th>Variable</th>
+                                <th>Default</th>
+                                <th>Bloquea si…</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>RSI</td>
+                                <td><code>RSI_FILTER_ENABLED</code></td>
+                                <td>true</td>
+                                <td>LONG con RSI &gt; <code>RSI_LONG_MAX</code> (70); SHORT con RSI &lt; <code>RSI_SHORT_MIN</code> (30)</td>
+                            </tr>
+                            <tr>
+                                <td>ADX</td>
+                                <td><code>ADX_FILTER_ENABLED</code></td>
+                                <td>true</td>
+                                <td>ADX &lt; <code>ADX_MIN_TREND</code> (25). Usa HTF si <code>ADX_USE_HTF=true</code>.</td>
+                            </tr>
+                            <tr>
+                                <td>MACD</td>
+                                <td><code>MACD_FILTER_ENABLED</code></td>
+                                <td>false</td>
+                                <td>LONG con histograma &lt; 0; SHORT con histograma &gt; 0</td>
+                            </tr>
+                            <tr>
+                                <td>HTF align</td>
+                                <td><code>REQUIRE_TREND_ALIGN</code></td>
+                                <td>true</td>
+                                <td>LONG sin HTF BULLISH; SHORT sin HTF BEARISH; HTF NEUTRAL bloquea todo</td>
+                            </tr>
+                            <tr>
+                                <td>Debounce</td>
+                                <td><code>SIGNAL_DEBOUNCE_COUNT</code></td>
+                                <td>5</td>
+                                <td>Candidato debe repetirse 5 veces seguidas en actualizaciones de depth</td>
+                            </tr>
+                            <tr>
+                                <td>Cooldown</td>
+                                <td><code>SIGNAL_COOLDOWN_SEC</code></td>
+                                <td>180 s</td>
+                                <td>Mínimo entre valid entries del mismo par</td>
+                            </tr>
+                            <tr>
+                                <td>Plan</td>
+                                <td>—</td>
+                                <td>—</td>
+                                <td>Sin plan activo (SL/TP no calculables)</td>
+                            </tr>
+                            <tr>
+                                <td>Flota pausada</td>
+                                <td><code>logs/fleet.state</code></td>
+                                <td>—</td>
+                                <td><code>trading_paused=true</code> → no envía órdenes (señal TRADE puede seguir visible)</td>
+                            </tr>
+                            <tr>
+                                <td>Balance L/S</td>
+                                <td><code>FLEET_SIDE_BALANCE_MAX_PCT</code></td>
+                                <td>20%</td>
+                                <td>Un lado (long o short) supera al otro más del 20% en USDT</td>
+                            </tr>
+                            <tr>
+                                <td>Par deshabilitado</td>
+                                <td><code>symbol_trading_enabled</code></td>
+                                <td>true</td>
+                                <td>Override MySQL por par</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <p>En el hub, la sección <strong>Blocked</strong> resume:</p>
+                <ul>
+                    <li><code>low signal N</code> — pares en NEUTRAL o 0% confianza</li>
+                    <li><code>HTF mismatch N</code> — TRADE visible pero señal ≠ tendencia HTF</li>
+                    <li><code>aligned N</code> — TRADE alineado con HTF</li>
+                    <li><code>fleet paused</code> — ejecución detenida globalmente</li>
+                    <li><code>auto exec off</code> — <code>EXECUTE_ON_VALID_ENTRY=false</code></li>
+                </ul>
+            </section>
+
+            <section id="plan" class="help-section">
+                <h2>6. Plan de trade (SL, TP, DCA, break-even)</h2>
+                <p>Cuando hay TRADE con plan activo, se calculan niveles estructurales:</p>
+
+                <h3>Entrada y DCA</h3>
+                <ul>
+                    <li>Primera pierna: <code>TRADE_PLAN_INITIAL_SIZE_PCT</code> del wallet (default 50%).</li>
+                    <li>Pasos DCA: <code>TRADE_PLAN_DCA_STEPS</code> (2) espaciados <code>TRADE_PLAN_DCA_STEP_PCT</code> (2.5%) desde entrada.</li>
+                    <li>Modo compensación (<code>TRADE_PLAN_DCA_COMPENSATION=true</code>): cada banda adversa añade <code>entry_usdt × band% × TRADE_PLAN_DCA_COMP_USDT_PER_PCT</code>.</li>
+                    <li><code>TRADE_PLAN_DCA_SIGNAL_DRIVEN=true</code>: una pierna DCA por cada valid entry (no todos los límites a la vez).</li>
+                    <li><code>TRADE_PLAN_DCA_ADVERSE_ONLY=true</code>: DCA solo si posición en pérdida (<code>DCA_FAVORABLE_PNL_MAX_USDT</code> ≤ 0).</li>
+                </ul>
+
+                <h3>Stop loss y take profit</h3>
+                <ul>
+                    <li>SL bajo estructura (soporte/resistencia) con buffer <code>TRADE_PLAN_SL_BUFFER_PCT</code> (0.25%).</li>
+                    <li>Distancia mínima entry–SL: <code>TRADE_PLAN_SL_MIN_DISTANCE_PCT</code> (1%).</li>
+                    <li>TP1 = riesgo × <code>TRADE_PLAN_TP1_RR</code> (1.0); TP2 × <code>TRADE_PLAN_TP2_RR</code> (2.0).</li>
+                    <li>Cierre parcial ~<code>TRADE_PLAN_PARTIAL_CLOSE_PCT</code> (70%) al detectar TP1.</li>
+                </ul>
+
+                <h3>Break-even y trailing</h3>
+                <ul>
+                    <li><code>TRADE_PLAN_AUTO_BE=true</code>: mueve SL a entrada tras parcial o por señales (<code>BE_TRIGGER_PARTIAL</code>, <code>BE_TRIGGER_SIGNAL</code>).</li>
+                    <li>Triggers de señal: HTF neutral/contra, SMC ranging, RSI extremo (<code>BE_ON_*</code>).</li>
+                    <li>TP tipo trailing: <code>TP_ORDER_TYPE=trailing</code>, callback <code>TP_TRAILING_CALLBACK_RATE</code> (0.5%).</li>
+                    <li>Reprice SL/TP si drift &gt; <code>SL_REPRICE_TOLERANCE_PCT</code> / <code>TP_REPRICE_TOLERANCE_PCT</code>.</li>
+                </ul>
+            </section>
+
+            <section id="ejecucion" class="help-section">
+                <h2>7. Ejecución en Binance Futures</h2>
+                <ul>
+                    <li><code>EXECUTION_ENABLED=false</code> por defecto. <code>EXECUTION_MODE=dry</code> solo registra; <code>live</code> envía órdenes.</li>
+                    <li><code>EXECUTE_ON_VALID_ENTRY=true</code>: orden automática al confirmar valid entry.</li>
+                    <li>Tamaño: <code>POSITION_SIZE_USDT</code> (25) o <code>POSITION_WALLET_PCT</code> si &gt; 0.</li>
+                    <li>Apalancamiento: <code>LEVERAGE</code> (4) o <code>LEVERAGE_MODE=max</code> (máximo del símbolo).</li>
+                    <li>Primera pierna: <code>ENTRY_FIRST_LEG_MARKET=true</code> (MARKET + SL/TP desde fill real).</li>
+                    <li>DCA adicionales: órdenes LIMIT.</li>
+                    <li>Órdenes LIMIT de entrada sin fill: canceladas tras <code>ENTRY_LIMIT_TTL_SEC</code> (600 s).</li>
+                    <li>Cooldown entre órdenes: <code>EXECUTION_ORDER_COOLDOWN</code> (180 s).</li>
+                    <li>Mantenimiento SL/TP: cada <code>EXECUTION_MAINTENANCE_SEC</code> (60 s).</li>
+                    <li>No abre si ya hay posición, límite conflictivo o duplicado (<code>EXECUTION_BLOCK_IF_OPEN</code>).</li>
+                </ul>
+            </section>
+
+            <section id="hub" class="help-section">
+                <h2>8. Interpretar el Hub</h2>
+                <div class="help-table-wrap">
+                    <table class="help-table">
+                        <thead>
+                            <tr>
+                                <th>Campo</th>
+                                <th>Significado</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Signal / Action</td><td>Dirección (LONG/SHORT/NEUTRAL) y si alcanza umbral TRADE</td></tr>
+                            <tr><td>Confidence</td><td>0–100%. TRADE requiere ≥ MIN_CONFIDENCE</td></tr>
+                            <tr><td>Trend</td><td>Bias HTF (BULLISH/BEARISH/NEUTRAL)</td></tr>
+                            <tr><td>SMC</td><td>Estado estructural (BOS, CHoCH, EQH, etc.)</td></tr>
+                            <tr><td>OB zone</td><td>Proximidad a soporte/resistencia del libro</td></tr>
+                            <tr><td>Position</td><td>Posición Futures abierta (desde cache REST de flota)</td></tr>
+                            <tr><td>Protection</td><td>SL/TP/trailing activos</td></tr>
+                            <tr><td>Estado WS</td><td><em>connecting</em> = sin depth; <em>live</em> = operativo; <em>buffering depth</em> = sincronizando snapshot</td></tr>
+                            <tr><td>exec LIVE / dry</td><td>Modo de ejecución del par</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <p>Meta superior: exposición L/S en USDT, imbalance %, cap de balance lateral, contadores TRADE/WATCH y chips Blocked.</p>
+            </section>
+
+            <section id="esperas" class="help-section">
+                <h2>9. ¿Cuánto tarda en haber señales?</h2>
+                <p><strong>Sí, pueden pasar horas sin ninguna señal TRADE ejecutable.</strong> Es comportamiento esperado cuando:</p>
+                <ul>
+                    <li>El precio está en la zona media del rango OB (35–65%) → NEUTRAL prolongado.</li>
+                    <li>HTF en NEUTRAL → ningún valid entry con <code>REQUIRE_TREND_ALIGN=true</code>.</li>
+                    <li>ADX bajo (&lt; 25) → mercado sin tendencia clara.</li>
+                    <li>Movimientos 24h moderados (±2%) → solo 40% confianza, quedan en WATCH.</li>
+                    <li>Varios pares en <em>connecting</em> → sin libro de órdenes, sin señal.</li>
+                </ul>
+                <p>Tiempos de referencia (con datos en vivo):</p>
+                <ul>
+                    <li>Debounce: ~5 × <code>DEPTH_METRICS_INTERVAL_SEC</code> ≈ 1.25 s mínimo (si depth estable).</li>
+                    <li>Cooldown entre entradas del mismo par: <code>SIGNAL_COOLDOWN_SEC</code> (180 s).</li>
+                    <li>Hub refresh: 3 s. UI individual: <code>METRICS_INTERVAL_MS</code> (5000 ms default).</li>
+                    <li>WS ping: cada <code>WS_PING_INTERVAL</code> (20 s), timeout <code>WS_PING_TIMEOUT</code> (120 s).</li>
+                </ul>
+                <p class="help-warn">Si <em>todos</em> los pares muestran precio «—» y <em>connecting</em> durante mucho tiempo, revisa que <code>./run-all.sh</code> esté activo y que los procesos escuchen en los puertos de <code>hub/pairs.json</code>.</p>
+            </section>
+
+            <section id="antiban" class="help-section">
+                <h2>10. Anti-baneo y rate limits</h2>
+                <p>Binance limita REST y puede bloquear IP (HTTP 418, 403 CloudFront, 429 / -1003). El sistema incluye varias capas:</p>
+
+                <h3>fapi_watch (vigilancia REST)</h3>
+                <ul>
+                    <li>Activo con <code>./run-all.sh</code> (hilo en <code>telegram_fleet.py</code>).</li>
+                    <li>Prueba <code>GET /fapi/v1/ping</code> cada <code>FAPI_WATCH_INTERVAL_SEC</code> (600 s = 10 min).</li>
+                    <li>Si falla (403, 418, CloudFront, timeout): <strong>pausa trading</strong> (= <code>/stop</code>) y alerta Telegram.</li>
+                    <li>Cooldown de alertas repetidas: <code>FAPI_WATCH_COOLDOWN_SEC</code> (3600 s).</li>
+                    <li>Al recuperar HTTP 200: notifica pero <strong>no reanuda solo</strong> — envía <code>/start</code> manualmente.</li>
+                    <li>Desactivar: <code>FAPI_WATCH_ENABLED=false</code>.</li>
+                </ul>
+
+                <h3>Cache REST compartida (flota)</h3>
+                <ul>
+                    <li><code>FLEET_REST_CACHE_ENABLED=true</code>: un solo <code>positionRisk</code> + <code>openOrders</code> para todos los pares.</li>
+                    <li>TTL: <code>FLEET_REST_CACHE_SEC</code> (30 s). Archivo: <code>logs/fleet_rest_cache.json</code>.</li>
+                    <li>Cache de posición por par: <code>EXECUTION_POSITION_CACHE_SEC</code> (45 s).</li>
+                    <li>Cache cuenta/PnL: <code>ACCOUNT_SNAPSHOT_CACHE_SEC</code> (60 s).</li>
+                    <li>Exposición L/S flota: <code>FLEET_EXPOSURE_CACHE_SEC</code> (60 s).</li>
+                </ul>
+
+                <h3>Backoff automático</h3>
+                <ul>
+                    <li>Ante error -1003 / «banned until», parsea timestamp y deja de llamar REST hasta esa hora.</li>
+                    <li>Durante backoff usa último cache disponible en lugar de golpear la API.</li>
+                </ul>
+
+                <h3>WebSocket vs REST</h3>
+                <ul>
+                    <li>Señales usan <strong>WebSocket Spot</strong> (sin límite de weight REST para depth en vivo).</li>
+                    <li>REST solo para ejecución, posiciones, SL/TP y panel de cuenta — minimizado por caches.</li>
+                    <li><code>DEPTH_METRICS_INTERVAL_SEC=0.25</code>: recalcula señal como máximo 4×/s (libro sigue actualizándose cada tick).</li>
+                    <li><code>METRICS_INTERVAL_MS=5000</code>: UI hace menos lecturas REST.</li>
+                </ul>
+
+                <h3>Buenas prácticas</h3>
+                <ul>
+                    <li>No abras puertos 8051+ al público; usa solo el hub (8050) detrás de nginx.</li>
+                    <li>Un solo proceso debe hacer polling Telegram (<code>getUpdates</code>) — evita 409 Conflict.</li>
+                    <li>Si ves 418 en el hub: espera o cambia IP del VPS; no fuerces REST.</li>
+                    <li>Prueba manual: <code>.venv/bin/python scripts/check_fapi_health.py --dry-run</code></li>
+                </ul>
+            </section>
+
+            <section id="telegram" class="help-section">
+                <h2>11. Telegram y flota</h2>
+                <p>Variables: <code>TELEGRAM_BOT_TOKEN</code>, <code>TELEGRAM_CHAT_ID</code>.</p>
+                <p>Comandos (solo el chat autorizado, un listener con <code>./run-all.sh</code>):</p>
+                <ul>
+                    <li><code>/status</code> — resumen flota: TRADE, posiciones abiertas, offline</li>
+                    <li><code>/stop</code> — pausa trading en todos los pares</li>
+                    <li><code>/start</code> — reanuda trading</li>
+                </ul>
+                <p>Alertas automáticas: valid entry, apertura/cierre, errores de orden (cooldown <code>ORDER_FAIL_NOTIFY_COOLDOWN</code> 120 s), bloqueo fapi_watch.</p>
+                <p>Estado compartido en <code>logs/fleet.state</code> (<code>trading_paused</code>, <code>fleet_running</code>).</p>
+            </section>
+
+            <section id="variables" class="help-section">
+                <h2>12. Variables de entorno</h2>
+                <p>Todas viven en <code>.env</code> (ver <code>.env.example</code>). Con <code>DB_ENABLED=true</code>, MySQL puede override por par vía Analytics/DeepSeek.</p>
+
+                <h3>Datos y señal</h3>
+                <div class="help-table-wrap">
+                    <table class="help-table help-table-compact">
+                        <thead><tr><th>Variable</th><th>Default</th><th>Descripción</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>SYMBOL</code></td><td>btcusdt</td><td>Par (CLI <code>app.py SYMBOL</code> lo override)</td></tr>
+                            <tr><td><code>INTERVAL</code></td><td>1m</td><td>Velas LTF</td></tr>
+                            <tr><td><code>HTF_INTERVAL</code></td><td>15m</td><td>Velas tendencia / SMC HTF</td></tr>
+                            <tr><td><code>HTF_CANDLES</code></td><td>120</td><td>Velas HTF en memoria</td></tr>
+                            <tr><td><code>DEPTH_LEVELS</code></td><td>20</td><td>Niveles del libro mostrados</td></tr>
+                            <tr><td><code>OB_WALL_RANGE_PCT</code></td><td>0.6</td><td>Rango % alrededor del mid para muros OB</td></tr>
+                            <tr><td><code>MAX_CANDLES</code></td><td>200</td><td>Velas LTF en memoria</td></tr>
+                            <tr><td><code>MIN_CONFIDENCE</code></td><td>50</td><td>Umbral TRADE (%)</td></tr>
+                            <tr><td><code>SIGNAL_ZONE_LONG_ENTER</code></td><td>20</td><td>% rango para entrar LONG</td></tr>
+                            <tr><td><code>SIGNAL_ZONE_LONG_EXIT</code></td><td>35</td><td>% rango para salir de LONG a NEUTRAL</td></tr>
+                            <tr><td><code>SIGNAL_ZONE_SHORT_ENTER</code></td><td>80</td><td>% rango para entrar SHORT</td></tr>
+                            <tr><td><code>SIGNAL_ZONE_SHORT_EXIT</code></td><td>65</td><td>% rango para salir de SHORT</td></tr>
+                            <tr><td><code>SIGNAL_DEBOUNCE_COUNT</code></td><td>5</td><td>Lecturas consecutivas iguales</td></tr>
+                            <tr><td><code>SIGNAL_COOLDOWN_SEC</code></td><td>180</td><td>Segundos entre valid entries</td></tr>
+                            <tr><td><code>REQUIRE_TREND_ALIGN</code></td><td>true</td><td>Exige alineación con HTF</td></tr>
+                            <tr><td><code>MIN_PATTERN_RANGE_PCT</code></td><td>0.02</td><td>Tamaño mínimo vela para patrón</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <h3>WebSocket y UI</h3>
+                <div class="help-table-wrap">
+                    <table class="help-table help-table-compact">
+                        <thead><tr><th>Variable</th><th>Default</th><th>Descripción</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>WS_PING_INTERVAL</code></td><td>20</td><td>Segundos entre pings WS</td></tr>
+                            <tr><td><code>WS_PING_TIMEOUT</code></td><td>120</td><td>Timeout sin pong</td></tr>
+                            <tr><td><code>DEPTH_METRICS_INTERVAL_SEC</code></td><td>0.25</td><td>Throttle recálculo señal en depth</td></tr>
+                            <tr><td><code>METRICS_INTERVAL_MS</code></td><td>5000</td><td>Poll UI dashboard (ms)</td></tr>
+                            <tr><td><code>DASH_HOST</code> / <code>DASH_PORT</code></td><td>0.0.0.0 / 8050</td><td>Bind dashboard individual</td></tr>
+                            <tr><td><code>HUB_PORT</code></td><td>8050</td><td>Puerto hub + analytics</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <h3>Indicadores</h3>
+                <div class="help-table-wrap">
+                    <table class="help-table help-table-compact">
+                        <thead><tr><th>Variable</th><th>Default</th><th>Descripción</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>EMA_FAST</code> / <code>EMA_SLOW</code> / <code>HTF_EMA_TREND</code></td><td>9 / 21 / 50</td><td>EMAs tendencia</td></tr>
+                            <tr><td><code>RSI_PERIOD</code></td><td>14</td><td>Periodo RSI</td></tr>
+                            <tr><td><code>MACD_FAST/SLOW/SIGNAL</code></td><td>12/26/9</td><td>MACD</td></tr>
+                            <tr><td><code>ADX_PERIOD</code></td><td>14</td><td>Periodo ADX</td></tr>
+                            <tr><td><code>INDICATOR_FILTERS_ENABLED</code></td><td>true</td><td>Master switch filtros</td></tr>
+                            <tr><td><code>RSI_FILTER_ENABLED</code></td><td>true</td><td>Filtro RSI</td></tr>
+                            <tr><td><code>RSI_LONG_MAX</code> / <code>RSI_SHORT_MIN</code></td><td>70 / 30</td><td>Umbrales RSI</td></tr>
+                            <tr><td><code>ADX_FILTER_ENABLED</code></td><td>true</td><td>Filtro ADX</td></tr>
+                            <tr><td><code>ADX_MIN_TREND</code></td><td>25</td><td>ADX mínimo</td></tr>
+                            <tr><td><code>ADX_USE_HTF</code></td><td>true</td><td>ADX en velas HTF</td></tr>
+                            <tr><td><code>MACD_FILTER_ENABLED</code></td><td>false</td><td>Filtro MACD</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <h3>SMC</h3>
+                <div class="help-table-wrap">
+                    <table class="help-table help-table-compact">
+                        <thead><tr><th>Variable</th><th>Default</th><th>Descripción</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>SMC_SWING_LEFT/RIGHT</code></td><td>2 / 2</td><td>Fractales HTF</td></tr>
+                            <tr><td><code>SMC_INT_SWING_LEFT/RIGHT</code></td><td>1 / 1</td><td>Fractales LTF</td></tr>
+                            <tr><td><code>SMC_BREAK_LOOKBACK_HTF/LTF</code></td><td>3 / 12</td><td>Velas hacia atrás para BOS/CHoCH</td></tr>
+                            <tr><td><code>SMC_EQ_TOLERANCE_PCT</code></td><td>0.08</td><td>Tolerancia equal highs/lows</td></tr>
+                            <tr><td><code>SMC_PD_DISCOUNT_MAX</code></td><td>38</td><td>Zona discount (% rango)</td></tr>
+                            <tr><td><code>SMC_PD_PREMIUM_MIN</code></td><td>62</td><td>Zona premium (% rango)</td></tr>
+                            <tr><td><code>SWING_LOOKBACK</code></td><td>20</td><td>Lookback swings liquidez</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <h3>Plan de trade</h3>
+                <div class="help-table-wrap">
+                    <table class="help-table help-table-compact">
+                        <thead><tr><th>Variable</th><th>Default</th><th>Descripción</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>TRADE_PLAN_INITIAL_SIZE_PCT</code></td><td>50</td><td>% wallet primera pierna</td></tr>
+                            <tr><td><code>TRADE_PLAN_DCA_STEPS</code></td><td>2</td><td>Niveles DCA extra</td></tr>
+                            <tr><td><code>TRADE_PLAN_DCA_STEP_PCT</code></td><td>2.5</td><td>Espaciado DCA (%)</td></tr>
+                            <tr><td><code>TRADE_PLAN_DCA_COMPENSATION</code></td><td>true</td><td>Modo USDT × band%</td></tr>
+                            <tr><td><code>TRADE_PLAN_DCA_COMP_USDT_PER_PCT</code></td><td>1</td><td>Multiplicador compensación</td></tr>
+                            <tr><td><code>TRADE_PLAN_EXECUTE_DCA</code></td><td>true</td><td>Ejecutar piernas DCA</td></tr>
+                            <tr><td><code>TRADE_PLAN_DCA_SIGNAL_DRIVEN</code></td><td>true</td><td>DCA por señal, no todo junto</td></tr>
+                            <tr><td><code>TRADE_PLAN_DCA_ADVERSE_ONLY</code></td><td>true</td><td>DCA solo en pérdida</td></tr>
+                            <tr><td><code>DCA_FAVORABLE_PNL_MAX_USDT</code></td><td>0</td><td>Máx PnL para permitir DCA</td></tr>
+                            <tr><td><code>TRADE_PLAN_SL_BUFFER_PCT</code></td><td>0.25</td><td>Buffer SL vs estructura</td></tr>
+                            <tr><td><code>TRADE_PLAN_SL_MIN_DISTANCE_PCT</code></td><td>1.0</td><td>Distancia mínima entry-SL</td></tr>
+                            <tr><td><code>TRADE_PLAN_TP1_RR</code> / <code>TP2_RR</code></td><td>1.0 / 2.0</td><td>Risk-reward TP1/TP2</td></tr>
+                            <tr><td><code>TRADE_PLAN_PARTIAL_CLOSE_PCT</code></td><td>70</td><td>% cierre en TP1</td></tr>
+                            <tr><td><code>TRADE_PLAN_AUTO_BE</code></td><td>true</td><td>Break-even automático</td></tr>
+                            <tr><td><code>TRADE_PLAN_BE_BUFFER_PCT</code></td><td>0.05</td><td>Buffer BE sobre entrada</td></tr>
+                            <tr><td><code>BE_TRIGGER_*</code></td><td>varios true</td><td>Disparadores BE (señal, parcial, HTF, RSI…)</td></tr>
+                            <tr><td><code>TP_ORDER_TYPE</code></td><td>trailing</td><td>Tipo TP (<code>trailing</code> u otro)</td></tr>
+                            <tr><td><code>TP_TRAILING_CALLBACK_RATE</code></td><td>0.5</td><td>Callback trailing (%)</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <h3>Ejecución y flota</h3>
+                <div class="help-table-wrap">
+                    <table class="help-table help-table-compact">
+                        <thead><tr><th>Variable</th><th>Default</th><th>Descripción</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>EXECUTION_ENABLED</code></td><td>false</td><td>Activa módulo Futures</td></tr>
+                            <tr><td><code>EXECUTE_ON_VALID_ENTRY</code></td><td>true</td><td>Auto-orden en valid entry</td></tr>
+                            <tr><td><code>EXECUTION_MODE</code></td><td>dry</td><td><code>dry</code> o <code>live</code></td></tr>
+                            <tr><td><code>BINANCE_API_KEY</code> / <code>SECRET</code></td><td>—</td><td>Claves Futures</td></tr>
+                            <tr><td><code>FAPI_BASE</code></td><td>fapi.binance.com</td><td>Base URL Futures</td></tr>
+                            <tr><td><code>POSITION_SIZE_USDT</code></td><td>25</td><td>Notional por entrada</td></tr>
+                            <tr><td><code>POSITION_WALLET_PCT</code></td><td>0</td><td>% wallet (si &gt; 0, prioriza)</td></tr>
+                            <tr><td><code>LEVERAGE</code></td><td>4</td><td>Apalancamiento fijo</td></tr>
+                            <tr><td><code>ENTRY_FIRST_LEG_MARKET</code></td><td>true</td><td>Primera pierna MARKET</td></tr>
+                            <tr><td><code>ENTRY_LIMIT_TTL_SEC</code></td><td>600</td><td>Cancelar LIMIT sin fill</td></tr>
+                            <tr><td><code>EXECUTION_ORDER_COOLDOWN</code></td><td>180</td><td>Cooldown órdenes</td></tr>
+                            <tr><td><code>FLEET_SIDE_BALANCE_MAX_PCT</code></td><td>20</td><td>Cap imbalance L/S</td></tr>
+                            <tr><td><code>FLEET_REST_CACHE_SEC</code></td><td>30</td><td>Cache REST compartida</td></tr>
+                            <tr><td><code>EXECUTION_POSITION_CACHE_SEC</code></td><td>45</td><td>Cache posición</td></tr>
+                            <tr><td><code>EXECUTION_MAINTENANCE_SEC</code></td><td>60</td><td>Reconcile SL/TP</td></tr>
+                            <tr><td><code>PROTECTION_RECONCILE_ENABLED</code></td><td>true</td><td>Reparar protección faltante</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <h3>fapi_watch y hub</h3>
+                <div class="help-table-wrap">
+                    <table class="help-table help-table-compact">
+                        <thead><tr><th>Variable</th><th>Default</th><th>Descripción</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>FAPI_WATCH_ENABLED</code></td><td>true</td><td>Vigilancia ping Futures</td></tr>
+                            <tr><td><code>FAPI_WATCH_INTERVAL_SEC</code></td><td>600</td><td>Intervalo probe (s)</td></tr>
+                            <tr><td><code>FAPI_WATCH_COOLDOWN_SEC</code></td><td>3600</td><td>Cooldown alertas Telegram</td></tr>
+                            <tr><td><code>FAPI_WATCH_TIMEOUT_SEC</code></td><td>10</td><td>Timeout HTTP probe</td></tr>
+                            <tr><td><code>HUB_PROXY_HOST</code></td><td>127.0.0.1</td><td>Host dashboards para proxy</td></tr>
+                            <tr><td><code>HUB_PROXY_TIMEOUT_SEC</code></td><td>5</td><td>Timeout hub-summary</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <h3>MySQL / DeepSeek (opcional)</h3>
+                <div class="help-table-wrap">
+                    <table class="help-table help-table-compact">
+                        <thead><tr><th>Variable</th><th>Default</th><th>Descripción</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>DB_ENABLED</code></td><td>false</td><td>MySQL para audit + overrides</td></tr>
+                            <tr><td><code>DB_HOST/PORT/NAME/USER/PASSWORD</code></td><td>127.0.0.1…</td><td>Conexión MySQL</td></tr>
+                            <tr><td><code>DB_CONFIG_POLL_SEC</code></td><td>0</td><td>Poll overrides (0 = solo reload API)</td></tr>
+                            <tr><td><code>DEEPSEEK_ENABLED</code></td><td>false</td><td>Sugerencias IA en Analytics</td></tr>
+                            <tr><td><code>DEEPSEEK_API_KEY</code></td><td>—</td><td>API DeepSeek</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <p class="help-note">Overrides por par en MySQL: <code>MIN_CONFIDENCE</code>, <code>HTF_INTERVAL</code>, <code>INTERVAL</code>, <code>REQUIRE_TREND_ALIGN</code>, <code>SIGNAL_DEBOUNCE_COUNT</code>, <code>SIGNAL_COOLDOWN_SEC</code>, filtros RSI/ADX/MACD, <code>symbol_trading_enabled</code>.</p>
+            </section>
+
+            <footer class="help-footer">
+                <p>Documentación generada desde el código del proyecto. Última revisión: variables en <code>.env.example</code>.</p>
+                <p class="help-disclaimer">El trading conlleva riesgo de pérdida de capital. Las señales son informativas, no asesoramiento financiero. Prueba siempre en <code>EXECUTION_MODE=dry</code> antes de operar en vivo.</p>
+            </footer>
+        </main>
+    </div>
+</body>
+</html>

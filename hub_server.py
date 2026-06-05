@@ -255,6 +255,12 @@ def hub_index():
     return send_from_directory(HUB_DIR, "index.html")
 
 
+@app.route("/help")
+@app.route("/help/")
+def help_page():
+    return send_from_directory(HUB_DIR, "help.html")
+
+
 @app.route("/<path:filename>")
 def hub_static(filename: str):
     if filename.startswith("api/") or filename.startswith("analytics/"):
@@ -271,6 +277,7 @@ def main() -> None:
     if db_store.is_enabled():
         db_store.run_migrations()
     print(f"Hub http://{HOST}:{PORT}/")
+    print(f"Help http://{HOST}:{PORT}/help")
     print(f"Analytics http://{HOST}:{PORT}/analytics/")
     app.run(host=HOST, port=PORT, debug=False, use_reloader=False)
 
