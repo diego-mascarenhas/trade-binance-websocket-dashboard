@@ -442,3 +442,13 @@ th {
         flex-direction: column;
     }
 }
+
+.adx-used-for-filter {
+    color: #f87171;
+    font-weight: 600;
+}
+
+.adx-filter-summary {
+    font-size: 0.85rem;
+    white-space: nowrap;
+}

@@ -117,6 +117,8 @@ def _flatten_row(row: dict[str, Any]) -> dict[str, Any]:
         "price": market.get("price"),
         "min_confidence": config.get("MIN_CONFIDENCE"),
         "htf_interval": config.get("HTF_INTERVAL"),
+        "adx_min_trend": config.get("ADX_MIN_TREND"),
+        "adx_use_htf": config.get("ADX_USE_HTF"),
         "execution_mode": config.get("execution_mode"),
         "execution_enabled": config.get("execution_enabled"),
         "execute_on_valid_entry": config.get("execute_on_valid_entry"),

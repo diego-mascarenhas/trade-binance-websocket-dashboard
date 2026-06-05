@@ -407,10 +407,66 @@ function renderTimeline(rows) {
     );
 }
 
+function formatAdxNumber(value) {
+    if (value == null || value === "") {
+        return null;
+    }
+    const num = Number(value);
+    return Number.isFinite(num) ? num.toFixed(1) : null;
+}
+
+function isAdxUseHtf(row) {
+    const value = row.adx_use_htf;
+    if (value == null) {
+        return true;
+    }
+    if (typeof value === "boolean") {
+        return value;
+    }
+    return String(value).toLowerCase() in ("1", "true", "yes");
+}
+
+function renderAdxCell(row, kind) {
+    const useHtf = isAdxUseHtf(row);
+    const isFilterTarget =
+        row.block_reason === "adx_low" && ((kind === "htf" && useHtf) || (kind === "ltf" && !useHtf));
+    const value = kind === "htf" ? row.htf_adx : row.adx;
+    const formatted = formatAdxNumber(value);
+    const interval = kind === "htf" ? row.htf_interval || "HTF" : "1m";
+    let title = kind === "htf" ? `ADX ${interval}` : "ADX 1m (LTF)";
+    if (isFilterTarget) {
+        const min = row.adx_min_trend;
+        title +=
+            min != null
+                ? ` — usado en adx_low (min ${min})`
+                : " — usado en adx_low";
+    }
+    const mark = isFilterTarget ? "*" : "";
+    const cls = isFilterTarget ? "adx-used-for-filter" : "";
+    return `<td class="${cls}" title="${escapeHtml(title)}">${formatted ?? "—"}${mark}</td>`;
+}
+
+function renderAdxFilterSummary(row) {
+    if (row.block_reason !== "adx_low") {
+        return "<td>—</td>";
+    }
+    const useHtf = isAdxUseHtf(row);
+    const source = useHtf ? "HTF" : "1m";
+    const value = useHtf ? row.htf_adx : row.adx;
+    const formatted = formatAdxNumber(value);
+    const min = row.adx_min_trend;
+    const interval = row.htf_interval ? ` ${row.htf_interval}` : "";
+    if (formatted == null || min == null) {
+        return `<td class="adx-filter-summary" title="adx_low">${source}${interval} · min ?</td>`;
+    }
+    const text = `${source}${interval}: ${formatted} &lt; ${min}`;
+    return `<td class="adx-filter-summary adx-used-for-filter" title="Motivo adx_low">${text}</td>`;
+}
+
 function renderRecent(rows) {
     const body = document.getElementById("recent-body");
     if (!rows.length) {
-        body.innerHTML = `<tr><td colspan="9">No events yet.</td></tr>`;
+        body.innerHTML = `<tr><td colspan="11">No events yet.</td></tr>`;
         return;
     }
     body.innerHTML = rows
@@ -425,7 +481,9 @@ function renderRecent(rows) {
                     <td>${row.signal || "—"}</td>
                     <td>${row.confidence ?? "—"}</td>
                     <td>${row.rsi ?? "—"}</td>
-                    <td>${row.adx ?? row.htf_adx ?? "—"}</td>
+                    ${renderAdxCell(row, "ltf")}
+                    ${renderAdxCell(row, "htf")}
+                    ${renderAdxFilterSummary(row)}
                 </tr>
             `
         )
