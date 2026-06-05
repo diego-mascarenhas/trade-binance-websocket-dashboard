@@ -108,6 +108,9 @@ HTF_INTERVAL = os.getenv("HTF_INTERVAL", "15m")
 HTF_CANDLES = int(os.getenv("HTF_CANDLES", "120"))
 REQUIRE_TREND_ALIGN = os.getenv("REQUIRE_TREND_ALIGN", "true").lower() in ("1", "true", "yes")
 SIGNAL_COOLDOWN_SEC = int(os.getenv("SIGNAL_COOLDOWN_SEC", "180"))
+DECISION_LOG_DEDUP_SEC = max(0, int(os.getenv("DECISION_LOG_DEDUP_SEC", "900")))
+_NOISY_DECISION_EVENTS = frozenset({"indicator_blocked", "valid_entry_blocked"})
+_last_decision_log_mono: dict[tuple[str, str, str], float] = {}
 WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "20"))
 WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "120"))
 METRICS_INTERVAL_MS = max(3000, int(os.getenv("METRICS_INTERVAL_MS", "8000")))
@@ -260,6 +263,20 @@ def log_decision_event(
     block_reason: str | None = None,
     market_snapshot: dict | None = None,
 ) -> None:
+    if (
+        DECISION_LOG_DEDUP_SEC > 0
+        and event_type in _NOISY_DECISION_EVENTS
+    ):
+        snap = market_snapshot or {}
+        signal = str(snap.get("signal") or "—").upper()
+        reason = str(block_reason or "—")
+        key = (event_type, reason, signal)
+        now = time.monotonic()
+        last = _last_decision_log_mono.get(key)
+        if last is not None and now - last < DECISION_LOG_DEDUP_SEC:
+            return
+        _last_decision_log_mono[key] = now
+
     db_store.log_decision_event(
         SYMBOL,
         event_type,
