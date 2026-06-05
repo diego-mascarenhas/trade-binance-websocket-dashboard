@@ -95,6 +95,12 @@ def health():
     return _cors(jsonify(payload))
 
 
+@app.route("/api/fapi-rest-metrics")
+def fapi_rest_metrics():
+    """Binance Futures REST usage (all processes, via execution.py)."""
+    return _cors(jsonify(execution.get_fapi_rest_metrics()))
+
+
 @app.route("/api/account-performance")
 def account_performance():
     """Live wallet + realized PnL averages + projection to MILLION_GOAL_USDT."""

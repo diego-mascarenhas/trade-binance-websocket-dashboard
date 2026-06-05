@@ -70,9 +70,13 @@ FLEET_SIDE_BALANCE_MAX_PCT = float(os.getenv("FLEET_SIDE_BALANCE_MAX_PCT", "20")
 FLEET_EXPOSURE_CACHE_SEC = float(os.getenv("FLEET_EXPOSURE_CACHE_SEC", "60"))
 FLEET_REST_CACHE_SEC = max(10.0, float(os.getenv("FLEET_REST_CACHE_SEC", "60")))
 FLEET_REST_CACHE_ENABLED = _env_bool("FLEET_REST_CACHE_ENABLED", "true")
+FAPI_SIGNED_RECOVERY_SEC = max(0.0, float(os.getenv("FAPI_SIGNED_RECOVERY_SEC", "0")))
+FAPI_SIGNED_PACE_SEC = max(0.0, float(os.getenv("FAPI_SIGNED_PACE_SEC", "1.0")))
 EXECUTION_BLOCK_IF_OPEN = _env_bool("EXECUTION_BLOCK_IF_OPEN", "true")
 EXECUTION_POSITION_CACHE_SEC = float(os.getenv("EXECUTION_POSITION_CACHE_SEC", "60"))
-ACCOUNT_SNAPSHOT_CACHE_SEC = float(os.getenv("ACCOUNT_SNAPSHOT_CACHE_SEC", "60"))
+ACCOUNT_SNAPSHOT_CACHE_SEC = float(os.getenv("ACCOUNT_SNAPSHOT_CACHE_SEC", "120"))
+FAPI_METRICS_ENABLED = _env_bool("FAPI_METRICS_ENABLED", "true")
+FAPI_WEIGHT_LIMIT_PER_MIN = max(1, int(os.getenv("FAPI_WEIGHT_LIMIT_PER_MIN", "2400")))
 PNL_STATS_LOOKBACK_DAYS = max(1, int(os.getenv("PNL_STATS_LOOKBACK_DAYS", "30")))
 MILLION_GOAL_USDT = float(os.getenv("MILLION_GOAL_USDT", "1000000"))
 BE_EXIT_PNL_MAX_USDT = float(os.getenv("BE_EXIT_PNL_MAX_USDT", "0.15"))
@@ -1101,6 +1105,30 @@ def _optional_env_float(name: str) -> float | None:
         return None
 
 
+def _account_snapshot_cache_path() -> Path:
+    return Path(LOG_DIR) / "account_snapshot.json"
+
+
+def _account_snapshot_lock_path() -> Path:
+    return Path(LOG_DIR) / "account_snapshot.lock"
+
+
+def _read_account_snapshot_file() -> dict[str, Any] | None:
+    path = _account_snapshot_cache_path()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_account_snapshot_file(payload: dict[str, Any]) -> None:
+    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    _account_snapshot_cache_path().write_text(json.dumps(payload, default=str), encoding="utf-8")
+
+
 def _unrealized_from_fleet_cache() -> float | None:
     """Fallback sum of open-position unrealized when /account is unavailable."""
     if not FLEET_REST_CACHE_ENABLED or not _keys_configured():
@@ -1122,7 +1150,7 @@ def _unrealized_from_fleet_cache() -> float | None:
 
 
 def get_account_wallet_snapshot(force: bool = False) -> dict[str, Any]:
-    """Cached Binance Futures wallet totals (shared across all pairs)."""
+    """Cached Binance Futures wallet totals (shared across hub + dashboards)."""
     global _account_snapshot_cache
     empty = {
         "configured": False,
@@ -1136,16 +1164,23 @@ def get_account_wallet_snapshot(force: bool = False) -> dict[str, Any]:
     if not _keys_configured():
         return dict(empty)
 
-    now = time.monotonic()
+    now_mono = time.monotonic()
+    now_epoch = time.time()
     with _account_snapshot_lock:
         if (
             not force
             and _account_snapshot_cache
-            and now - _account_snapshot_cache[0] < ACCOUNT_SNAPSHOT_CACHE_SEC
+            and now_mono - _account_snapshot_cache[0] < ACCOUNT_SNAPSHOT_CACHE_SEC
         ):
             return dict(_account_snapshot_cache[1])
 
     def _stale_snapshot(api_error: str) -> dict[str, Any] | None:
+        file_cached = _read_account_snapshot_file()
+        if file_cached and file_cached.get("wallet_usdt") is not None:
+            stale = {k: v for k, v in file_cached.items() if k != "fetched_at"}
+            stale["stale"] = True
+            stale["api_error"] = api_error
+            return stale
         with _account_snapshot_lock:
             if _account_snapshot_cache and _account_snapshot_cache[1].get("wallet_usdt") is not None:
                 stale = dict(_account_snapshot_cache[1])
@@ -1154,53 +1189,78 @@ def get_account_wallet_snapshot(force: bool = False) -> dict[str, Any]:
                 return stale
         return None
 
-    if _fapi_in_backoff():
-        until = _read_shared_fapi_backoff_until()
-        err = (
-            f"Futures REST backoff until "
-            f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))}"
-        )
-        cached = _stale_snapshot(err)
+    rest_block = _fapi_rest_block_reason()
+    if rest_block:
+        cached = _stale_snapshot(rest_block)
         if cached:
             return cached
-        out = {**empty, "configured": True, "api_error": err}
+        out = {**empty, "configured": True, "api_error": rest_block}
         unrealized = _unrealized_from_fleet_cache()
         if unrealized is not None:
             out["unrealized_usdt"] = unrealized
             out["unrealized_source"] = "fleet_cache"
         return out
 
-    snapshot = {
-        "configured": True,
-        "wallet_usdt": None,
-        "available_usdt": None,
-        "unrealized_usdt": None,
-        "margin_balance_usdt": None,
-        "api_error": None,
-        "stale": False,
-    }
+    file_cached = _read_account_snapshot_file()
+    if (
+        not force
+        and file_cached
+        and now_epoch - float(file_cached.get("fetched_at") or 0) < ACCOUNT_SNAPSHOT_CACHE_SEC
+    ):
+        payload = {k: v for k, v in file_cached.items() if k != "fetched_at"}
+        with _account_snapshot_lock:
+            _account_snapshot_cache = (now_mono, dict(payload))
+        return dict(payload)
+
+    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    lock_handle = open(_account_snapshot_lock_path(), "w", encoding="utf-8")
+    snapshot: dict[str, Any]
     try:
-        account = _fapi_request("GET", "/fapi/v2/account", {})
-        snapshot["wallet_usdt"] = float(account.get("totalWalletBalance", 0) or 0)
-        snapshot["available_usdt"] = float(account.get("availableBalance", 0) or 0)
-        snapshot["unrealized_usdt"] = float(account.get("totalUnrealizedProfit", 0) or 0)
-        snapshot["margin_balance_usdt"] = float(account.get("totalMarginBalance", 0) or 0)
-        snapshot["unrealized_source"] = "account"
-    except RuntimeError as exc:
-        err = str(exc)
-        logger.warning("Account snapshot failed: %s", exc)
-        cached = _stale_snapshot(err)
-        if cached:
-            return cached
-        snapshot["api_error"] = err
-        unrealized = _unrealized_from_fleet_cache()
-        if unrealized is not None:
-            snapshot["unrealized_usdt"] = unrealized
-            snapshot["unrealized_source"] = "fleet_cache"
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        file_cached = _read_account_snapshot_file()
+        if (
+            not force
+            and file_cached
+            and now_epoch - float(file_cached.get("fetched_at") or 0) < ACCOUNT_SNAPSHOT_CACHE_SEC
+        ):
+            snapshot = {k: v for k, v in file_cached.items() if k != "fetched_at"}
+        else:
+            snapshot = {
+                "configured": True,
+                "wallet_usdt": None,
+                "available_usdt": None,
+                "unrealized_usdt": None,
+                "margin_balance_usdt": None,
+                "api_error": None,
+                "stale": False,
+            }
+            try:
+                account = _fapi_request("GET", "/fapi/v2/account", {})
+                snapshot["wallet_usdt"] = float(account.get("totalWalletBalance", 0) or 0)
+                snapshot["available_usdt"] = float(account.get("availableBalance", 0) or 0)
+                snapshot["unrealized_usdt"] = float(account.get("totalUnrealizedProfit", 0) or 0)
+                snapshot["margin_balance_usdt"] = float(account.get("totalMarginBalance", 0) or 0)
+                snapshot["unrealized_source"] = "account"
+            except RuntimeError as exc:
+                err = str(exc)
+                logger.warning("Account snapshot failed: %s", exc)
+                stale = _stale_snapshot(err)
+                if stale:
+                    return stale
+                snapshot["api_error"] = err
+                unrealized = _unrealized_from_fleet_cache()
+                if unrealized is not None:
+                    snapshot["unrealized_usdt"] = unrealized
+                    snapshot["unrealized_source"] = "fleet_cache"
+            if snapshot.get("wallet_usdt") is not None:
+                _write_account_snapshot_file({**snapshot, "fetched_at": time.time()})
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
 
     if snapshot.get("wallet_usdt") is not None:
         with _account_snapshot_lock:
-            _account_snapshot_cache = (now, dict(snapshot))
+            _account_snapshot_cache = (now_mono, dict(snapshot))
     return dict(snapshot)
 
 
@@ -1489,6 +1549,115 @@ def _fapi_backoff_path() -> Path:
     return Path(LOG_DIR) / "fapi_backoff.json"
 
 
+def _fapi_recovery_path() -> Path:
+    return Path(LOG_DIR) / "fapi_signed_recovery.json"
+
+
+def _fapi_backoff_lock_path() -> Path:
+    return Path(LOG_DIR) / "fapi_backoff.transition.lock"
+
+
+def _fapi_signed_pace_path() -> Path:
+    return Path(LOG_DIR) / "fapi_signed_pace.json"
+
+
+def _read_signed_recovery_until() -> float:
+    path = _fapi_recovery_path()
+    if not path.exists():
+        return 0.0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        until = float(data.get("until") or 0)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return 0.0
+    if until <= time.time():
+        _clear_signed_recovery()
+        return 0.0
+    return until
+
+
+def _maybe_start_signed_recovery_after_backoff() -> None:
+    """One recovery window per backoff expiry (never extend an active recovery)."""
+    if FAPI_SIGNED_RECOVERY_SEC <= 0:
+        return
+    now = time.time()
+    if _read_signed_recovery_until() > now:
+        return
+    _set_signed_recovery_until(now + FAPI_SIGNED_RECOVERY_SEC)
+    logger.info(
+        "Futures REST backoff expired — signed REST pause %.0fs",
+        FAPI_SIGNED_RECOVERY_SEC,
+    )
+
+
+def _expire_fapi_backoff_file_if_needed() -> None:
+    """Atomically drop expired backoff file and optionally start recovery once."""
+    global _fapi_backoff_until, _fapi_backoff_file_read_at
+    path = _fapi_backoff_path()
+    if not path.exists():
+        _fapi_backoff_until = 0.0
+        return
+    try:
+        file_until = float(json.loads(path.read_text(encoding="utf-8")).get("until") or 0)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        _fapi_backoff_until = 0.0
+        return
+    if file_until > time.time():
+        _fapi_backoff_until = max(_fapi_backoff_until, file_until)
+        return
+
+    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    lock_handle = open(_fapi_backoff_lock_path(), "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        if not path.exists():
+            _fapi_backoff_until = 0.0
+            return
+        try:
+            file_until = float(json.loads(path.read_text(encoding="utf-8")).get("until") or 0)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            path.unlink(missing_ok=True)
+            _fapi_backoff_until = 0.0
+            return
+        if file_until > time.time():
+            _fapi_backoff_until = max(_fapi_backoff_until, file_until)
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Could not delete expired fapi_backoff.json: %s", exc)
+        _fapi_backoff_until = 0.0
+        _fapi_backoff_file_read_at = time.time()
+        _maybe_start_signed_recovery_after_backoff()
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+
+def _set_signed_recovery_until(until_epoch: float) -> None:
+    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    _fapi_recovery_path().write_text(
+        json.dumps({"until": until_epoch, "updated_at": time.time()}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _clear_signed_recovery() -> None:
+    try:
+        _fapi_recovery_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _signed_rest_paused() -> bool:
+    """Block signed REST briefly after IP backoff expires (ping may work before account)."""
+    return time.time() < _read_signed_recovery_until()
+
+
 def _parse_fapi_ban_until(detail: str) -> float | None:
     if "-1003" not in detail and "too many requests" not in detail.lower():
         return None
@@ -1510,6 +1679,7 @@ def clear_fapi_backoff(*, reason: str = "recovered") -> bool:
             path.unlink(missing_ok=True)
         except OSError:
             pass
+    _clear_signed_recovery()
     if had_active:
         logger.info("Futures REST backoff cleared (%s)", reason)
     return had_active
@@ -1525,26 +1695,25 @@ def _read_shared_fapi_backoff_until() -> float:
                 return 0.0
             return _fapi_backoff_until
         _fapi_backoff_file_read_at = now
-        path = _fapi_backoff_path()
-        if not path.exists():
+
+    path = _fapi_backoff_path()
+    if not path.exists():
+        with _fapi_backoff_lock:
             _fapi_backoff_until = 0.0
-            return 0.0
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            file_until = float(data.get("until") or 0)
-            if file_until <= now:
-                _fapi_backoff_until = 0.0
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                logger.info("Futures REST backoff expired — file removed")
-                return 0.0
-            _fapi_backoff_until = max(_fapi_backoff_until, file_until)
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            pass
-        if _fapi_backoff_until <= now:
-            return 0.0
+        return 0.0
+    try:
+        file_until = float(json.loads(path.read_text(encoding="utf-8")).get("until") or 0)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        _expire_fapi_backoff_file_if_needed()
+        with _fapi_backoff_lock:
+            return max(_fapi_backoff_until, 0.0) if _fapi_backoff_until > now else 0.0
+
+    if file_until <= now:
+        _expire_fapi_backoff_file_if_needed()
+        return 0.0
+
+    with _fapi_backoff_lock:
+        _fapi_backoff_until = max(_fapi_backoff_until, file_until)
         return _fapi_backoff_until
 
 
@@ -1572,14 +1741,331 @@ def _fapi_in_backoff() -> bool:
     return time.time() < _read_shared_fapi_backoff_until()
 
 
+def _fapi_rest_block_reason() -> str | None:
+    if _fapi_in_backoff():
+        until = _read_shared_fapi_backoff_until()
+        return (
+            f"Futures REST backoff until "
+            f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))}"
+        )
+    if _signed_rest_paused():
+        until = _read_signed_recovery_until()
+        return (
+            f"Futures REST recovery pause until "
+            f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))}"
+        )
+    return None
+
+
 def _apply_fapi_error_backoff(detail: str) -> None:
     until = _parse_fapi_ban_until(detail)
     if until:
         _set_fapi_backoff(until)
+        _clear_signed_recovery()
         logger.warning(
             "Futures REST rate limited — backing off until %s UTC",
             time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(until)),
         )
+
+
+def fapi_public_blocked_reason() -> str | None:
+    """Block all fapi REST (including app.py market bootstrap) during IP backoff."""
+    if _fapi_in_backoff():
+        until = _read_shared_fapi_backoff_until()
+        return (
+            f"Futures REST backoff until "
+            f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))}"
+        )
+    return None
+
+
+def notify_fapi_rest_result(
+    *,
+    kind: str,
+    method: str,
+    path: str,
+    ok: bool,
+    detail: str = "",
+    headers: dict[str, str] | None = None,
+) -> None:
+    """Record + backoff for REST outside _fapi_public_get (e.g. app.py aiohttp bootstrap)."""
+    hdrs = headers or {}
+    outcome = "success" if ok else "error"
+    _record_fapi_rest_metrics(
+        kind=kind,
+        method=method,
+        path=path,
+        outcome=outcome,
+        binance_weight_1m=hdrs.get("X-MBX-USED-WEIGHT-1M") or hdrs.get("x-mbx-used-weight-1m"),
+        binance_order_count_1m=hdrs.get("X-MBX-ORDER-COUNT-1M") or hdrs.get("x-mbx-order-count-1m"),
+    )
+    if not ok and detail:
+        _apply_fapi_error_backoff(detail)
+
+
+def _acquire_signed_rest_pace() -> None:
+    """Fleet-wide minimum gap between signed REST calls (avoids post-ban stampede)."""
+    if FAPI_SIGNED_PACE_SEC <= 0:
+        return
+    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    lock_handle = open(_fapi_signed_pace_path().with_suffix(".lock"), "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        pace_path = _fapi_signed_pace_path()
+        last_at = 0.0
+        if pace_path.exists():
+            try:
+                last_at = float(json.loads(pace_path.read_text(encoding="utf-8")).get("last_at") or 0)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                last_at = 0.0
+        while True:
+            now = time.time()
+            wait = FAPI_SIGNED_PACE_SEC - (now - last_at)
+            if wait <= 0:
+                break
+            time.sleep(min(wait, 0.25))
+        pace_path.write_text(
+            json.dumps({"last_at": time.time()}, indent=2),
+            encoding="utf-8",
+        )
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+
+def _fapi_metrics_path() -> Path:
+    return Path(LOG_DIR) / "fapi_rest_metrics.json"
+
+
+def _fapi_metrics_lock_path() -> Path:
+    return Path(LOG_DIR) / "fapi_rest_metrics.lock"
+
+
+def _empty_fapi_minute_bucket() -> dict[str, Any]:
+    return {
+        "attempts": 0,
+        "sent": 0,
+        "blocked": 0,
+        "success": 0,
+        "errors": 0,
+        "by_endpoint": {},
+        "binance_weight_1m": None,
+        "binance_order_count_1m": None,
+        "binance_weight_updated_at": None,
+    }
+
+
+def _fapi_minute_floor(epoch: float | None = None) -> int:
+    ts = time.time() if epoch is None else epoch
+    return int(ts // 60) * 60
+
+
+def _fapi_endpoint_key(method: str, path: str) -> str:
+    return f"{method.upper()} {path}"
+
+
+def _parse_binance_metric_header(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_fapi_rest_metrics(
+    *,
+    kind: str,
+    method: str,
+    path: str,
+    outcome: str,
+    binance_weight_1m: str | None = None,
+    binance_order_count_1m: str | None = None,
+) -> None:
+    """Cross-process REST counters (all traffic via _fapi_request / _fapi_public_get)."""
+    if not FAPI_METRICS_ENABLED:
+        return
+    endpoint = _fapi_endpoint_key(method, path)
+    minute_ts = _fapi_minute_floor()
+    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    lock_handle = open(_fapi_metrics_lock_path(), "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        metrics_path = _fapi_metrics_path()
+        data: dict[str, Any]
+        if metrics_path.exists():
+            try:
+                raw = json.loads(metrics_path.read_text(encoding="utf-8"))
+                data = raw if isinstance(raw, dict) else {}
+            except (OSError, json.JSONDecodeError):
+                data = {}
+        else:
+            data = {}
+
+        if int(data.get("minute_ts") or 0) != minute_ts:
+            data["previous_minute"] = data.get("current") or _empty_fapi_minute_bucket()
+            data["previous_minute_ts"] = data.get("minute_ts")
+            data["current"] = _empty_fapi_minute_bucket()
+            data["minute_ts"] = minute_ts
+
+        bucket = data.setdefault("current", _empty_fapi_minute_bucket())
+        by_ep = bucket.setdefault("by_endpoint", {})
+        ep = by_ep.setdefault(
+            endpoint,
+            {"kind": kind, "sent": 0, "blocked": 0, "success": 0, "errors": 0},
+        )
+        ep["kind"] = kind
+        bucket["attempts"] = int(bucket.get("attempts") or 0) + 1
+        if outcome == "blocked":
+            bucket["blocked"] = int(bucket.get("blocked") or 0) + 1
+            ep["blocked"] = int(ep.get("blocked") or 0) + 1
+        elif outcome == "success":
+            bucket["sent"] = int(bucket.get("sent") or 0) + 1
+            bucket["success"] = int(bucket.get("success") or 0) + 1
+            ep["sent"] = int(ep.get("sent") or 0) + 1
+            ep["success"] = int(ep.get("success") or 0) + 1
+        elif outcome == "error":
+            bucket["sent"] = int(bucket.get("sent") or 0) + 1
+            bucket["errors"] = int(bucket.get("errors") or 0) + 1
+            ep["sent"] = int(ep.get("sent") or 0) + 1
+            ep["errors"] = int(ep.get("errors") or 0) + 1
+
+        weight = _parse_binance_metric_header(binance_weight_1m)
+        if weight is not None:
+            bucket["binance_weight_1m"] = weight
+            bucket["binance_weight_updated_at"] = time.time()
+        order_count = _parse_binance_metric_header(binance_order_count_1m)
+        if order_count is not None:
+            bucket["binance_order_count_1m"] = order_count
+
+        data["updated_at"] = time.time()
+        metrics_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.debug("fapi REST metrics write failed: %s", exc)
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+
+def record_fapi_rest_external(
+    method: str,
+    path: str,
+    *,
+    kind: str = "public",
+    outcome: str,
+    binance_weight_1m: str | None = None,
+    binance_order_count_1m: str | None = None,
+) -> None:
+    """Optional hook for probes outside execution (e.g. fapi_watch ping)."""
+    _record_fapi_rest_metrics(
+        kind=kind,
+        method=method,
+        path=path,
+        outcome=outcome,
+        binance_weight_1m=binance_weight_1m,
+        binance_order_count_1m=binance_order_count_1m,
+    )
+
+
+def _summarize_fapi_minute_bucket(
+    bucket: dict[str, Any] | None,
+    *,
+    minute_ts: int | None,
+) -> dict[str, Any]:
+    empty = _empty_fapi_minute_bucket()
+    data = dict(bucket or empty)
+    weight = data.get("binance_weight_1m")
+    weight_int = int(weight) if isinstance(weight, (int, float)) else None
+    limit = FAPI_WEIGHT_LIMIT_PER_MIN
+    by_ep = data.get("by_endpoint") or {}
+    top_endpoints = sorted(
+        (
+            {
+                "endpoint": name,
+                "kind": stats.get("kind"),
+                "sent": int(stats.get("sent") or 0),
+                "blocked": int(stats.get("blocked") or 0),
+                "success": int(stats.get("success") or 0),
+                "errors": int(stats.get("errors") or 0),
+            }
+            for name, stats in by_ep.items()
+            if isinstance(stats, dict)
+        ),
+        key=lambda row: (row["sent"] + row["blocked"], row["sent"]),
+        reverse=True,
+    )[:20]
+    return {
+        "minute_start_utc": (
+            time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(minute_ts))
+            if minute_ts
+            else None
+        ),
+        "attempts": int(data.get("attempts") or 0),
+        "sent": int(data.get("sent") or 0),
+        "blocked": int(data.get("blocked") or 0),
+        "success": int(data.get("success") or 0),
+        "errors": int(data.get("errors") or 0),
+        "binance_weight_1m": weight_int,
+        "binance_order_count_1m": data.get("binance_order_count_1m"),
+        "weight_limit_per_min": limit,
+        "weight_pct_of_limit": (
+            round(weight_int / limit * 100.0, 1) if weight_int is not None else None
+        ),
+        "over_weight_limit": weight_int is not None and weight_int >= limit,
+        "top_endpoints": top_endpoints,
+    }
+
+
+def get_fapi_rest_metrics() -> dict[str, Any]:
+    """Aggregate Futures REST usage for hub / diagnostics."""
+    data: dict[str, Any] = {}
+    path = _fapi_metrics_path()
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                data = raw
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    backoff_until = _read_shared_fapi_backoff_until()
+    recovery_until = _read_signed_recovery_until()
+    now = time.time()
+    current_ts = int(data.get("minute_ts") or _fapi_minute_floor())
+    previous_ts = data.get("previous_minute_ts")
+    previous_ts_int = int(previous_ts) if previous_ts is not None else None
+
+    return {
+        "enabled": FAPI_METRICS_ENABLED,
+        "weight_limit_per_min": FAPI_WEIGHT_LIMIT_PER_MIN,
+        "updated_at": data.get("updated_at"),
+        "backoff_active": now < backoff_until,
+        "backoff_until_utc": (
+            time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(backoff_until))
+            if now < backoff_until
+            else None
+        ),
+        "recovery_active": now < recovery_until,
+        "recovery_until_utc": (
+            time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(recovery_until))
+            if now < recovery_until
+            else None
+        ),
+        "current_minute": _summarize_fapi_minute_bucket(
+            data.get("current"),
+            minute_ts=current_ts,
+        ),
+        "previous_minute": _summarize_fapi_minute_bucket(
+            data.get("previous_minute"),
+            minute_ts=previous_ts_int,
+        ),
+        "metrics_file": str(path),
+        "note": (
+            "Counts all processes via execution._fapi_request / _fapi_public_get. "
+            "binance_weight_1m comes from Binance response headers (authoritative limit). "
+            "fapi_watch ping is included when recorded via record_fapi_rest_external."
+        ),
+    }
 
 
 def _read_fleet_rest_cache_file() -> dict[str, Any] | None:
@@ -1615,7 +2101,7 @@ def _symbols_with_open_positions(position_risk: list[dict[str, Any]]) -> set[str
 
 def _fetch_open_algo_orders_fleet(position_risk: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """One fleet-wide algo-order snapshot (shared across all pair processes)."""
-    if _fapi_in_backoff():
+    if _fapi_rest_block_reason():
         cached = _read_fleet_rest_cache_file()
         return (cached or {}).get("open_algo_orders") or []
 
@@ -1658,7 +2144,7 @@ def _fetch_fleet_rest_live() -> dict[str, Any]:
         _last_position_api_error = api_error
         logger.warning("positionRisk (all symbols) failed: %s", exc)
 
-    if not _fapi_in_backoff():
+    if not _fapi_rest_block_reason():
         try:
             resp = _fapi_request("GET", "/fapi/v1/openOrders", {})
             open_orders = resp if isinstance(resp, list) else []
@@ -1713,7 +2199,11 @@ def _fleet_rest_cache_payload(*, force: bool = False) -> dict[str, Any]:
 
     if _fapi_in_backoff() and cached:
         return cached
+    if _signed_rest_paused() and cached:
+        return cached
 
+    if _fapi_rest_block_reason():
+        return cached if cached else empty
     Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
     lock_path = _fleet_rest_cache_lock_path()
     lock_handle = open(lock_path, "w", encoding="utf-8")
@@ -3035,6 +3525,12 @@ def _sign_query(params: dict[str, Any]) -> str:
 def _fapi_public_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     if _fapi_in_backoff():
         until = _read_shared_fapi_backoff_until()
+        _record_fapi_rest_metrics(
+            kind="public",
+            method="GET",
+            path=path,
+            outcome="blocked",
+        )
         raise RuntimeError(
             f"Futures REST backoff until {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))}"
         )
@@ -3046,20 +3542,39 @@ def _fapi_public_get(path: str, params: dict[str, Any] | None = None) -> dict[st
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             payload = response.read().decode()
-            clear_fapi_backoff(reason=f"GET {path}")
+            _record_fapi_rest_metrics(
+                kind="public",
+                method="GET",
+                path=path,
+                outcome="success",
+                binance_weight_1m=response.headers.get("X-MBX-USED-WEIGHT-1M"),
+                binance_order_count_1m=response.headers.get("X-MBX-ORDER-COUNT-1M"),
+            )
             return json.loads(payload) if payload else {}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode()
+        _record_fapi_rest_metrics(
+            kind="public",
+            method="GET",
+            path=path,
+            outcome="error",
+            binance_weight_1m=exc.headers.get("X-MBX-USED-WEIGHT-1M"),
+            binance_order_count_1m=exc.headers.get("X-MBX-ORDER-COUNT-1M"),
+        )
         _apply_fapi_error_backoff(detail)
         raise RuntimeError(detail or str(exc)) from exc
 
 
 def _fapi_request(method: str, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    if _fapi_in_backoff():
-        until = _read_shared_fapi_backoff_until()
-        raise RuntimeError(
-            f"Futures REST backoff until {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))}"
+    block = _fapi_rest_block_reason()
+    if block:
+        _record_fapi_rest_metrics(
+            kind="signed",
+            method=method,
+            path=path,
+            outcome="blocked",
         )
+        raise RuntimeError(block)
     params = dict(params or {})
     params["timestamp"] = int(time.time() * 1000)
     params["recvWindow"] = 5000
@@ -3074,12 +3589,29 @@ def _fapi_request(method: str, path: str, params: dict[str, Any] | None = None) 
         headers["Content-Type"] = "application/x-www-form-urlencoded"
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
+        _acquire_signed_rest_pace()
         with urllib.request.urlopen(request, timeout=20) as response:
             payload = response.read().decode()
+            _record_fapi_rest_metrics(
+                kind="signed",
+                method=method,
+                path=path,
+                outcome="success",
+                binance_weight_1m=response.headers.get("X-MBX-USED-WEIGHT-1M"),
+                binance_order_count_1m=response.headers.get("X-MBX-ORDER-COUNT-1M"),
+            )
             clear_fapi_backoff(reason=f"{method} {path}")
             return json.loads(payload) if payload else {}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode()
+        _record_fapi_rest_metrics(
+            kind="signed",
+            method=method,
+            path=path,
+            outcome="error",
+            binance_weight_1m=exc.headers.get("X-MBX-USED-WEIGHT-1M"),
+            binance_order_count_1m=exc.headers.get("X-MBX-ORDER-COUNT-1M"),
+        )
         _apply_fapi_error_backoff(detail)
         raise RuntimeError(detail or str(exc)) from exc
 
@@ -3622,13 +4154,15 @@ def round_qty(symbol: str, value: float) -> str:
 
 def _calculate_notional_usdt() -> float:
     if POSITION_WALLET_PCT > 0 and _keys_configured():
-        try:
-            account = _fapi_request("GET", "/fapi/v2/account", {})
-            wallet = float(account.get("totalWalletBalance", 0) or 0)
-            if wallet > 0:
-                return wallet * POSITION_WALLET_PCT / 100.0
-        except RuntimeError:
-            logger.warning("Could not read wallet balance; using POSITION_SIZE_USDT")
+        snap = get_account_wallet_snapshot()
+        wallet = snap.get("wallet_usdt")
+        if wallet is not None and wallet > 0:
+            return float(wallet) * POSITION_WALLET_PCT / 100.0
+        if snap.get("api_error"):
+            logger.warning(
+                "Could not read wallet balance (%s); using POSITION_SIZE_USDT",
+                snap["api_error"],
+            )
     return POSITION_SIZE_USDT
 
 

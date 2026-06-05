@@ -41,9 +41,42 @@ log() {
     printf '[run-all] %s\n' "$*"
 }
 
+stop_listening_ports() {
+    local ports=("$HUB_PORT")
+    if [[ -f "$PAIRS_FILE" && -x "$VENV_PYTHON" ]]; then
+        while IFS= read -r port; do
+            [[ -n "$port" ]] && ports+=("$port")
+        done < <(
+            "$VENV_PYTHON" -c "
+import json
+from pathlib import Path
+rows = json.loads(Path('$PAIRS_FILE').read_text(encoding='utf-8'))
+for row in rows:
+    print(row.get('port', ''))
+"
+        )
+    else
+        for item in "${DEFAULT_PAIRS[@]}"; do
+            ports+=("${item##*:}")
+        done
+    fi
+
+    for port in "${ports[@]}"; do
+        [[ -z "$port" ]] && continue
+        if command -v fuser >/dev/null 2>&1; then
+            fuser -k "${port}/tcp" 2>/dev/null || true
+        elif command -v lsof >/dev/null 2>&1; then
+            while IFS= read -r pid; do
+                [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+            done < <(lsof -ti "tcp:${port}" -sTCP:LISTEN 2>/dev/null || true)
+        fi
+    done
+}
+
 stop_all() {
     if [[ ! -f "$PID_FILE" ]]; then
-        log "No pid file ($PID_FILE). Nothing to stop."
+        log "No pid file ($PID_FILE). Cleaning listening ports anyway."
+        stop_listening_ports
         return 0
     fi
 
@@ -65,6 +98,7 @@ stop_all() {
     done < "$PID_FILE"
 
     rm -f "$PID_FILE"
+    stop_listening_ports
 
     if [[ -x "$VENV_PYTHON" && -f "$SCRIPT_DIR/telegram_notify.py" ]]; then
         "$VENV_PYTHON" -c "
@@ -149,7 +183,8 @@ start_hub() {
     fi
 
     log "Hub http://0.0.0.0:${HUB_PORT}/ (analytics /analytics/)"
-    HUB_PORT="$HUB_PORT" "$VENV_PYTHON" "$SCRIPT_DIR/hub_server.py" >/dev/null 2>&1 &
+    mkdir -p "$SCRIPT_DIR/logs"
+    HUB_PORT="$HUB_PORT" "$VENV_PYTHON" "$SCRIPT_DIR/hub_server.py" >>"$SCRIPT_DIR/logs/hub.log" 2>&1 &
     echo $! >> "$PID_FILE"
 }
 
@@ -184,11 +219,14 @@ start_dashboards() {
         exit 1
     fi
 
+    mkdir -p "$SCRIPT_DIR/logs"
+
     for item in "${PAIR_LINES[@]}"; do
         local symbol="${item%%:*}"
         local port="${item##*:}"
         log "Dashboard ${symbol} -> http://127.0.0.1:${port}/"
-        TELEGRAM_COMMANDS_ENABLED=false "$VENV_PYTHON" "$SCRIPT_DIR/app.py" "$symbol" --port "$port" >/dev/null 2>&1 &
+        TELEGRAM_COMMANDS_ENABLED=false "$VENV_PYTHON" "$SCRIPT_DIR/app.py" "$symbol" --port "$port" \
+            >>"$SCRIPT_DIR/logs/${symbol}.log" 2>&1 &
         echo $! >> "$PID_FILE"
     done
 }

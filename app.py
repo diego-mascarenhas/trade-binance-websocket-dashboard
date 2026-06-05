@@ -10,6 +10,7 @@ import signal
 import socket
 import time
 from collections import deque
+from typing import Any
 from threading import Event, Lock, Thread
 
 import aiohttp
@@ -1942,20 +1943,47 @@ def sync_orderbook_state(bid_map: dict[float, float], ask_map: dict[float, float
     )
 
 
-async def fetch_depth_snapshot(session: aiohttp.ClientSession) -> dict:
-    url = f"{FAPI_MARKET_PATH}/depth"
-    params = {"symbol": SYMBOL.upper(), "limit": 1000}
+async def _fapi_market_get(
+    session: aiohttp.ClientSession,
+    path: str,
+    params: dict[str, Any],
+) -> Any:
+    """Public fapi GET with shared backoff + metrics (same IP limit as execution.py)."""
+    block = execution.fapi_public_blocked_reason()
+    if block:
+        raise RuntimeError(block)
+    url = f"{FAPI_BASE}{path}"
     async with session.get(url, params=params, timeout=10) as resp:
-        resp.raise_for_status()
-        return await resp.json()
+        body = await resp.text()
+        headers = {k: v for k, v in resp.headers.items()}
+        if resp.status >= 400:
+            execution.notify_fapi_rest_result(
+                kind="public",
+                method="GET",
+                path=path,
+                ok=False,
+                detail=body,
+                headers=headers,
+            )
+            resp.raise_for_status()
+        execution.notify_fapi_rest_result(
+            kind="public",
+            method="GET",
+            path=path,
+            ok=True,
+            headers=headers,
+        )
+        return json.loads(body) if body else {}
+
+
+async def fetch_depth_snapshot(session: aiohttp.ClientSession) -> dict:
+    params = {"symbol": SYMBOL.upper(), "limit": 1000}
+    return await _fapi_market_get(session, "/fapi/v1/depth", params)
 
 
 async def fetch_24h_ticker(session: aiohttp.ClientSession) -> float | None:
-    url = f"{FAPI_MARKET_PATH}/ticker/24hr"
     params = {"symbol": SYMBOL.upper()}
-    async with session.get(url, params=params, timeout=10) as resp:
-        resp.raise_for_status()
-        data = await resp.json()
+    data = await _fapi_market_get(session, "/fapi/v1/ticker/24hr", params)
     try:
         return float(data["priceChangePercent"])
     except (KeyError, TypeError, ValueError):
@@ -1967,16 +1995,13 @@ async def fetch_historical_klines(
     interval: str = INTERVAL,
     limit: int | None = None,
 ) -> list[dict]:
-    url = f"{FAPI_MARKET_PATH}/klines"
-    candle_limit = limit if limit is not None else min(MAX_CANDLES, 500)
+    candle_limit = limit if limit is not None else MAX_CANDLES
     params = {
         "symbol": SYMBOL.upper(),
         "interval": interval,
         "limit": candle_limit,
     }
-    async with session.get(url, params=params, timeout=10) as resp:
-        resp.raise_for_status()
-        rows = await resp.json()
+    rows = await _fapi_market_get(session, "/fapi/v1/klines", params)
 
     return [
         {
@@ -2082,14 +2107,11 @@ async def ws_loop() -> None:
     await asyncio.sleep(stagger_s)
 
     async with aiohttp.ClientSession() as session:
-        history = await fetch_historical_klines(session, INTERVAL, min(MAX_CANDLES, 500))
-        htf_history = await fetch_historical_klines(session, HTF_INTERVAL, min(HTF_CANDLES, 500))
-        initial_change = await fetch_24h_ticker(session)
+        history = await fetch_historical_klines(session, INTERVAL, MAX_CANDLES)
+        htf_history = await fetch_historical_klines(session, HTF_INTERVAL, min(HTF_CANDLES, MAX_CANDLES))
         with state_lock:
             candles.extend(history)
             htf_candles.extend(htf_history)
-            if initial_change is not None:
-                change_24h = initial_change
 
         while True:
             current_ltf = INTERVAL
@@ -2103,7 +2125,7 @@ async def ws_loop() -> None:
             if current_htf != last_htf_interval:
                 try:
                     htf_history = await fetch_historical_klines(
-                        session, current_htf, min(HTF_CANDLES, 500)
+                        session, current_htf, min(HTF_CANDLES, MAX_CANDLES)
                     )
                     with state_lock:
                         htf_candles.clear()
@@ -2149,7 +2171,7 @@ async def ws_loop() -> None:
                     if need_kline_refill:
                         try:
                             refill = await fetch_historical_klines(
-                                session, current_ltf, min(MAX_CANDLES, 500)
+                                session, current_ltf, MAX_CANDLES
                             )
                             with state_lock:
                                 candles.clear()
@@ -3779,12 +3801,14 @@ def run_server() -> None:
         if ui_enabled:
             app.run(debug=False, host=DASH_HOST, port=DASH_PORT, use_reloader=False)
         else:
-            logger.warning(
-                "Port %s already in use — skipping Dash UI; websocket and execution continue",
+            logger.error(
+                "%s: port %s already in use — Dash UI not started (/api/hub-summary unavailable). "
+                "Run ./run-all.sh stop or: fuser -k %s/tcp",
+                SYMBOL.upper(),
+                DASH_PORT,
                 DASH_PORT,
             )
-            while True:
-                time.sleep(3600)
+            raise SystemExit(1)
     except KeyboardInterrupt:
         logger.info("Shutting down")
 

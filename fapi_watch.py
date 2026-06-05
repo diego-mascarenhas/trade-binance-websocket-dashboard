@@ -56,8 +56,11 @@ def probe() -> tuple[bool, int | None, str]:
     try:
         import execution
 
-        if execution._fapi_in_backoff():
-            until = execution._read_shared_fapi_backoff_until()
+        if execution._fapi_in_backoff() or execution._signed_rest_paused():
+            until = max(
+                execution._read_shared_fapi_backoff_until(),
+                execution._read_signed_recovery_until(),
+            )
             return (
                 False,
                 429,
@@ -72,12 +75,31 @@ def probe() -> tuple[bool, int | None, str]:
         with urllib.request.urlopen(request, timeout=TIMEOUT_SEC) as response:
             code = response.getcode()
             body = response.read().decode("utf-8", errors="replace").strip()
+            try:
+                import execution
+
+                execution.record_fapi_rest_external(
+                    "GET",
+                    PING_PATH,
+                    outcome="success" if code == 200 else "error",
+                    binance_weight_1m=response.headers.get("X-MBX-USED-WEIGHT-1M"),
+                    binance_order_count_1m=response.headers.get("X-MBX-ORDER-COUNT-1M"),
+                )
+            except Exception:
+                pass
     except urllib.error.HTTPError as exc:
         code = exc.code
         body = exc.read().decode("utf-8", errors="replace").strip()
         try:
             import execution
 
+            execution.record_fapi_rest_external(
+                "GET",
+                PING_PATH,
+                outcome="error",
+                binance_weight_1m=exc.headers.get("X-MBX-USED-WEIGHT-1M"),
+                binance_order_count_1m=exc.headers.get("X-MBX-ORDER-COUNT-1M"),
+            )
             execution._apply_fapi_error_backoff(body)
         except Exception:
             pass
@@ -162,12 +184,6 @@ def run_check(*, dry_run: bool = False, kill_fleet: bool = False) -> int:
 
     if ok:
         state["status"] = "ok"
-        try:
-            import execution
-
-            execution.clear_fapi_backoff(reason="fapi_watch_ping_ok")
-        except Exception:
-            pass
         if prev_status == "blocked" and _cooldown_elapsed(state, "notified_recovered_at"):
             if not dry_run and telegram.is_configured():
                 if _notify_recovered():

@@ -288,8 +288,8 @@ function renderAccountKpis(perf) {
             accountNote.textContent = `Wallet unavailable (${perf.api_error}). Realized PnL is from MySQL history.`;
         } else if (perf.stale) {
             accountNote.className = "note warn account-panel-note";
-            accountNote.textContent =
-                "Wallet from last successful Futures API read · daily average from trade history · refreshes every 60s.";
+            const blockHint = perf.api_error ? ` (${perf.api_error})` : "";
+            accountNote.textContent = `Wallet from last successful Futures API read${blockHint} · Realized PnL from MySQL history.`;
         } else {
             accountNote.textContent =
                 "Live from Binance Futures · daily average follows Range and Symbol filters · refreshes every 60s.";
