@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 FAPI_BASE = os.getenv("FAPI_BASE", "https://fapi.binance.com").rstrip("/")
 PING_PATH = "/fapi/v1/ping"
 TIMEOUT_SEC = max(3, int(os.getenv("FAPI_WATCH_TIMEOUT_SEC", "10")))
-INTERVAL_SEC = max(60, int(os.getenv("FAPI_WATCH_INTERVAL_SEC", "300")))
+INTERVAL_SEC = max(60, int(os.getenv("FAPI_WATCH_INTERVAL_SEC", "600")))
 COOLDOWN_SEC = max(60, int(os.getenv("FAPI_WATCH_COOLDOWN_SEC", "3600")))
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_PATH = LOG_DIR / "fapi_watch.state"
@@ -62,6 +62,12 @@ def probe() -> tuple[bool, int | None, str]:
     except urllib.error.HTTPError as exc:
         code = exc.code
         body = exc.read().decode("utf-8", errors="replace").strip()
+        try:
+            import execution
+
+            execution._apply_fapi_error_backoff(body)
+        except Exception:
+            pass
     except (urllib.error.URLError, TimeoutError) as exc:
         return False, None, str(exc)
 
@@ -100,10 +106,11 @@ def _notify_blocked(code: int | None, detail: str) -> bool:
     snippet = detail.replace("\n", " ").strip()
     if len(snippet) > 120:
         snippet = snippet[:117] + "..."
+    ban_hint = " (IP ban — wait or change VPS IP)" if code == 418 else ""
     text = (
         f"Binance Futures REST blocked on {host}\n"
         f"URL: {FAPI_BASE}{PING_PATH}\n"
-        f"HTTP {code_s} — trading paused (same as /stop)\n"
+        f"HTTP {code_s}{ban_hint} — trading paused (same as /stop)\n"
         f"{snippet}\n"
         "Resume manually with /start when curl ping returns 200."
     )

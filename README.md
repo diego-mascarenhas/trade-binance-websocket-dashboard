@@ -204,7 +204,7 @@ If that times out, fix firewall/DNS — **trades on Binance still work**; only T
 
 ### Futures API block watcher (403 / CloudFront)
 
-With `./run-all.sh`, `telegram_fleet.py` runs `fapi_watch` in a background thread (default every **5 min**). On block it pauses trading (same as `/stop`) and sends Telegram; on recovery it notifies but does not auto-resume (`/start`).
+With `./run-all.sh`, `telegram_fleet.py` runs `fapi_watch` in a background thread (default every **10 min**). On block it pauses trading (same as `/stop`) and sends Telegram; on recovery it notifies but does not auto-resume (`/start`).
 
 ```bash
 # Optional one-off / dry-run (cron not required)

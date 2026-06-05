@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import calendar
+import fcntl
 import hashlib
 import hmac
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from pathlib import Path
 from typing import Any
 
 import db_store
@@ -59,15 +62,17 @@ REST_SL_TP_POLL_INTERVAL = float(os.getenv("REST_SL_TP_POLL_INTERVAL", "2"))
 TP_ORDER_TYPE = os.getenv("TP_ORDER_TYPE", "trailing").lower()
 TP_TRAILING_CALLBACK_RATE = float(os.getenv("TP_TRAILING_CALLBACK_RATE", "0.5"))
 EXECUTION_ORDER_COOLDOWN = int(os.getenv("EXECUTION_ORDER_COOLDOWN", "180"))
-EXECUTION_MAINTENANCE_SEC = float(os.getenv("EXECUTION_MAINTENANCE_SEC", "15"))
+EXECUTION_MAINTENANCE_SEC = float(os.getenv("EXECUTION_MAINTENANCE_SEC", "60"))
 ENTRY_LIMIT_TTL_SEC = int(os.getenv("ENTRY_LIMIT_TTL_SEC", "600"))
 ENTRY_FIRST_LEG_MARKET = _env_bool("ENTRY_FIRST_LEG_MARKET", "true")
 PROTECTION_RECONCILE_ENABLED = _env_bool("PROTECTION_RECONCILE_ENABLED", "true")
 FLEET_SIDE_BALANCE_MAX_PCT = float(os.getenv("FLEET_SIDE_BALANCE_MAX_PCT", "20"))
-FLEET_EXPOSURE_CACHE_SEC = float(os.getenv("FLEET_EXPOSURE_CACHE_SEC", "15"))
+FLEET_EXPOSURE_CACHE_SEC = float(os.getenv("FLEET_EXPOSURE_CACHE_SEC", "60"))
+FLEET_REST_CACHE_SEC = max(10.0, float(os.getenv("FLEET_REST_CACHE_SEC", "30")))
+FLEET_REST_CACHE_ENABLED = _env_bool("FLEET_REST_CACHE_ENABLED", "true")
 EXECUTION_BLOCK_IF_OPEN = _env_bool("EXECUTION_BLOCK_IF_OPEN", "true")
-EXECUTION_POSITION_CACHE_SEC = float(os.getenv("EXECUTION_POSITION_CACHE_SEC", "10"))
-ACCOUNT_SNAPSHOT_CACHE_SEC = float(os.getenv("ACCOUNT_SNAPSHOT_CACHE_SEC", "30"))
+EXECUTION_POSITION_CACHE_SEC = float(os.getenv("EXECUTION_POSITION_CACHE_SEC", "45"))
+ACCOUNT_SNAPSHOT_CACHE_SEC = float(os.getenv("ACCOUNT_SNAPSHOT_CACHE_SEC", "60"))
 PNL_STATS_LOOKBACK_DAYS = max(1, int(os.getenv("PNL_STATS_LOOKBACK_DAYS", "30")))
 MILLION_GOAL_USDT = float(os.getenv("MILLION_GOAL_USDT", "1000000"))
 BE_EXIT_PNL_MAX_USDT = float(os.getenv("BE_EXIT_PNL_MAX_USDT", "0.15"))
@@ -109,6 +114,8 @@ _fleet_exposure_cache: tuple[float, dict[str, Any]] | None = None
 _fleet_positions_lock = threading.Lock()
 _fleet_positions_cache: tuple[float, dict[str, Any]] | None = None
 _last_position_api_error: str | None = None
+_fapi_backoff_until: float = 0.0
+_fapi_backoff_lock = threading.Lock()
 _hedge_mode_lock = threading.Lock()
 _hedge_mode: bool | None = None
 _last_execution_monotonic: float | None = None
@@ -1408,11 +1415,161 @@ def _position_amt(value: Any) -> Decimal:
         return Decimal(0)
 
 
+def _fleet_rest_cache_path() -> Path:
+    return Path(LOG_DIR) / "fleet_rest_cache.json"
+
+
+def _fleet_rest_cache_lock_path() -> Path:
+    return Path(LOG_DIR) / "fleet_rest_cache.lock"
+
+
+def _parse_fapi_ban_until(detail: str) -> float | None:
+    if "-1003" not in detail and "too many requests" not in detail.lower():
+        return None
+    match = re.search(r"banned until (\d+)", detail)
+    if match:
+        return int(match.group(1)) / 1000.0 + 5.0
+    return time.time() + 900.0
+
+
+def _set_fapi_backoff(until_epoch: float) -> None:
+    global _fapi_backoff_until
+    with _fapi_backoff_lock:
+        _fapi_backoff_until = max(_fapi_backoff_until, until_epoch)
+
+
+def _fapi_in_backoff() -> bool:
+    with _fapi_backoff_lock:
+        return time.time() < _fapi_backoff_until
+
+
+def _apply_fapi_error_backoff(detail: str) -> None:
+    until = _parse_fapi_ban_until(detail)
+    if until:
+        _set_fapi_backoff(until)
+        logger.warning(
+            "Futures REST rate limited — backing off until %s UTC",
+            time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(until)),
+        )
+
+
+def _read_fleet_rest_cache_file() -> dict[str, Any] | None:
+    path = _fleet_rest_cache_path()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.debug("fleet REST cache read failed: %s", exc)
+        return None
+
+
+def _write_fleet_rest_cache_file(payload: dict[str, Any]) -> None:
+    global _last_position_api_error
+    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    _fleet_rest_cache_path().write_text(json.dumps(payload, default=str), encoding="utf-8")
+    err = payload.get("api_error")
+    _last_position_api_error = str(err) if err else None
+
+
+def _fetch_fleet_rest_live() -> dict[str, Any]:
+    """One positionRisk + one openOrders for the whole account."""
+    global _last_position_api_error
+    api_error: str | None = None
+    position_risk: list[dict[str, Any]] = []
+    open_orders: list[dict[str, Any]] = []
+
+    try:
+        resp = _fapi_request("GET", "/fapi/v2/positionRisk", {})
+        position_risk = resp if isinstance(resp, list) else []
+        _last_position_api_error = None
+    except RuntimeError as exc:
+        api_error = str(exc)
+        _last_position_api_error = api_error
+        logger.warning("positionRisk (all symbols) failed: %s", exc)
+
+    if not _fapi_in_backoff():
+        try:
+            resp = _fapi_request("GET", "/fapi/v1/openOrders", {})
+            open_orders = resp if isinstance(resp, list) else []
+        except RuntimeError as exc:
+            if api_error:
+                api_error = f"{api_error}; openOrders: {exc}"
+            else:
+                api_error = str(exc)
+            _last_position_api_error = api_error
+            logger.warning("openOrders (all symbols) failed: %s", exc)
+
+    return {
+        "fetched_at": time.time(),
+        "position_risk": position_risk,
+        "open_orders": open_orders,
+        "api_error": api_error,
+    }
+
+
+def _fleet_rest_cache_payload(*, force: bool = False) -> dict[str, Any]:
+    """Cross-process cache: all dashboards share one REST snapshot."""
+    global _last_position_api_error
+    empty: dict[str, Any] = {
+        "fetched_at": 0.0,
+        "position_risk": [],
+        "open_orders": [],
+        "api_error": None,
+    }
+    if not _keys_configured():
+        return empty
+
+    if not FLEET_REST_CACHE_ENABLED:
+        return _fetch_fleet_rest_live()
+
+    now = time.time()
+    cached = _read_fleet_rest_cache_file()
+    if (
+        not force
+        and cached
+        and now - float(cached.get("fetched_at") or 0) < FLEET_REST_CACHE_SEC
+    ):
+        err = cached.get("api_error")
+        if err:
+            _last_position_api_error = str(err)
+        elif cached.get("position_risk"):
+            _last_position_api_error = None
+        return cached
+
+    if _fapi_in_backoff() and cached:
+        return cached
+
+    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    lock_path = _fleet_rest_cache_lock_path()
+    lock_handle = open(lock_path, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        cached = _read_fleet_rest_cache_file()
+        if (
+            not force
+            and cached
+            and now - float(cached.get("fetched_at") or 0) < FLEET_REST_CACHE_SEC
+        ):
+            return cached
+        payload = _fetch_fleet_rest_live()
+        _write_fleet_rest_cache_file(payload)
+        return payload
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+
 def _get_position_risk(symbol: str) -> list[dict[str, Any]]:
     if not _keys_configured():
         return []
+    symbol = symbol.upper()
+    if FLEET_REST_CACHE_ENABLED:
+        rows = _fleet_rest_cache_payload().get("position_risk") or []
+        return [r for r in rows if str(r.get("symbol") or "").upper() == symbol]
     try:
-        resp = _fapi_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol.upper()})
+        resp = _fapi_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
         return resp if isinstance(resp, list) else []
     except RuntimeError as exc:
         logger.warning("positionRisk failed for %s: %s", symbol, exc)
@@ -1631,8 +1788,12 @@ def get_exchange_exposure(symbol: str) -> dict[str, Any]:
 def _get_open_orders(symbol: str) -> list[dict[str, Any]]:
     if not _keys_configured():
         return []
+    symbol = symbol.upper()
+    if FLEET_REST_CACHE_ENABLED:
+        orders = _fleet_rest_cache_payload().get("open_orders") or []
+        return [o for o in orders if str(o.get("symbol") or "").upper() == symbol]
     try:
-        resp = _fapi_request("GET", "/fapi/v1/openOrders", {"symbol": symbol.upper()})
+        resp = _fapi_request("GET", "/fapi/v1/openOrders", {"symbol": symbol})
         return resp if isinstance(resp, list) else []
     except RuntimeError as exc:
         logger.warning("openOrders failed for %s: %s", symbol, exc)
@@ -2158,6 +2319,9 @@ def _get_all_position_risk() -> list[dict[str, Any]]:
     if not _keys_configured():
         _last_position_api_error = "no_api_keys"
         return []
+    if FLEET_REST_CACHE_ENABLED:
+        payload = _fleet_rest_cache_payload()
+        return payload.get("position_risk") or []
     try:
         resp = _fapi_request("GET", "/fapi/v2/positionRisk", {})
         _last_position_api_error = None
@@ -2244,6 +2408,8 @@ def get_fleet_open_positions_map(*, force: bool = False) -> dict[str, Any]:
 def _get_all_open_orders() -> list[dict[str, Any]]:
     if not _keys_configured():
         return []
+    if FLEET_REST_CACHE_ENABLED:
+        return _fleet_rest_cache_payload().get("open_orders") or []
     try:
         resp = _fapi_request("GET", "/fapi/v1/openOrders", {})
         return resp if isinstance(resp, list) else []
@@ -2705,6 +2871,11 @@ def _fapi_public_get(path: str, params: dict[str, Any] | None = None) -> dict[st
 
 
 def _fapi_request(method: str, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    if _fapi_in_backoff():
+        until = _fapi_backoff_until
+        raise RuntimeError(
+            f"Futures REST backoff until {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))}"
+        )
     params = dict(params or {})
     params["timestamp"] = int(time.time() * 1000)
     params["recvWindow"] = 5000
@@ -2724,6 +2895,7 @@ def _fapi_request(method: str, path: str, params: dict[str, Any] | None = None) 
             return json.loads(payload) if payload else {}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode()
+        _apply_fapi_error_backoff(detail)
         raise RuntimeError(detail or str(exc)) from exc
 
 

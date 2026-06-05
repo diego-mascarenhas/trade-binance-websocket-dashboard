@@ -393,12 +393,45 @@
             return counts;
         }
 
+        function formatFleetApiError(raw) {
+            const s = String(raw || "");
+            if (!s) {
+                return null;
+            }
+            const lower = s.toLowerCase();
+            if (s.includes("418") || lower.includes("banned") || lower.includes("i'm a teapot")) {
+                return "⚠ IP banned (418)";
+            }
+            if (lower.includes("cloudfront") || lower.includes("request blocked") || s.includes("403")) {
+                return "⚠ Futures blocked (403)";
+            }
+            if (s.includes("-1003") || lower.includes("too many requests") || lower.includes("banned until")) {
+                return "⚠ Rate limit (-1003)";
+            }
+            if (s.includes("-2015") || lower.includes("invalid api-key")) {
+                return "⚠ API key / IP whitelist";
+            }
+            if (lower.includes("timed out") || lower.includes("timeout")) {
+                return "⚠ Binance timeout";
+            }
+            const json = s.match(/"msg"\s*:\s*"([^"]+)"/);
+            if (json) {
+                return `⚠ ${json[1].slice(0, 40)}`;
+            }
+            const oneLine = s.replace(/\s+/g, " ").trim();
+            if (oneLine.length > 48) {
+                return `⚠ ${oneLine.slice(0, 45)}…`;
+            }
+            return `⚠ ${oneLine}`;
+        }
+
         function renderHubMeta(counts, totalPairs, fleetExposure, fleetPositions) {
             const parts = [`${totalPairs} pairs`];
-            if (fleetPositions && fleetPositions.keys_configured === false) {
+            const fleetApi = fleetPositions || fleetExposure;
+            if (fleetApi && fleetApi.keys_configured === false) {
                 parts.push("⚠ no API keys");
-            } else if (fleetPositions && fleetPositions.api_error) {
-                parts.push("⚠ Binance API");
+            } else if (fleetApi && fleetApi.api_error) {
+                parts.push(formatFleetApiError(fleetApi.api_error) || "⚠ Binance API");
             }
             if (fleetExposure && fleetExposure.enabled) {
                 const longTotal = Number(fleetExposure.long_total_usdt || 0).toFixed(0);

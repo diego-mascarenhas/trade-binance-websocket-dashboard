@@ -110,6 +110,7 @@ REQUIRE_TREND_ALIGN = os.getenv("REQUIRE_TREND_ALIGN", "true").lower() in ("1", 
 SIGNAL_COOLDOWN_SEC = int(os.getenv("SIGNAL_COOLDOWN_SEC", "180"))
 WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "20"))
 WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "120"))
+METRICS_INTERVAL_MS = max(3000, int(os.getenv("METRICS_INTERVAL_MS", "5000")))
 DEPTH_METRICS_INTERVAL_SEC = float(os.getenv("DEPTH_METRICS_INTERVAL_SEC", "0.25"))
 EMA_FAST = int(os.getenv("EMA_FAST", "9"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
@@ -3465,7 +3466,7 @@ app.layout = html.Div(
             config={"displayModeBar": True, "responsive": True},
             style={"minHeight": "900px"},
         ),
-        dcc.Interval(id="interval", interval=1500, n_intervals=0),
+        dcc.Interval(id="interval", interval=METRICS_INTERVAL_MS, n_intervals=0),
     ],
     className="app-shell",
 )
