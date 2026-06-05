@@ -153,15 +153,15 @@ def build_fleet_status() -> str:
     has_content = False
     if trade_blocks:
         has_content = True
-        parts.append(_section_header("🔥", "TRADE", len(trade_blocks)))
+        parts.append(_section_header("🔥", "TRADE", len(trade_blocks), leading_blank=True))
         parts.append(_join_symbol_blocks(trade_blocks[:10]))
     if watch_blocks:
         has_content = True
-        parts.append(_section_header("👀", "WATCH", len(watch_blocks), leading_blank=has_content))
+        parts.append(_section_header("👀", "WATCH", len(watch_blocks), leading_blank=True))
         parts.append(_join_symbol_blocks(watch_blocks[:15]))
     if open_blocks:
         has_content = True
-        parts.append(_section_header("💼", "OPEN", len(open_blocks), leading_blank=has_content))
+        parts.append(_section_header("💼", "OPEN", len(open_blocks), leading_blank=True))
         parts.append(_join_symbol_blocks(open_blocks[:10]))
     if offline:
         if has_content:
@@ -169,7 +169,7 @@ def build_fleet_status() -> str:
         parts.append(SEP_SECTION)
         parts.append(f"⚠️ Offline: <b>{offline}</b>")
     if not has_content:
-        parts.append(f"{SEP_SECTION}\n<i>All pairs idle · no setups or positions</i>")
+        parts.append(f"\n{SEP_SECTION}\n<i>All pairs idle · no setups or positions</i>")
 
     return "\n".join(parts)
 
