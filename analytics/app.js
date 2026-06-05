@@ -136,7 +136,10 @@ function formatDaysToGoal(perf) {
         return { value: "Goal reached", sub: `${Number(goal).toLocaleString()} USDT` };
     }
     if (!daily || daily <= 0) {
-        return { value: "Need +daily avg", sub: "Close trades in range with positive PnL" };
+        return {
+            value: "Need +daily avg",
+            sub: "Close trades in range with positive PnL",
+        };
     }
     if (days == null) {
         return { value: "—", sub: null };
@@ -195,16 +198,35 @@ function renderAccountKpis(perf) {
         none: "no closes in range",
     }[perf.stats_source || "none"];
 
+    const walletSub =
+        perf.available_usdt != null
+            ? `${formatPnl(perf.available_usdt).replace("+", "")} available`
+            : null;
+    const walletValue =
+        perf.wallet_usdt != null
+            ? formatPnl(perf.wallet_usdt).replace("+", "")
+            : "—";
+    const walletSubFinal =
+        perf.stale && walletSub
+            ? `${walletSub} · cached`
+            : perf.stale
+              ? "cached · API paused"
+              : walletSub;
+
+    const unrealizedSub =
+        perf.unrealized_source === "fleet_cache" ? "from open positions · cached" : null;
+
     const cards = [
         {
             label: "Wallet",
-            value: formatPnl(perf.wallet_usdt).replace("+", ""),
-            sub: perf.available_usdt != null ? `${formatPnl(perf.available_usdt).replace("+", "")} available` : null,
+            value: walletValue,
+            sub: walletSubFinal,
         },
         {
             label: "Unrealized (all)",
             value: formatPnl(perf.unrealized_usdt),
             valueClass: pnlClass(perf.unrealized_usdt),
+            sub: unrealizedSub,
         },
         {
             label: "ROI",
@@ -261,8 +283,17 @@ function renderAccountKpis(perf) {
 
     if (accountNote) {
         accountNote.className = "note account-panel-note";
-        accountNote.textContent =
-            "Live from Binance Futures · daily average follows Range and Symbol filters · refreshes every 60s.";
+        if (perf.wallet_usdt == null && perf.api_error) {
+            accountNote.className = "note warn account-panel-note";
+            accountNote.textContent = `Wallet unavailable (${perf.api_error}). Realized PnL is from MySQL history.`;
+        } else if (perf.stale) {
+            accountNote.className = "note warn account-panel-note";
+            accountNote.textContent =
+                "Wallet from last successful Futures API read · daily average from trade history · refreshes every 60s.";
+        } else {
+            accountNote.textContent =
+                "Live from Binance Futures · daily average follows Range and Symbol filters · refreshes every 60s.";
+        }
     }
 }
 

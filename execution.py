@@ -1101,17 +1101,40 @@ def _optional_env_float(name: str) -> float | None:
         return None
 
 
+def _unrealized_from_fleet_cache() -> float | None:
+    """Fallback sum of open-position unrealized when /account is unavailable."""
+    if not FLEET_REST_CACHE_ENABLED or not _keys_configured():
+        return None
+    payload = _read_fleet_rest_cache_file()
+    if not payload:
+        return None
+    total = 0.0
+    found = False
+    for row in payload.get("position_risk") or []:
+        if _position_amt(row.get("positionAmt", "0")).copy_abs() <= Decimal("0"):
+            continue
+        found = True
+        try:
+            total += float(row.get("unrealizedProfit") or 0)
+        except (TypeError, ValueError):
+            pass
+    return total if found else 0.0 if payload.get("position_risk") else None
+
+
 def get_account_wallet_snapshot(force: bool = False) -> dict[str, Any]:
     """Cached Binance Futures wallet totals (shared across all pairs)."""
     global _account_snapshot_cache
+    empty = {
+        "configured": False,
+        "wallet_usdt": None,
+        "available_usdt": None,
+        "unrealized_usdt": None,
+        "margin_balance_usdt": None,
+        "api_error": None,
+        "stale": False,
+    }
     if not _keys_configured():
-        return {
-            "configured": False,
-            "wallet_usdt": None,
-            "available_usdt": None,
-            "unrealized_usdt": None,
-            "margin_balance_usdt": None,
-        }
+        return dict(empty)
 
     now = time.monotonic()
     with _account_snapshot_lock:
@@ -1122,12 +1145,39 @@ def get_account_wallet_snapshot(force: bool = False) -> dict[str, Any]:
         ):
             return dict(_account_snapshot_cache[1])
 
+    def _stale_snapshot(api_error: str) -> dict[str, Any] | None:
+        with _account_snapshot_lock:
+            if _account_snapshot_cache and _account_snapshot_cache[1].get("wallet_usdt") is not None:
+                stale = dict(_account_snapshot_cache[1])
+                stale["stale"] = True
+                stale["api_error"] = api_error
+                return stale
+        return None
+
+    if _fapi_in_backoff():
+        until = _read_shared_fapi_backoff_until()
+        err = (
+            f"Futures REST backoff until "
+            f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))}"
+        )
+        cached = _stale_snapshot(err)
+        if cached:
+            return cached
+        out = {**empty, "configured": True, "api_error": err}
+        unrealized = _unrealized_from_fleet_cache()
+        if unrealized is not None:
+            out["unrealized_usdt"] = unrealized
+            out["unrealized_source"] = "fleet_cache"
+        return out
+
     snapshot = {
         "configured": True,
         "wallet_usdt": None,
         "available_usdt": None,
         "unrealized_usdt": None,
         "margin_balance_usdt": None,
+        "api_error": None,
+        "stale": False,
     }
     try:
         account = _fapi_request("GET", "/fapi/v2/account", {})
@@ -1135,11 +1185,22 @@ def get_account_wallet_snapshot(force: bool = False) -> dict[str, Any]:
         snapshot["available_usdt"] = float(account.get("availableBalance", 0) or 0)
         snapshot["unrealized_usdt"] = float(account.get("totalUnrealizedProfit", 0) or 0)
         snapshot["margin_balance_usdt"] = float(account.get("totalMarginBalance", 0) or 0)
+        snapshot["unrealized_source"] = "account"
     except RuntimeError as exc:
+        err = str(exc)
         logger.warning("Account snapshot failed: %s", exc)
+        cached = _stale_snapshot(err)
+        if cached:
+            return cached
+        snapshot["api_error"] = err
+        unrealized = _unrealized_from_fleet_cache()
+        if unrealized is not None:
+            snapshot["unrealized_usdt"] = unrealized
+            snapshot["unrealized_source"] = "fleet_cache"
 
-    with _account_snapshot_lock:
-        _account_snapshot_cache = (now, snapshot)
+    if snapshot.get("wallet_usdt") is not None:
+        with _account_snapshot_lock:
+            _account_snapshot_cache = (now, dict(snapshot))
     return dict(snapshot)
 
 
