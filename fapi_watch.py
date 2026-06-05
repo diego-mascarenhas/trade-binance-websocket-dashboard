@@ -162,6 +162,12 @@ def run_check(*, dry_run: bool = False, kill_fleet: bool = False) -> int:
 
     if ok:
         state["status"] = "ok"
+        try:
+            import execution
+
+            execution.clear_fapi_backoff(reason="fapi_watch_ping_ok")
+        except Exception:
+            pass
         if prev_status == "blocked" and _cooldown_elapsed(state, "notified_recovered_at"):
             if not dry_run and telegram.is_configured():
                 if _notify_recovered():

@@ -1498,23 +1498,53 @@ def _parse_fapi_ban_until(detail: str) -> float | None:
     return time.time() + 900.0
 
 
+def clear_fapi_backoff(*, reason: str = "recovered") -> bool:
+    """Remove shared backoff state so REST can resume after recovery."""
+    global _fapi_backoff_until, _fapi_backoff_file_read_at
+    with _fapi_backoff_lock:
+        path = _fapi_backoff_path()
+        had_active = time.time() < _fapi_backoff_until or path.exists()
+        _fapi_backoff_until = 0.0
+        _fapi_backoff_file_read_at = 0.0
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if had_active:
+        logger.info("Futures REST backoff cleared (%s)", reason)
+    return had_active
+
+
 def _read_shared_fapi_backoff_until() -> float:
     """Cross-process backoff (all dashboards + hub share logs/fapi_backoff.json)."""
     global _fapi_backoff_until, _fapi_backoff_file_read_at
     now = time.time()
     with _fapi_backoff_lock:
         if now - _fapi_backoff_file_read_at < 2.0:
+            if _fapi_backoff_until <= now:
+                return 0.0
             return _fapi_backoff_until
         _fapi_backoff_file_read_at = now
         path = _fapi_backoff_path()
         if not path.exists():
-            return _fapi_backoff_until
+            _fapi_backoff_until = 0.0
+            return 0.0
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             file_until = float(data.get("until") or 0)
+            if file_until <= now:
+                _fapi_backoff_until = 0.0
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                logger.info("Futures REST backoff expired — file removed")
+                return 0.0
             _fapi_backoff_until = max(_fapi_backoff_until, file_until)
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
             pass
+        if _fapi_backoff_until <= now:
+            return 0.0
         return _fapi_backoff_until
 
 
@@ -3016,6 +3046,7 @@ def _fapi_public_get(path: str, params: dict[str, Any] | None = None) -> dict[st
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             payload = response.read().decode()
+            clear_fapi_backoff(reason=f"GET {path}")
             return json.loads(payload) if payload else {}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode()
@@ -3025,7 +3056,7 @@ def _fapi_public_get(path: str, params: dict[str, Any] | None = None) -> dict[st
 
 def _fapi_request(method: str, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     if _fapi_in_backoff():
-        until = _fapi_backoff_until
+        until = _read_shared_fapi_backoff_until()
         raise RuntimeError(
             f"Futures REST backoff until {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))}"
         )
@@ -3045,6 +3076,7 @@ def _fapi_request(method: str, path: str, params: dict[str, Any] | None = None) 
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             payload = response.read().decode()
+            clear_fapi_backoff(reason=f"{method} {path}")
             return json.loads(payload) if payload else {}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode()
