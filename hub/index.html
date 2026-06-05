@@ -405,7 +405,13 @@
             if (lower.includes("cloudfront") || lower.includes("request blocked") || s.includes("403")) {
                 return "⚠ Futures blocked (403)";
             }
-            if (s.includes("-1003") || lower.includes("too many requests") || lower.includes("banned until")) {
+            if (
+                s.includes("429")
+                || s.includes("-1003")
+                || lower.includes("too many requests")
+                || lower.includes("banned until")
+                || lower.includes("2400 requests per minute")
+            ) {
                 return "⚠ Rate limit (-1003)";
             }
             if (s.includes("-2015") || lower.includes("invalid api-key")) {

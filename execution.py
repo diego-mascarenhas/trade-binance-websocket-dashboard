@@ -3720,6 +3720,34 @@ def _place_trailing_tp(symbol: str, direction: str, activation_price: str, quant
     return _fapi_request("POST", "/fapi/v1/algoOrder", params)
 
 
+def _resolve_entry_fill_qty(
+    symbol: str,
+    order_id: int | None,
+    quantity: str,
+    *,
+    entry_is_market: bool = False,
+    order_response: dict[str, Any] | None = None,
+) -> str | None:
+    """Resolve filled qty without excess REST polling (MARKET fills are immediate)."""
+    if order_id is None:
+        return quantity
+    if order_response:
+        status = str(order_response.get("status") or "").upper()
+        executed = order_response.get("executedQty") or order_response.get("cumQty")
+        if status == "FILLED" and executed:
+            return str(executed)
+    if entry_is_market:
+        order = _fapi_request("GET", "/fapi/v1/order", {"symbol": symbol.upper(), "orderId": order_id})
+        status = str(order.get("status") or "").upper()
+        executed = order.get("executedQty") or order.get("cumQty")
+        if status == "FILLED" and executed:
+            return str(executed)
+        if status in ("CANCELED", "REJECTED", "EXPIRED"):
+            return None
+        return _wait_limit_fill(symbol, order_id, min(10, REST_SL_TP_FILL_WAIT))
+    return _wait_limit_fill(symbol, order_id, REST_SL_TP_FILL_WAIT)
+
+
 def _place_sl_tp_after_fill(
     symbol: str,
     direction: str,
@@ -3727,6 +3755,9 @@ def _place_sl_tp_after_fill(
     tp: float,
     quantity: str,
     order_id: int | None,
+    *,
+    entry_is_market: bool = False,
+    order_response: dict[str, Any] | None = None,
 ) -> dict[str, bool]:
     """Place SL then TP after entry fill. Never raises — logs and notifies on partial failure."""
     result = {"sl": False, "tp": False}
@@ -3735,7 +3766,13 @@ def _place_sl_tp_after_fill(
 
     fill_qty = quantity
     if order_id is not None:
-        waited = _wait_limit_fill(symbol, order_id, REST_SL_TP_FILL_WAIT)
+        waited = _resolve_entry_fill_qty(
+            symbol,
+            order_id,
+            quantity,
+            entry_is_market=entry_is_market,
+            order_response=order_response,
+        )
         if not waited:
             msg = f"Entry not filled in {REST_SL_TP_FILL_WAIT}s — SL/TP skipped"
             _set_status(message=msg, last_event="skip_sl_tp")
@@ -4027,7 +4064,16 @@ def _execute_open(
             },
         )
         if order_id is not None and REST_PLACE_SL_TP:
-            _place_sl_tp_after_fill(symbol, direction, sl, tp, qty, int(order_id))
+            _place_sl_tp_after_fill(
+                symbol,
+                direction,
+                sl,
+                tp,
+                qty,
+                int(order_id),
+                entry_is_market=use_market,
+                order_response=response if use_market else None,
+            )
     except RuntimeError as exc:
         logger.error("Order failed for %s: %s", symbol, exc)
         _append_orders_log("live_open_failed", symbol=symbol, error=str(exc), **payload)
@@ -4320,7 +4366,16 @@ def _execute_open_dca(
             placed.append(row)
             _append_orders_log("live_dca_leg", **row, symbol=symbol, direction=direction)
             if use_market and order_id is not None and REST_PLACE_SL_TP:
-                _place_sl_tp_after_fill(symbol, direction, sl, tp, qty, int(order_id))
+                _place_sl_tp_after_fill(
+                    symbol,
+                    direction,
+                    sl,
+                    tp,
+                    qty,
+                    int(order_id),
+                    entry_is_market=True,
+                    order_response=response,
+                )
         except RuntimeError as exc:
             logger.error("DCA leg %s failed for %s: %s", index, symbol, exc)
             _append_orders_log("live_dca_leg_failed", symbol=symbol, leg=index, error=str(exc))
