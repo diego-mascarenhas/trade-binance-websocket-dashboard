@@ -41,7 +41,7 @@
 
             <section id="arquitectura" class="help-section">
                 <h2>1. Arquitectura</h2>
-                <p>El sistema combina <strong>datos en vivo de Binance Spot</strong> (WebSocket: velas, depth, miniTicker) con <strong>ejecución opcional en Binance Futures</strong> (REST).</p>
+                <p>El sistema usa <strong>Binance Futures USDT-M</strong> de punta a punta: señales por <strong>WebSocket</strong> (<code>fstream</code>: velas, depth, miniTicker) y <strong>ejecución opcional</strong> por REST (<code>fapi</code>).</p>
                 <ul>
                     <li><strong>Un proceso por par</strong> (<code>app.py SYMBOL --port 805x</code>): stream WS, cálculo de señal, dashboard individual.</li>
                     <li><strong>Hub central</strong> (<code>hub_server.py</code>, puerto <code>HUB_PORT</code>, default 8050): tarjetas de todos los pares vía proxy interno.</li>
@@ -333,7 +333,7 @@
                 <ul>
                     <li>Debounce: ~5 × <code>DEPTH_METRICS_INTERVAL_SEC</code> ≈ 1.25 s mínimo (si depth estable).</li>
                     <li>Cooldown entre entradas del mismo par: <code>SIGNAL_COOLDOWN_SEC</code> (180 s).</li>
-                    <li>Hub refresh: 3 s. UI individual: <code>METRICS_INTERVAL_MS</code> (5000 ms default).</li>
+                    <li>Hub refresh: 5 s. UI individual: <code>METRICS_INTERVAL_MS</code> (8000 ms default).</li>
                     <li>WS ping: cada <code>WS_PING_INTERVAL</code> (20 s), timeout <code>WS_PING_TIMEOUT</code> (120 s).</li>
                 </ul>
                 <p class="help-warn">Si <em>todos</em> los pares muestran precio «—» y <em>connecting</em> durante mucho tiempo, revisa que <code>./run-all.sh</code> esté activo y que los procesos escuchen en los puertos de <code>hub/pairs.json</code>.</p>
@@ -346,7 +346,7 @@
                 <h3>fapi_watch (vigilancia REST)</h3>
                 <ul>
                     <li>Activo con <code>./run-all.sh</code> (hilo en <code>telegram_fleet.py</code>).</li>
-                    <li>Prueba <code>GET /fapi/v1/ping</code> cada <code>FAPI_WATCH_INTERVAL_SEC</code> (600 s = 10 min).</li>
+                    <li>Prueba <code>GET /fapi/v1/ping</code> cada <code>FAPI_WATCH_INTERVAL_SEC</code> (900 s = 15 min).</li>
                     <li>Si falla (403, 418, CloudFront, timeout): <strong>pausa trading</strong> (= <code>/stop</code>) y alerta Telegram.</li>
                     <li>Cooldown de alertas repetidas: <code>FAPI_WATCH_COOLDOWN_SEC</code> (3600 s).</li>
                     <li>Al recuperar HTTP 200: notifica pero <strong>no reanuda solo</strong> — envía <code>/start</code> manualmente.</li>
@@ -356,8 +356,8 @@
                 <h3>Cache REST compartida (flota)</h3>
                 <ul>
                     <li><code>FLEET_REST_CACHE_ENABLED=true</code>: un solo <code>positionRisk</code> + <code>openOrders</code> para todos los pares.</li>
-                    <li>TTL: <code>FLEET_REST_CACHE_SEC</code> (30 s). Archivo: <code>logs/fleet_rest_cache.json</code>.</li>
-                    <li>Cache de posición por par: <code>EXECUTION_POSITION_CACHE_SEC</code> (45 s).</li>
+                    <li>TTL: <code>FLEET_REST_CACHE_SEC</code> (60 s). Archivo: <code>logs/fleet_rest_cache.json</code>.</li>
+                    <li>Cache de posición por par: <code>EXECUTION_POSITION_CACHE_SEC</code> (60 s).</li>
                     <li>Cache cuenta/PnL: <code>ACCOUNT_SNAPSHOT_CACHE_SEC</code> (60 s).</li>
                     <li>Exposición L/S flota: <code>FLEET_EXPOSURE_CACHE_SEC</code> (60 s).</li>
                 </ul>
@@ -370,10 +370,10 @@
 
                 <h3>WebSocket vs REST</h3>
                 <ul>
-                    <li>Señales usan <strong>WebSocket Spot</strong> (sin límite de weight REST para depth en vivo).</li>
-                    <li>REST solo para ejecución, posiciones, SL/TP y panel de cuenta — minimizado por caches.</li>
+                    <li>Señales usan <strong>WebSocket Futures</strong> (<code>FSTREAM_WS_BASE</code>, default <code>wss://fstream.binance.com</code>).</li>
+                    <li>REST <code>fapi</code> para bootstrap al conectar (depth/klines) y para ejecución, posiciones, SL/TP — minimizado por caches.</li>
                     <li><code>DEPTH_METRICS_INTERVAL_SEC=0.25</code>: recalcula señal como máximo 4×/s (libro sigue actualizándose cada tick).</li>
-                    <li><code>METRICS_INTERVAL_MS=5000</code>: UI hace menos lecturas REST.</li>
+                    <li><code>METRICS_INTERVAL_MS=8000</code>: UI hace menos lecturas REST.</li>
                 </ul>
 
                 <h3>Buenas prácticas</h3>
@@ -435,7 +435,7 @@
                             <tr><td><code>WS_PING_INTERVAL</code></td><td>20</td><td>Segundos entre pings WS</td></tr>
                             <tr><td><code>WS_PING_TIMEOUT</code></td><td>120</td><td>Timeout sin pong</td></tr>
                             <tr><td><code>DEPTH_METRICS_INTERVAL_SEC</code></td><td>0.25</td><td>Throttle recálculo señal en depth</td></tr>
-                            <tr><td><code>METRICS_INTERVAL_MS</code></td><td>5000</td><td>Poll UI dashboard (ms)</td></tr>
+                            <tr><td><code>METRICS_INTERVAL_MS</code></td><td>8000</td><td>Poll UI dashboard (ms)</td></tr>
                             <tr><td><code>DASH_HOST</code> / <code>DASH_PORT</code></td><td>0.0.0.0 / 8050</td><td>Bind dashboard individual</td></tr>
                             <tr><td><code>HUB_PORT</code></td><td>8050</td><td>Puerto hub + analytics</td></tr>
                         </tbody>
@@ -514,7 +514,8 @@
                             <tr><td><code>EXECUTE_ON_VALID_ENTRY</code></td><td>true</td><td>Auto-orden en valid entry</td></tr>
                             <tr><td><code>EXECUTION_MODE</code></td><td>dry</td><td><code>dry</code> o <code>live</code></td></tr>
                             <tr><td><code>BINANCE_API_KEY</code> / <code>SECRET</code></td><td>—</td><td>Claves Futures</td></tr>
-                            <tr><td><code>FAPI_BASE</code></td><td>fapi.binance.com</td><td>Base URL Futures</td></tr>
+                            <tr><td><code>FAPI_BASE</code></td><td>fapi.binance.com</td><td>REST Futures (mercado + ejecución)</td></tr>
+                            <tr><td><code>FSTREAM_WS_BASE</code></td><td>fstream.binance.com</td><td>WebSocket Futures USDT-M</td></tr>
                             <tr><td><code>POSITION_SIZE_USDT</code></td><td>25</td><td>Notional por entrada</td></tr>
                             <tr><td><code>POSITION_WALLET_PCT</code></td><td>0</td><td>% wallet (si &gt; 0, prioriza)</td></tr>
                             <tr><td><code>LEVERAGE</code></td><td>4</td><td>Apalancamiento fijo</td></tr>
@@ -522,8 +523,8 @@
                             <tr><td><code>ENTRY_LIMIT_TTL_SEC</code></td><td>600</td><td>Cancelar LIMIT sin fill</td></tr>
                             <tr><td><code>EXECUTION_ORDER_COOLDOWN</code></td><td>180</td><td>Cooldown órdenes</td></tr>
                             <tr><td><code>FLEET_SIDE_BALANCE_MAX_PCT</code></td><td>20</td><td>Cap imbalance L/S</td></tr>
-                            <tr><td><code>FLEET_REST_CACHE_SEC</code></td><td>30</td><td>Cache REST compartida</td></tr>
-                            <tr><td><code>EXECUTION_POSITION_CACHE_SEC</code></td><td>45</td><td>Cache posición</td></tr>
+                            <tr><td><code>FLEET_REST_CACHE_SEC</code></td><td>60</td><td>Cache REST compartida</td></tr>
+                            <tr><td><code>EXECUTION_POSITION_CACHE_SEC</code></td><td>60</td><td>Cache posición</td></tr>
                             <tr><td><code>EXECUTION_MAINTENANCE_SEC</code></td><td>60</td><td>Reconcile SL/TP</td></tr>
                             <tr><td><code>PROTECTION_RECONCILE_ENABLED</code></td><td>true</td><td>Reparar protección faltante</td></tr>
                         </tbody>
@@ -536,7 +537,7 @@
                         <thead><tr><th>Variable</th><th>Default</th><th>Descripción</th></tr></thead>
                         <tbody>
                             <tr><td><code>FAPI_WATCH_ENABLED</code></td><td>true</td><td>Vigilancia ping Futures</td></tr>
-                            <tr><td><code>FAPI_WATCH_INTERVAL_SEC</code></td><td>600</td><td>Intervalo probe (s)</td></tr>
+                            <tr><td><code>FAPI_WATCH_INTERVAL_SEC</code></td><td>900</td><td>Intervalo probe (s)</td></tr>
                             <tr><td><code>FAPI_WATCH_COOLDOWN_SEC</code></td><td>3600</td><td>Cooldown alertas Telegram</td></tr>
                             <tr><td><code>FAPI_WATCH_TIMEOUT_SEC</code></td><td>10</td><td>Timeout HTTP probe</td></tr>
                             <tr><td><code>HUB_PROXY_HOST</code></td><td>127.0.0.1</td><td>Host dashboards para proxy</td></tr>

@@ -68,10 +68,10 @@ ENTRY_FIRST_LEG_MARKET = _env_bool("ENTRY_FIRST_LEG_MARKET", "true")
 PROTECTION_RECONCILE_ENABLED = _env_bool("PROTECTION_RECONCILE_ENABLED", "true")
 FLEET_SIDE_BALANCE_MAX_PCT = float(os.getenv("FLEET_SIDE_BALANCE_MAX_PCT", "20"))
 FLEET_EXPOSURE_CACHE_SEC = float(os.getenv("FLEET_EXPOSURE_CACHE_SEC", "60"))
-FLEET_REST_CACHE_SEC = max(10.0, float(os.getenv("FLEET_REST_CACHE_SEC", "30")))
+FLEET_REST_CACHE_SEC = max(10.0, float(os.getenv("FLEET_REST_CACHE_SEC", "60")))
 FLEET_REST_CACHE_ENABLED = _env_bool("FLEET_REST_CACHE_ENABLED", "true")
 EXECUTION_BLOCK_IF_OPEN = _env_bool("EXECUTION_BLOCK_IF_OPEN", "true")
-EXECUTION_POSITION_CACHE_SEC = float(os.getenv("EXECUTION_POSITION_CACHE_SEC", "45"))
+EXECUTION_POSITION_CACHE_SEC = float(os.getenv("EXECUTION_POSITION_CACHE_SEC", "60"))
 ACCOUNT_SNAPSHOT_CACHE_SEC = float(os.getenv("ACCOUNT_SNAPSHOT_CACHE_SEC", "60"))
 PNL_STATS_LOOKBACK_DAYS = max(1, int(os.getenv("PNL_STATS_LOOKBACK_DAYS", "30")))
 MILLION_GOAL_USDT = float(os.getenv("MILLION_GOAL_USDT", "1000000"))
@@ -115,6 +115,7 @@ _fleet_positions_lock = threading.Lock()
 _fleet_positions_cache: tuple[float, dict[str, Any]] | None = None
 _last_position_api_error: str | None = None
 _fapi_backoff_until: float = 0.0
+_fapi_backoff_file_read_at: float = 0.0
 _fapi_backoff_lock = threading.Lock()
 _hedge_mode_lock = threading.Lock()
 _hedge_mode: bool | None = None
@@ -1423,6 +1424,10 @@ def _fleet_rest_cache_lock_path() -> Path:
     return Path(LOG_DIR) / "fleet_rest_cache.lock"
 
 
+def _fapi_backoff_path() -> Path:
+    return Path(LOG_DIR) / "fapi_backoff.json"
+
+
 def _parse_fapi_ban_until(detail: str) -> float | None:
     if "-1003" not in detail and "too many requests" not in detail.lower():
         return None
@@ -1432,15 +1437,48 @@ def _parse_fapi_ban_until(detail: str) -> float | None:
     return time.time() + 900.0
 
 
-def _set_fapi_backoff(until_epoch: float) -> None:
-    global _fapi_backoff_until
+def _read_shared_fapi_backoff_until() -> float:
+    """Cross-process backoff (all dashboards + hub share logs/fapi_backoff.json)."""
+    global _fapi_backoff_until, _fapi_backoff_file_read_at
+    now = time.time()
     with _fapi_backoff_lock:
-        _fapi_backoff_until = max(_fapi_backoff_until, until_epoch)
+        if now - _fapi_backoff_file_read_at < 2.0:
+            return _fapi_backoff_until
+        _fapi_backoff_file_read_at = now
+        path = _fapi_backoff_path()
+        if not path.exists():
+            return _fapi_backoff_until
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            file_until = float(data.get("until") or 0)
+            _fapi_backoff_until = max(_fapi_backoff_until, file_until)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return _fapi_backoff_until
+
+
+def _set_fapi_backoff(until_epoch: float) -> None:
+    global _fapi_backoff_until, _fapi_backoff_file_read_at
+    with _fapi_backoff_lock:
+        merged = max(_fapi_backoff_until, until_epoch)
+        path = _fapi_backoff_path()
+        if path.exists():
+            try:
+                existing = float(json.loads(path.read_text(encoding="utf-8")).get("until") or 0)
+                merged = max(merged, existing)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+        _fapi_backoff_until = merged
+        _fapi_backoff_file_read_at = time.time()
+        Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"until": merged, "updated_at": time.time()}, indent=2),
+            encoding="utf-8",
+        )
 
 
 def _fapi_in_backoff() -> bool:
-    with _fapi_backoff_lock:
-        return time.time() < _fapi_backoff_until
+    return time.time() < _read_shared_fapi_backoff_until()
 
 
 def _apply_fapi_error_backoff(detail: str) -> None:
@@ -1473,12 +1511,52 @@ def _write_fleet_rest_cache_file(payload: dict[str, Any]) -> None:
     _last_position_api_error = str(err) if err else None
 
 
+def _symbols_with_open_positions(position_risk: list[dict[str, Any]]) -> set[str]:
+    symbols: set[str] = set()
+    for row in position_risk:
+        sym = str(row.get("symbol") or "").upper()
+        if not sym:
+            continue
+        if _position_amt(row.get("positionAmt", "0")).copy_abs() > Decimal("0"):
+            symbols.add(sym)
+    return symbols
+
+
+def _fetch_open_algo_orders_fleet(position_risk: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One fleet-wide algo-order snapshot (shared across all pair processes)."""
+    if _fapi_in_backoff():
+        cached = _read_fleet_rest_cache_file()
+        return (cached or {}).get("open_algo_orders") or []
+
+    try:
+        resp = _fapi_request("GET", "/fapi/v1/openAlgoOrders", {"algoType": "CONDITIONAL"})
+        if isinstance(resp, list):
+            return resp
+    except RuntimeError as exc:
+        logger.debug("openAlgoOrders (all symbols) failed, falling back per symbol: %s", exc)
+
+    orders: list[dict[str, Any]] = []
+    for symbol in sorted(_symbols_with_open_positions(position_risk)):
+        try:
+            resp = _fapi_request(
+                "GET",
+                "/fapi/v1/openAlgoOrders",
+                {"symbol": symbol, "algoType": "CONDITIONAL"},
+            )
+            if isinstance(resp, list):
+                orders.extend(resp)
+        except RuntimeError as exc:
+            logger.warning("openAlgoOrders failed for %s: %s", symbol, exc)
+    return orders
+
+
 def _fetch_fleet_rest_live() -> dict[str, Any]:
-    """One positionRisk + one openOrders for the whole account."""
+    """One positionRisk + openOrders + openAlgoOrders for the whole account."""
     global _last_position_api_error
     api_error: str | None = None
     position_risk: list[dict[str, Any]] = []
     open_orders: list[dict[str, Any]] = []
+    open_algo_orders: list[dict[str, Any]] = []
 
     try:
         resp = _fapi_request("GET", "/fapi/v2/positionRisk", {})
@@ -1501,10 +1579,13 @@ def _fetch_fleet_rest_live() -> dict[str, Any]:
             _last_position_api_error = api_error
             logger.warning("openOrders (all symbols) failed: %s", exc)
 
+        open_algo_orders = _fetch_open_algo_orders_fleet(position_risk)
+
     return {
         "fetched_at": time.time(),
         "position_risk": position_risk,
         "open_orders": open_orders,
+        "open_algo_orders": open_algo_orders,
         "api_error": api_error,
     }
 
@@ -1516,6 +1597,7 @@ def _fleet_rest_cache_payload(*, force: bool = False) -> dict[str, Any]:
         "fetched_at": 0.0,
         "position_risk": [],
         "open_orders": [],
+        "open_algo_orders": [],
         "api_error": None,
     }
     if not _keys_configured():
@@ -1803,11 +1885,15 @@ def _get_open_orders(symbol: str) -> list[dict[str, Any]]:
 def _get_open_algo_orders(symbol: str) -> list[dict[str, Any]]:
     if not _keys_configured():
         return []
+    symbol = symbol.upper()
+    if FLEET_REST_CACHE_ENABLED:
+        orders = _fleet_rest_cache_payload().get("open_algo_orders") or []
+        return [o for o in orders if str(o.get("symbol") or "").upper() == symbol]
     try:
         resp = _fapi_request(
             "GET",
             "/fapi/v1/openAlgoOrders",
-            {"symbol": symbol.upper(), "algoType": "CONDITIONAL"},
+            {"symbol": symbol, "algoType": "CONDITIONAL"},
         )
         return resp if isinstance(resp, list) else []
     except RuntimeError as exc:
@@ -2856,6 +2942,11 @@ def _sign_query(params: dict[str, Any]) -> str:
 
 
 def _fapi_public_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    if _fapi_in_backoff():
+        until = _read_shared_fapi_backoff_until()
+        raise RuntimeError(
+            f"Futures REST backoff until {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))}"
+        )
     query = urllib.parse.urlencode(params or {})
     url = f"{FAPI_BASE}{path}"
     if query:
@@ -2867,6 +2958,7 @@ def _fapi_public_get(path: str, params: dict[str, Any] | None = None) -> dict[st
             return json.loads(payload) if payload else {}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode()
+        _apply_fapi_error_backoff(detail)
         raise RuntimeError(detail or str(exc)) from exc
 
 

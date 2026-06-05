@@ -110,7 +110,7 @@ REQUIRE_TREND_ALIGN = os.getenv("REQUIRE_TREND_ALIGN", "true").lower() in ("1", 
 SIGNAL_COOLDOWN_SEC = int(os.getenv("SIGNAL_COOLDOWN_SEC", "180"))
 WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "20"))
 WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "120"))
-METRICS_INTERVAL_MS = max(3000, int(os.getenv("METRICS_INTERVAL_MS", "5000")))
+METRICS_INTERVAL_MS = max(3000, int(os.getenv("METRICS_INTERVAL_MS", "8000")))
 DEPTH_METRICS_INTERVAL_SEC = float(os.getenv("DEPTH_METRICS_INTERVAL_SEC", "0.25"))
 EMA_FAST = int(os.getenv("EMA_FAST", "9"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
@@ -182,8 +182,9 @@ symbol_config.apply_db_overrides(globals(), SYMBOL)
 
 ws_force_reconnect = Event()
 
-REST_BASE = "https://api.binance.com"
-WS_BASE = "wss://stream.binance.com:9443"
+FAPI_BASE = os.getenv("FAPI_BASE", "https://fapi.binance.com").rstrip("/")
+FSTREAM_WS_BASE = os.getenv("FSTREAM_WS_BASE", "wss://fstream.binance.com").rstrip("/")
+FAPI_MARKET_PATH = f"{FAPI_BASE}/fapi/v1"
 
 state_lock = Lock()
 candles: deque = deque(maxlen=MAX_CANDLES)
@@ -1925,7 +1926,7 @@ def sync_orderbook_state(bid_map: dict[float, float], ask_map: dict[float, float
 
 
 async def fetch_depth_snapshot(session: aiohttp.ClientSession) -> dict:
-    url = f"{REST_BASE}/api/v3/depth"
+    url = f"{FAPI_MARKET_PATH}/depth"
     params = {"symbol": SYMBOL.upper(), "limit": 1000}
     async with session.get(url, params=params, timeout=10) as resp:
         resp.raise_for_status()
@@ -1933,7 +1934,7 @@ async def fetch_depth_snapshot(session: aiohttp.ClientSession) -> dict:
 
 
 async def fetch_24h_ticker(session: aiohttp.ClientSession) -> float | None:
-    url = f"{REST_BASE}/api/v3/ticker/24hr"
+    url = f"{FAPI_MARKET_PATH}/ticker/24hr"
     params = {"symbol": SYMBOL.upper()}
     async with session.get(url, params=params, timeout=10) as resp:
         resp.raise_for_status()
@@ -1949,7 +1950,7 @@ async def fetch_historical_klines(
     interval: str = INTERVAL,
     limit: int | None = None,
 ) -> list[dict]:
-    url = f"{REST_BASE}/api/v3/klines"
+    url = f"{FAPI_MARKET_PATH}/klines"
     candle_limit = limit if limit is not None else min(MAX_CANDLES, 500)
     params = {
         "symbol": SYMBOL.upper(),
@@ -2056,7 +2057,11 @@ async def ws_loop() -> None:
     last_depth_metrics_mono = 0.0
 
     stagger_s = (hash(SYMBOL.upper()) % 30) + random.uniform(0.0, 2.0)
-    logger.info("%s: WebSocket stagger %.1fs (reduces REST burst on fleet start)", SYMBOL.upper(), stagger_s)
+    logger.info(
+        "%s: Futures WS stagger %.1fs (reduces fapi REST burst on fleet start)",
+        SYMBOL.upper(),
+        stagger_s,
+    )
     await asyncio.sleep(stagger_s)
 
     async with aiohttp.ClientSession() as session:
@@ -2073,7 +2078,7 @@ async def ws_loop() -> None:
             current_ltf = INTERVAL
             current_htf = HTF_INTERVAL
             stream_url = (
-                f"{WS_BASE}/stream?streams="
+                f"{FSTREAM_WS_BASE}/stream?streams="
                 f"{SYMBOL}@kline_{current_ltf}/{SYMBOL}@kline_{current_htf}/"
                 f"{SYMBOL}@depth@100ms/{SYMBOL}@miniTicker"
             )
@@ -2104,7 +2109,7 @@ async def ws_loop() -> None:
                     close_timeout=10,
                     max_queue=512,
                 ) as ws:
-                    logger.info("WebSocket connected for %s", SYMBOL.upper())
+                    logger.info("Futures WebSocket connected for %s (%s)", SYMBOL.upper(), FSTREAM_WS_BASE)
                     ws_status = "buffering depth"
 
                     while len(depth_buffer) < 3:
@@ -2257,7 +2262,7 @@ def resolve_confirmed_pattern(closed_rows: list[dict]) -> str | None:
     return confirmed_pattern(raw_pattern, signal_dir, signal_confidence)
 
 
-def get_candles_df() -> pd.DataFrame:
+def get_candles_df(*, refresh_execution: bool = True) -> pd.DataFrame:
     global latest_pattern
     with state_lock:
         rows = list(candles)
@@ -2341,25 +2346,26 @@ def get_candles_df() -> pd.DataFrame:
         snapshot_market_analysis = market_analysis
 
     exposure = execution.get_exchange_exposure(SYMBOL)
-    maintain_plan = resolved_trade_plan
-    if not maintain_plan.get("active") and exposure.get("open"):
-        maintain_plan = trade_plan_for_position_reconcile(
-            exposure,
-            support=snapshot_support,
-            resistance=snapshot_resistance,
-            price=snapshot_price,
-            market_analysis=snapshot_market_analysis,
-        )
-    if maintain_plan.get("active"):
-        execution.run_execution_maintenance(
-            SYMBOL,
-            direction=maintain_plan.get("signal"),
-            sl=float(maintain_plan["sl"]) if maintain_plan.get("sl") else None,
-            tp=float(maintain_plan["tp1"]) if maintain_plan.get("tp1") else None,
-            market_analysis=snapshot_market_analysis,
-        )
-    else:
-        execution.run_execution_maintenance(SYMBOL, market_analysis=snapshot_market_analysis)
+    if refresh_execution:
+        maintain_plan = resolved_trade_plan
+        if not maintain_plan.get("active") and exposure.get("open"):
+            maintain_plan = trade_plan_for_position_reconcile(
+                exposure,
+                support=snapshot_support,
+                resistance=snapshot_resistance,
+                price=snapshot_price,
+                market_analysis=snapshot_market_analysis,
+            )
+        if maintain_plan.get("active"):
+            execution.run_execution_maintenance(
+                SYMBOL,
+                direction=maintain_plan.get("signal"),
+                sl=float(maintain_plan["sl"]) if maintain_plan.get("sl") else None,
+                tp=float(maintain_plan["tp1"]) if maintain_plan.get("tp1") else None,
+                market_analysis=snapshot_market_analysis,
+            )
+        else:
+            execution.run_execution_maintenance(SYMBOL, market_analysis=snapshot_market_analysis)
     metrics["execution"] = {
         **execution.get_execution_status(),
         "position": exposure,
@@ -3441,7 +3447,7 @@ app.layout = html.Div(
                     [
                         html.H2("Binance Live Dashboard", className="title"),
                         html.P(
-                            f"Streaming {SYMBOL.upper()} · interval {INTERVAL} · depth {DEPTH_LEVELS} levels · "
+                            f"Futures USDT-M · {SYMBOL.upper()} · interval {INTERVAL} · depth {DEPTH_LEVELS} levels · "
                             f"min confidence {MIN_CONFIDENCE}%",
                             className="subtitle",
                         ),
@@ -3649,7 +3655,7 @@ def format_position_label(pos: dict) -> tuple[str, float | None, float | None]:
 
 def build_hub_summary() -> dict:
     """Compact snapshot for the multi-pair hub cards."""
-    _, _, metrics = get_candles_df()
+    _, _, metrics = get_candles_df(refresh_execution=False)
     signal = metrics.get("signal", "NEUTRAL")
     confidence = int(metrics.get("confidence", 0))
     min_conf = int(metrics.get("min_confidence", MIN_CONFIDENCE))

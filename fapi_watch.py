@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 FAPI_BASE = os.getenv("FAPI_BASE", "https://fapi.binance.com").rstrip("/")
 PING_PATH = "/fapi/v1/ping"
 TIMEOUT_SEC = max(3, int(os.getenv("FAPI_WATCH_TIMEOUT_SEC", "10")))
-INTERVAL_SEC = max(60, int(os.getenv("FAPI_WATCH_INTERVAL_SEC", "600")))
+INTERVAL_SEC = max(60, int(os.getenv("FAPI_WATCH_INTERVAL_SEC", "900")))
 COOLDOWN_SEC = max(60, int(os.getenv("FAPI_WATCH_COOLDOWN_SEC", "3600")))
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_PATH = LOG_DIR / "fapi_watch.state"
@@ -53,6 +53,19 @@ def _save_state(state: dict) -> None:
 
 
 def probe() -> tuple[bool, int | None, str]:
+    try:
+        import execution
+
+        if execution._fapi_in_backoff():
+            until = execution._read_shared_fapi_backoff_until()
+            return (
+                False,
+                429,
+                f"Skipping probe — fleet REST backoff until {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))}",
+            )
+    except Exception:
+        pass
+
     url = f"{FAPI_BASE}{PING_PATH}"
     request = urllib.request.Request(url, method="GET")
     try:
@@ -142,6 +155,11 @@ def run_check(*, dry_run: bool = False, kill_fleet: bool = False) -> int:
     prev_status = state.get("status")
     state["last_http_code"] = code
 
+    if not ok and detail.startswith("Skipping probe"):
+        logger.debug("fapi_watch probe skipped: %s", detail)
+        _save_state(state)
+        return 0
+
     if ok:
         state["status"] = "ok"
         if prev_status == "blocked" and _cooldown_elapsed(state, "notified_recovered_at"):
@@ -205,7 +223,13 @@ def start_background_watch() -> threading.Thread | None:
         daemon=True,
     )
     _watch_thread.start()
-    run_check()
+    try:
+        import execution
+
+        if not execution._fapi_in_backoff():
+            run_check()
+    except Exception:
+        run_check()
     return _watch_thread
 
 

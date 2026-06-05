@@ -1,8 +1,8 @@
 # trade-binance-websocket-dashboard
 
-**trade-binance-websocket-dashboard** is a **Binance Spot** live dashboard that streams **klines** and the **order book** over WebSocket, renders OHLC candles with pattern markers (Hammer, Shooting Star), and shows depth, spread, and volume metrics in a **Plotly Dash** UI.
+**trade-binance-websocket-dashboard** is a **Binance Futures USDT-M** live dashboard that streams **klines** and the **order book** over WebSocket (`fstream`), renders OHLC candles with pattern markers (Hammer, Shooting Star), and shows depth, spread, and volume metrics in a **Plotly Dash** UI.
 
-Optional **order execution** sends **Binance Futures** LIMIT entries (with SL/TP algos) when a **valid chart entry** is confirmed — same REST flow as [trade-binance-websocket-order-blocks](https://github.com/idoneo/trade-binance-websocket-order-blocks). Use `EXECUTION_MODE=dry` to log only, or `live` with API keys.
+Optional **order execution** sends **Futures** LIMIT entries (with SL/TP algos) on the same market when a **valid chart entry** is confirmed — same REST flow as [trade-binance-websocket-order-blocks](https://github.com/idoneo/trade-binance-websocket-order-blocks). Use `EXECUTION_MODE=dry` to log only, or `live` with API keys.
 
 ## Requirements
 
@@ -245,7 +245,7 @@ Questions, support, or license-related notices: hola@idoneo.dev
 
 ## Security
 
-Do not commit `.env` or secrets to the repository. Public Spot streams need no keys; **live execution** requires Futures API keys with trade permissions. Report security issues to hola@idoneo.dev.
+Do not commit `.env` or secrets to the repository. Public Futures market streams need no keys; **live execution** requires Futures API keys with trade permissions. Report security issues to hola@idoneo.dev.
 
 ## Disclaimer
 

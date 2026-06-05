@@ -31,7 +31,7 @@
         if (analyticsLink) {
             analyticsLink.href = "/analytics/";
         }
-        const REFRESH_MS = 3000;
+        const REFRESH_MS = 5000;
 
         function signalBadge(signal) {
             if (signal === "LONG") return "badge badge-bull";
@@ -292,7 +292,7 @@
                 footer.textContent =
                     `${offline} dashboards not reachable on 127.0.0.1 — is ./run-all.sh running in screen? Check: curl -s http://127.0.0.1:8050/api/hub-summaries`;
             } else {
-                footer.textContent = `Updates every 3s · ${online} online · ${offline} offline`;
+                footer.textContent = `Updates every 5s · ${online} online · ${offline} offline`;
             }
         }
 
