@@ -1990,6 +1990,42 @@ async def fetch_24h_ticker(session: aiohttp.ClientSession) -> float | None:
         return None
 
 
+def _parse_mini_ticker_change_pct(data: dict) -> float | None:
+    pct_raw = data.get("P")
+    if pct_raw is not None:
+        try:
+            return float(pct_raw)
+        except (TypeError, ValueError):
+            pass
+    try:
+        open_price = float(data.get("o") or 0)
+        close_price = float(data.get("c") or 0)
+        if open_price > 0:
+            return (close_price - open_price) / open_price * 100.0
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+async def _ensure_change_24h_from_rest(session: aiohttp.ClientSession) -> None:
+    """Bootstrap 24h % once via REST (miniTicker may lag after connect)."""
+    global change_24h
+    with state_lock:
+        if change_24h is not None:
+            return
+    try:
+        pct = await fetch_24h_ticker(session)
+    except RuntimeError as exc:
+        logger.debug("%s: 24h ticker skipped: %s", SYMBOL.upper(), exc)
+        return
+    except Exception as exc:
+        logger.warning("%s: 24h ticker failed: %s", SYMBOL.upper(), exc)
+        return
+    if pct is not None:
+        with state_lock:
+            change_24h = pct
+
+
 async def fetch_historical_klines(
     session: aiohttp.ClientSession,
     interval: str = INTERVAL,
@@ -2112,6 +2148,7 @@ async def ws_loop() -> None:
         with state_lock:
             candles.extend(history)
             htf_candles.extend(htf_history)
+        await _ensure_change_24h_from_rest(session)
 
         while True:
             current_ltf = INTERVAL
@@ -2188,6 +2225,8 @@ async def ws_loop() -> None:
                                 exc,
                             )
 
+                    await _ensure_change_24h_from_rest(session)
+
                     async for raw in ws:
                         if ws_force_reconnect.is_set():
                             logger.info("%s: config change — reconnecting WebSocket", SYMBOL.upper())
@@ -2223,23 +2262,19 @@ async def ws_loop() -> None:
                                         )
 
                         elif data.get("e") == "24hrMiniTicker" or msg.get("stream", "").endswith("@miniTicker"):
-                            pct_raw = data.get("P")
-                            if pct_raw is not None:
-                                try:
-                                    with state_lock:
-                                        change_24h = float(pct_raw)
-                                        if orderbook.get("bids") and orderbook.get("asks"):
-                                            update_metrics(
-                                                orderbook["bids"],
-                                                orderbook["asks"],
-                                                analysis_orderbook.get("bids"),
-                                                analysis_orderbook.get("asks"),
-                                            )
-                                except (TypeError, ValueError):
-                                    log_error("mini_ticker_parse_error", raw=pct_raw)
-                                    logger.warning("Invalid miniTicker change pct: %r", pct_raw)
+                            pct = _parse_mini_ticker_change_pct(data)
+                            if pct is not None:
+                                with state_lock:
+                                    change_24h = pct
+                                    if orderbook.get("bids") and orderbook.get("asks"):
+                                        update_metrics(
+                                            orderbook["bids"],
+                                            orderbook["asks"],
+                                            analysis_orderbook.get("bids"),
+                                            analysis_orderbook.get("asks"),
+                                        )
                             else:
-                                logger.debug("miniTicker event without P field: %s", data)
+                                logger.debug("miniTicker without 24h pct: %s", data)
 
                         elif "U" in data and "u" in data:
                             if data["u"] <= last_update_id:
