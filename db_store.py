@@ -300,6 +300,51 @@ def get_symbol_config(symbol: str) -> tuple[dict[str, Any], int]:
     return _parse_json_field(row.get("config_json")), int(row.get("config_version") or 0)
 
 
+def list_active_symbol_configs() -> list[dict[str, Any]]:
+    if not DB_ENABLED or not _credentials_configured():
+        return []
+    if not ensure_schema():
+        return []
+
+    try:
+        conn = _connect()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT symbol, config_json, config_version, updated_at, updated_by
+                    FROM symbol_config
+                    WHERE active = 1
+                    ORDER BY symbol ASC
+                    """
+                )
+                rows = cursor.fetchall() or []
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("MySQL list_active_symbol_configs failed: %s", exc)
+        return []
+
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        overrides = _parse_json_field(row.get("config_json"))
+        if not overrides:
+            continue
+        updated = row.get("updated_at")
+        if hasattr(updated, "isoformat"):
+            updated = updated.isoformat()
+        result.append(
+            {
+                "symbol": str(row.get("symbol") or "").upper(),
+                "overrides": overrides,
+                "config_version": int(row.get("config_version") or 0),
+                "updated_at": updated,
+                "updated_by": row.get("updated_by"),
+            }
+        )
+    return result
+
+
 def get_symbol_config_record(symbol: str) -> tuple[dict[str, Any], int, bool]:
     """Return active overrides, config_version, and whether the row is active."""
     if not DB_ENABLED or not _credentials_configured():

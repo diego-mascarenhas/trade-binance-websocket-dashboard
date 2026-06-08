@@ -16,6 +16,7 @@ const suggestionsBtn = document.getElementById("suggestions-btn");
 const suggestionsApplyAllBtn = document.getElementById("suggestions-apply-all-btn");
 const suggestionsRestoreAllBtn = document.getElementById("suggestions-restore-all-btn");
 const suggestionsBulkFeedback = document.getElementById("suggestions-bulk-feedback");
+const activeConfigStatusEl = document.getElementById("active-config-status");
 const suggestionsNote = document.getElementById("suggestions-note");
 const suggestionsContent = document.getElementById("suggestions-content");
 const accountKpiGrid = document.getElementById("account-kpi-grid");
@@ -23,6 +24,7 @@ const accountNote = document.getElementById("account-note");
 let deepseekAvailable = false;
 let lastSuggestions = [];
 let bulkApplied = false;
+let activeConfigStatus = null;
 /** @type {Map<string, number>} */
 const symbolPorts = new Map();
 
@@ -644,13 +646,107 @@ function hasBulkApplicableSuggestions(suggestions = lastSuggestions) {
     return suggestions.some((item) => hasConfigChanges(item));
 }
 
+function hasActiveOverrides() {
+    return Boolean(activeConfigStatus?.active);
+}
+
+function formatConfigValue(value) {
+    if (typeof value === "boolean") {
+        return value ? "true" : "false";
+    }
+    return String(value ?? "—");
+}
+
+function renderConfigKeyValues(entries) {
+    const keys = Object.keys(entries || {});
+    if (!keys.length) {
+        return '<p class="note" style="margin:0;">—</p>';
+    }
+    return `
+        <dl class="active-config-kv">
+            ${keys
+                .sort()
+                .map(
+                    (key) => `
+                        <dt>${escapeHtml(key)}</dt>
+                        <dd>${escapeHtml(formatConfigValue(entries[key]))}</dd>
+                    `
+                )
+                .join("")}
+        </dl>
+    `;
+}
+
+function renderActiveConfigStatus(status) {
+    activeConfigStatus = status;
+    if (!activeConfigStatusEl) {
+        updateBulkActionButtons();
+        return;
+    }
+    if (!status?.active) {
+        activeConfigStatusEl.hidden = true;
+        activeConfigStatusEl.innerHTML = "";
+        updateBulkActionButtons();
+        return;
+    }
+
+    const fleetWide = status.fleet_wide || {};
+    const perSymbol = status.per_symbol || {};
+    const perSymbolBlocks = Object.keys(perSymbol)
+        .sort()
+        .map(
+            (symbol) => `
+                <div class="active-config-block">
+                    <h4>${escapeHtml(symbol)}</h4>
+                    ${renderConfigKeyValues(perSymbol[symbol])}
+                </div>
+            `
+        )
+        .join("");
+
+    const updatedAt = status.updated_at ? escapeHtml(String(status.updated_at)) : "—";
+    const updatedBy = status.updated_by ? escapeHtml(String(status.updated_by)) : "—";
+    const symbolCount = status.symbols_with_overrides ?? 0;
+    const fleetSize = status.fleet_size ?? 0;
+
+    activeConfigStatusEl.hidden = false;
+    activeConfigStatusEl.innerHTML = `
+        <div class="active-config-head">
+            <h3 class="active-config-title">Configuración activa (MySQL overrides)</h3>
+            <p class="active-config-meta">${symbolCount}/${fleetSize} símbolos · ${updatedAt} · ${updatedBy}</p>
+        </div>
+        <div class="active-config-grid">
+            <div class="active-config-block">
+                <h4>Flota (mismo valor en todos)</h4>
+                ${renderConfigKeyValues(fleetWide)}
+            </div>
+            ${perSymbolBlocks}
+        </div>
+        <p class="note" style="margin:10px 0 0;font-size:0.78rem;">
+            Estos valores sustituyen al <code>.env</code> mientras estén activos.
+            Usa <strong>Restaurar .env</strong> para volver a los defaults.
+        </p>
+    `;
+    updateBulkActionButtons();
+}
+
+async function loadActiveConfigStatus() {
+    try {
+        const status = await fetchJson("/api/config-overrides");
+        renderActiveConfigStatus(status);
+    } catch (error) {
+        renderActiveConfigStatus(null);
+    }
+}
+
 function updateBulkActionButtons() {
     const applicable = hasBulkApplicableSuggestions();
+    const hasOverrides = hasActiveOverrides();
     if (suggestionsApplyAllBtn) {
-        suggestionsApplyAllBtn.hidden = !applicable || bulkApplied;
+        suggestionsApplyAllBtn.hidden = !applicable || bulkApplied || hasOverrides;
     }
     if (suggestionsRestoreAllBtn) {
-        suggestionsRestoreAllBtn.hidden = !applicable || !bulkApplied;
+        suggestionsRestoreAllBtn.hidden = !hasOverrides && !bulkApplied;
     }
 }
 
@@ -800,6 +896,7 @@ async function applySuggestion(index) {
             return;
         }
         setSuggestionFeedback(index, result.message || "Configuración aplicada.", "ok");
+        await loadActiveConfigStatus();
     } catch (error) {
         setSuggestionFeedback(index, error.message, "error");
     } finally {
@@ -836,6 +933,7 @@ async function restoreSuggestion(index) {
             return;
         }
         setSuggestionFeedback(index, result.message || "Restaurado a defaults.", "info");
+        await loadActiveConfigStatus();
     } catch (error) {
         setSuggestionFeedback(index, error.message, "error");
     } finally {
@@ -869,6 +967,7 @@ async function applyAllSuggestions() {
         lastSuggestions.forEach((_, index) => {
             setSuggestionFeedback(index, "Incluido en aplicación masiva.", "ok");
         });
+        await loadActiveConfigStatus();
     } catch (error) {
         setBulkFeedback(error.message, "error");
     } finally {
@@ -881,7 +980,7 @@ async function applyAllSuggestions() {
 }
 
 async function restoreAllSuggestions() {
-    if (!hasBulkApplicableSuggestions() || !bulkApplied) {
+    if (!hasActiveOverrides() && !bulkApplied) {
         return;
     }
     if (suggestionsRestoreAllBtn) {
@@ -890,10 +989,15 @@ async function restoreAllSuggestions() {
     }
     setBulkFeedback("Restaurando overrides a valores del .env…", "info");
     try {
-        const result = await postJson("/api/suggestions/restore-all", {
-            suggestions: lastSuggestions,
-            reason: "DeepSeek bulk restore",
-        });
+        const result =
+            hasBulkApplicableSuggestions() && bulkApplied
+                ? await postJson("/api/suggestions/restore-all", {
+                      suggestions: lastSuggestions,
+                      reason: "DeepSeek bulk restore",
+                  })
+                : await postJson("/api/config-overrides/restore", {
+                      reason: "Analytics restore all to .env",
+                  });
         if (!result.ok && !result.partial) {
             setBulkFeedback(result.error || "No se pudo restaurar.", "error");
             return;
@@ -903,6 +1007,7 @@ async function restoreAllSuggestions() {
         lastSuggestions.forEach((_, index) => {
             setSuggestionFeedback(index, "Restaurado a .env.", "info");
         });
+        await loadActiveConfigStatus();
     } catch (error) {
         setBulkFeedback(error.message, "error");
     } finally {
@@ -948,7 +1053,7 @@ async function refresh() {
     try {
         const health = await fetchJson("/api/health");
         deepseekAvailable = Boolean(health.deepseek_enabled);
-        await loadAccountPerformance();
+        await Promise.all([loadAccountPerformance(), loadActiveConfigStatus()]);
 
         if (!health.db_enabled) {
             statusNote.className = "note warn";

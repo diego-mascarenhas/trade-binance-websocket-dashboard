@@ -170,6 +170,20 @@ def suggestions():
     return _cors(jsonify(result)), status
 
 
+@app.route("/api/config-overrides", methods=["GET"])
+def config_overrides_status():
+    return _cors(jsonify(symbol_config_admin.get_fleet_overrides_status()))
+
+
+@app.route("/api/config-overrides/restore", methods=["POST"])
+def config_overrides_restore():
+    payload = request.get_json(silent=True) or {}
+    reason = payload.get("reason")
+    result = symbol_config_admin.restore_fleet_to_env_defaults(reason=reason)
+    status = 200 if result.get("ok") or result.get("partial") else 400
+    return _cors(jsonify(result)), status
+
+
 @app.route("/api/symbol-config/<symbol>", methods=["GET"])
 def symbol_config_get(symbol: str):
     return _cors(jsonify(symbol_config_admin.get_symbol_override(symbol)))

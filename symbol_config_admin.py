@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import db_store
@@ -204,6 +205,141 @@ def apply_suggestions_batch(
         "partial": applied > 0 and bool(errors),
         "applied_symbols": applied,
         "total_symbols": len(plan),
+        "errors": errors,
+        "results": results,
+        "message": message,
+    }
+
+
+def _format_config_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        return value
+    return value
+
+
+def get_fleet_overrides_status() -> dict[str, Any]:
+    """Summarize active MySQL overrides for analytics UI."""
+    if not db_store.is_enabled():
+        return {"enabled": False, "active": False, "error": "DB_ENABLED=false"}
+
+    fleet = dashboard_notify.load_fleet_symbols()
+    rows = db_store.list_active_symbol_configs()
+    fleet_set = set(fleet)
+    symbol_overrides: dict[str, dict[str, Any]] = {}
+    meta_by_symbol: dict[str, dict[str, Any]] = {}
+
+    for row in rows:
+        symbol = row.get("symbol")
+        overrides = row.get("overrides") or {}
+        if not symbol or not overrides:
+            continue
+        symbol_overrides[symbol] = overrides
+        meta_by_symbol[symbol] = {
+            "config_version": row.get("config_version"),
+            "updated_at": row.get("updated_at"),
+            "updated_by": row.get("updated_by"),
+        }
+
+    active_symbols = [symbol for symbol in fleet if symbol in symbol_overrides]
+    extra_symbols = sorted(symbol for symbol in symbol_overrides if symbol not in fleet_set)
+
+    if not active_symbols and not extra_symbols:
+        return {
+            "enabled": True,
+            "active": False,
+            "fleet_size": len(fleet),
+            "symbols_with_overrides": 0,
+        }
+
+    scoped_symbols = active_symbols or extra_symbols
+    all_keys: set[str] = set()
+    for symbol in scoped_symbols:
+        all_keys.update(symbol_overrides[symbol].keys())
+
+    fleet_wide: dict[str, Any] = {}
+    per_symbol: dict[str, dict[str, Any]] = {}
+    for key in sorted(all_keys):
+        values = {
+            symbol: symbol_overrides[symbol][key]
+            for symbol in scoped_symbols
+            if key in symbol_overrides[symbol]
+        }
+        if not values:
+            continue
+        serialized = {symbol: json.dumps(value, sort_keys=True, default=str) for symbol, value in values.items()}
+        if len(values) == len(scoped_symbols) and len(set(serialized.values())) == 1:
+            fleet_wide[key] = _format_config_value(next(iter(values.values())))
+        else:
+            for symbol, value in values.items():
+                per_symbol.setdefault(symbol, {})[key] = _format_config_value(value)
+
+    latest_at = None
+    latest_by = None
+    for symbol in scoped_symbols:
+        meta = meta_by_symbol.get(symbol) or {}
+        updated_at = meta.get("updated_at")
+        if updated_at and (latest_at is None or str(updated_at) > str(latest_at)):
+            latest_at = updated_at
+            latest_by = meta.get("updated_by")
+
+    return {
+        "enabled": True,
+        "active": True,
+        "fleet_size": len(fleet),
+        "symbols_with_overrides": len(active_symbols),
+        "extra_symbols": extra_symbols,
+        "fleet_wide": fleet_wide,
+        "per_symbol": per_symbol,
+        "updated_at": latest_at,
+        "updated_by": latest_by,
+        "source": "mysql_symbol_config",
+    }
+
+
+def restore_fleet_to_env_defaults(*, reason: str | None = None) -> dict[str, Any]:
+    if not db_store.is_enabled():
+        return {"ok": False, "error": "DB_ENABLED=false"}
+
+    fleet = dashboard_notify.load_fleet_symbols()
+    rows = db_store.list_active_symbol_configs()
+    active_symbols = {row["symbol"] for row in rows if row.get("symbol")}
+    targets = sorted(symbol for symbol in fleet if symbol in active_symbols)
+    if not targets:
+        return {
+            "ok": True,
+            "restored_symbols": 0,
+            "message": "No hay overrides activos — ya se usa .env.",
+        }
+
+    detail = reason or "Analytics restore all to .env defaults"
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for symbol in targets:
+        if symbol not in fleet:
+            continue
+        version = db_store.deactivate_symbol_config(
+            symbol,
+            updated_by=UPDATED_BY,
+            reason=detail,
+        )
+        if version is None:
+            errors.append(f"{symbol}: deactivate failed")
+            results.append({"ok": False, "symbol": symbol})
+            continue
+        reload = dashboard_notify.notify_dashboard_reload(symbol)
+        results.append({"ok": True, "symbol": symbol, "config_version": version, "reload": reload})
+
+    restored = sum(1 for result in results if result.get("ok"))
+    message = f"Restaurado a .env en {restored}/{len(targets)} símbolo(s)."
+    if errors:
+        message = f"Restaurado en {restored}/{len(targets)} símbolo(s). Fallos: {'; '.join(errors[:5])}"
+
+    return {
+        "ok": restored > 0 and not errors,
+        "partial": restored > 0 and bool(errors),
+        "restored_symbols": restored,
+        "total_symbols": len(targets),
         "errors": errors,
         "results": results,
         "message": message,
