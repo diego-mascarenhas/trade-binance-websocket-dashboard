@@ -19,6 +19,64 @@ const accountKpiGrid = document.getElementById("account-kpi-grid");
 const accountNote = document.getElementById("account-note");
 let deepseekAvailable = false;
 let lastSuggestions = [];
+/** @type {Map<string, number>} */
+const symbolPorts = new Map();
+
+async function loadSymbolPorts() {
+    try {
+        const response = await fetch("/pairs.json");
+        if (!response.ok) {
+            return;
+        }
+        const pairs = await response.json();
+        if (!Array.isArray(pairs)) {
+            return;
+        }
+        pairs.forEach((pair) => {
+            const symbol = String(pair.symbol || "").toUpperCase();
+            const port = Number(pair.port);
+            if (symbol && Number.isFinite(port)) {
+                symbolPorts.set(symbol, port);
+            }
+        });
+    } catch {
+        /* pairs.json optional */
+    }
+}
+
+function symbolDashboardUrl(symbol) {
+    const upper = String(symbol || "").trim().toUpperCase();
+    if (!upper) {
+        return null;
+    }
+    const port = symbolPorts.get(upper);
+    if (!port) {
+        return null;
+    }
+    const host = window.location.hostname || "127.0.0.1";
+    return `http://${host}:${port}/`;
+}
+
+function renderSymbolLink(symbol) {
+    const upper = String(symbol || "").trim().toUpperCase();
+    if (!upper) {
+        return "—";
+    }
+    const dashboardUrl = symbolDashboardUrl(upper);
+    const label = escapeHtml(upper);
+    if (dashboardUrl) {
+        return `<a class="symbol-link" href="${dashboardUrl}" target="_blank" rel="noopener noreferrer" title="Open ${label} dashboard">${label}</a>`;
+    }
+    return `<a class="symbol-link symbol-link-analytics" href="/analytics/?symbol=${encodeURIComponent(upper)}" title="Filter analytics by ${label}">${label}</a>`;
+}
+
+function applySymbolFromQuery() {
+    const params = new URLSearchParams(window.location.search);
+    const symbol = (params.get("symbol") || "").trim().toUpperCase();
+    if (symbol && symbolEl) {
+        symbolEl.value = symbol;
+    }
+}
 
 const PLOTLY_LAYOUT = {
     paper_bgcolor: "#171a21",
@@ -446,21 +504,73 @@ function renderAdxCell(row, kind) {
     return `<td class="${cls}" title="${escapeHtml(title)}">${formatted ?? "—"}${mark}</td>`;
 }
 
-function renderAdxFilterSummary(row) {
-    if (row.block_reason !== "adx_low") {
+function renderBlockDetail(row) {
+    const reason = row.block_reason;
+    if (!reason) {
         return "<td>—</td>";
     }
-    const useHtf = isAdxUseHtf(row);
-    const source = useHtf ? "HTF" : "1m";
-    const value = useHtf ? row.htf_adx : row.adx;
-    const formatted = formatAdxNumber(value);
-    const min = row.adx_min_trend;
-    const interval = row.htf_interval ? ` ${row.htf_interval}` : "";
-    if (formatted == null || min == null) {
-        return `<td class="adx-filter-summary" title="adx_low">${source}${interval} · min ?</td>`;
+
+    if (reason === "adx_low") {
+        const useHtf = isAdxUseHtf(row);
+        const source = useHtf ? "HTF" : "1m";
+        const value = useHtf ? row.htf_adx : row.adx;
+        const formatted = formatAdxNumber(value);
+        const min = row.adx_min_trend;
+        const interval = row.htf_interval ? ` ${row.htf_interval}` : "";
+        if (formatted == null || min == null) {
+            return `<td class="block-detail adx-filter-summary" title="Primer bloqueo: adx_low">${source}${interval} · min ?</td>`;
+        }
+        const text = `${source}${interval}: ${formatted} &lt; ${min}`;
+        return `<td class="block-detail adx-filter-summary adx-used-for-filter" title="Primer bloqueo: adx_low (solo este ADX se evalúa con ADX_USE_HTF)">${text}</td>`;
     }
-    const text = `${source}${interval}: ${formatted} &lt; ${min}`;
-    return `<td class="adx-filter-summary adx-used-for-filter" title="Motivo adx_low">${text}</td>`;
+
+    if (reason === "rsi_overbought") {
+        const rsi = formatAdxNumber(row.rsi);
+        const max = row.rsi_long_max;
+        const text =
+            rsi != null && max != null ? `RSI ${rsi} &gt; ${max}` : `RSI ${rsi ?? "—"} (LONG max ${max ?? "?"})`;
+        return `<td class="block-detail" title="Primer bloqueo: rsi_overbought">${text}</td>`;
+    }
+
+    if (reason === "rsi_oversold") {
+        const rsi = formatAdxNumber(row.rsi);
+        const min = row.rsi_short_min;
+        const text =
+            rsi != null && min != null ? `RSI ${rsi} &lt; ${min}` : `RSI ${rsi ?? "—"} (SHORT min ${min ?? "?"})`;
+        return `<td class="block-detail" title="Primer bloqueo: rsi_oversold">${text}</td>`;
+    }
+
+    if (reason === "macd_bearish" || reason === "macd_bullish") {
+        const hist = row.macd_hist;
+        const formatted =
+            hist != null && Number.isFinite(Number(hist)) ? Number(hist).toFixed(4) : "—";
+        const text =
+            reason === "macd_bearish"
+                ? `MACD hist ${formatted} &lt; 0 (LONG)`
+                : `MACD hist ${formatted} &gt; 0 (SHORT)`;
+        return `<td class="block-detail" title="Primer bloqueo: ${reason}">${text}</td>`;
+    }
+
+    if (reason === "htf_mismatch") {
+        const signal = row.signal || "?";
+        const trend = row.trend || "?";
+        const text = `${signal} vs HTF ${trend}`;
+        return `<td class="block-detail" title="Primer bloqueo: htf_mismatch">${text}</td>`;
+    }
+
+    if (reason === "signal_cooldown") {
+        return `<td class="block-detail" title="Primer bloqueo: signal_cooldown">Cooldown entre entradas</td>`;
+    }
+
+    if (reason === "no_active_plan") {
+        return `<td class="block-detail" title="Primer bloqueo: no_active_plan">Plan SL/TP inactivo</td>`;
+    }
+
+    if (reason === "symbol_disabled") {
+        return `<td class="block-detail" title="Primer bloqueo: symbol_disabled">Símbolo deshabilitado</td>`;
+    }
+
+    return `<td class="block-detail" title="Primer bloqueo: ${escapeHtml(reason)}">${escapeHtml(reason)}</td>`;
 }
 
 function renderRecent(rows) {
@@ -474,7 +584,7 @@ function renderRecent(rows) {
             (row) => `
                 <tr>
                     <td>${row.created_at || "—"}</td>
-                    <td>${row.symbol || "—"}</td>
+                    <td>${renderSymbolLink(row.symbol)}</td>
                     <td>${row.event_type || "—"}</td>
                     <td>${row.outcome || "—"}</td>
                     <td>${row.block_reason || "—"}</td>
@@ -483,7 +593,7 @@ function renderRecent(rows) {
                     <td>${row.rsi ?? "—"}</td>
                     ${renderAdxCell(row, "ltf")}
                     ${renderAdxCell(row, "htf")}
-                    ${renderAdxFilterSummary(row)}
+                    ${renderBlockDetail(row)}
                 </tr>
             `
         )
@@ -818,5 +928,8 @@ daysEl.addEventListener("change", refresh);
 symbolEl.addEventListener("change", refresh);
 granularityEl.addEventListener("change", refresh);
 
-refresh();
+applySymbolFromQuery();
+loadSymbolPorts().then(() => {
+    refresh();
+});
 setInterval(refresh, 60000);

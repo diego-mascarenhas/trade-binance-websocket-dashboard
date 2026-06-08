@@ -124,15 +124,17 @@
                             <th>RSI</th>
                             <th>ADX 1m</th>
                             <th>ADX HTF</th>
-                            <th>ADX filter</th>
+                            <th>Block detail</th>
                         </tr>
                     </thead>
                     <tbody id="recent-body"></tbody>
                 </table>
             </div>
             <p class="note" style="margin-top:8px;">
-                <span class="adx-used-for-filter">*</span> = ADX usado en el filtro
-                (<code>ADX_USE_HTF</code> elige 1m vs HTF · mínimo = <code>ADX_MIN_TREND</code> al bloquear).
+                Cada fila guarda <strong>una sola</strong> razón: la primera comprobación que bloqueó
+                (RSI → MACD → ADX en indicadores; trend/cooldown/plan en valid entry).
+                <span class="adx-used-for-filter">*</span> = ADX evaluado en el filtro
+                (<code>ADX_USE_HTF</code> elige 1m vs HTF · mínimo = <code>ADX_MIN_TREND</code>).
             </p>
         </section>
 

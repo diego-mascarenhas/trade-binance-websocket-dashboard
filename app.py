@@ -28,7 +28,12 @@ import execution
 import symbol_config
 import telegram_notify as telegram
 import trade_boost
-from indicators import IndicatorFilterSettings, evaluate_indicator_filters, compute_adx
+from indicators import (
+    IndicatorFilterSettings,
+    IndicatorFilterResult,
+    evaluate_indicator_filters,
+    compute_adx,
+)
 import db_store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -1702,12 +1707,19 @@ def _attempt_signal_entry(
         signal,
         indicator_filter_settings(),
     )
-    filter_result = evaluate_indicator_filters(
-        signal,
-        confidence,
-        analysis,
-        filter_settings,
-    )
+    if boost_info and boost_info.relaxed.get("bypass_indicators"):
+        filter_result = IndicatorFilterResult(
+            True,
+            confidence,
+            notes="boost bypass ADX/RSI/MACD",
+        )
+    else:
+        filter_result = evaluate_indicator_filters(
+            signal,
+            confidence,
+            analysis,
+            filter_settings,
+        )
     if not filter_result.allowed:
         market_snap = _decision_market_snapshot(signal, confidence, trend_bias, analysis)
         if boost_info:
@@ -1758,7 +1770,7 @@ def maybe_process_boost_entry(
     if not trade_boost.is_active(SYMBOL, candidate):
         return
 
-    min_conf = trade_boost.effective_min_confidence(MIN_CONFIDENCE)
+    min_conf = trade_boost.min_confidence_for(SYMBOL, candidate, MIN_CONFIDENCE)
     if not is_tradable_signal(candidate, confidence, min_conf):
         return
 
@@ -1811,7 +1823,11 @@ def apply_signal_debounce(
             entry=entry,
             trend_bias=trend_bias,
         )
-        if is_tradable_signal(candidate, confidence):
+        if is_tradable_signal(
+            candidate,
+            confidence,
+            trade_boost.min_confidence_for(SYMBOL, candidate, MIN_CONFIDENCE),
+        ):
             _attempt_signal_entry(
                 candidate,
                 confidence,
@@ -1821,6 +1837,9 @@ def apply_signal_debounce(
                 trend_bias,
                 trade_plan,
                 market_analysis,
+                min_confidence=trade_boost.min_confidence_for(
+                    SYMBOL, candidate, MIN_CONFIDENCE
+                ),
             )
         stable_signal_dir = candidate
 
@@ -3417,12 +3436,12 @@ def format_boost_status_text(status: dict) -> str:
                 f"{direction}: {entry.get('summary') or 'armed'} · {countdown} left"
             )
     if parts:
-        return f"ARMED — {' · '.join(parts)}. Used on next valid entry."
+        return f"ARMED — {' · '.join(parts)}. Bypasses adx_low & HTF mismatch on next entry."
     ttl = status.get("ttl_sec")
     ttl_hint = f" Max {max(1, int(ttl) // 60)}m per boost." if ttl else ""
     return (
-        "One boost at a time — LONG or SHORT replaces the other. "
-        f"Click an armed button or Cancel to disarm.{ttl_hint}"
+        "Arm before the signal fires. Bypasses adx_low (1m ADX), HTF trend mismatch, "
+        f"and min conf −{int(trade_boost.TRADE_BOOST_MIN_CONF_DELTA)}.{ttl_hint}"
     )
 
 
@@ -3492,17 +3511,20 @@ def diagnose_boost_wait_reason(metrics: dict) -> str | None:
             direction,
             indicator_filter_settings(),
         )
-        filter_result = evaluate_indicator_filters(
-            direction,
-            confidence,
-            analysis,
-            filter_settings,
-        )
-        if not filter_result.allowed:
-            return (
-                f"Boost {direction} armado — aún bloqueado: "
-                f"{filter_result.block_reason} ({filter_result.notes or '—'})."
+        if boost_info and boost_info.relaxed.get("bypass_indicators"):
+            pass  # filters bypassed while boost armed
+        else:
+            filter_result = evaluate_indicator_filters(
+                direction,
+                confidence,
+                analysis,
+                filter_settings,
             )
+            if not filter_result.allowed:
+                return (
+                    f"Boost {direction} armado — aún bloqueado: "
+                    f"{filter_result.block_reason} ({filter_result.notes or '—'})."
+                )
 
         if not entry_allowed_with_trend(direction, trend):
             return f"Boost {direction} armado — HTF trend {trend} (sin relax)."
@@ -3752,7 +3774,6 @@ app.title = f"Binance Live | {SYMBOL.upper()}"
 
 app.layout = html.Div(
     [
-        html.Div(id="boost-banner", className="boost-banner boost-banner-hidden"),
         html.Div(
             [
                 html.Div(
@@ -3780,8 +3801,9 @@ app.layout = html.Div(
                             [
                                 panel_section("Trade boost"),
                                 html.P(
-                                    "One boost at a time. SHORT replaces LONG (and vice versa). "
-                                    "Click an armed button again or Cancel to disarm.",
+                                    "While armed: bypasses adx_low / HTF ADX, HTF trend mismatch, "
+                                    f"and lowers min confidence by {int(trade_boost.TRADE_BOOST_MIN_CONF_DELTA)}. "
+                                    "One boost at a time — click again or Cancel to disarm.",
                                     className="panel-hint",
                                 ),
                                 html.Div(
@@ -4090,8 +4112,6 @@ def build_hub_summary() -> dict:
 
 
 @app.callback(
-    Output("boost-banner", "children"),
-    Output("boost-banner", "className"),
     Output("signal-boost-section", "className"),
     Output("boost-countdown-text", "children"),
     Output("boost-countdown-text", "className"),
@@ -4173,22 +4193,13 @@ def update_boost_panel(
     short_class = "boost-btn boost-short" + (" is-active" if short_active else "")
     cancel_class = "boost-btn boost-cancel" + ("" if any_active else " boost-cancel-hidden")
 
-    banner_class = "boost-banner" + ("" if any_active else " boost-banner-hidden")
     section_class = "signal-boost-section" + (" is-armed" if any_active else "")
     countdown_class = "boost-countdown" + ("" if any_active else " boost-countdown-hidden")
 
     if any_active:
         armed = list(boosts.keys())
-        banner_text = f"⚡ BOOST ARMED — {' / '.join(armed)}"
-        countdown_text = f"⏱ {countdown_line} remaining"
-        banner_children = [
-            html.Strong(banner_text),
-            html.Span(countdown_text, className="boost-banner-countdown"),
-        ]
-        if wait_reason:
-            banner_children.append(html.Span(wait_reason, className="boost-banner-detail"))
+        countdown_text = f"⚡ BOOST ARMED — {' / '.join(armed)} · ⏱ {countdown_line} remaining"
     else:
-        banner_children = []
         countdown_text = ""
 
     status_lines = [format_boost_status_text(status)]
@@ -4196,8 +4207,6 @@ def update_boost_panel(
         status_lines.append(wait_reason)
 
     return (
-        banner_children,
-        banner_class,
         section_class,
         countdown_text,
         countdown_class,

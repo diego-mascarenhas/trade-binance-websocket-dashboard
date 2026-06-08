@@ -359,6 +359,21 @@ th {
     font-weight: 600;
 }
 
+.symbol-link {
+    color: #93c5fd;
+    font-weight: 600;
+    text-decoration: none;
+}
+
+.symbol-link:hover {
+    color: #bfdbfe;
+    text-decoration: underline;
+}
+
+.symbol-link-analytics {
+    color: #fcd34d;
+}
+
 .bar-list {
     display: flex;
     flex-direction: column;

@@ -119,6 +119,8 @@ def _flatten_row(row: dict[str, Any]) -> dict[str, Any]:
         "htf_interval": config.get("HTF_INTERVAL"),
         "adx_min_trend": config.get("ADX_MIN_TREND"),
         "adx_use_htf": config.get("ADX_USE_HTF"),
+        "rsi_long_max": config.get("RSI_LONG_MAX"),
+        "rsi_short_min": config.get("RSI_SHORT_MIN"),
         "execution_mode": config.get("execution_mode"),
         "execution_enabled": config.get("execution_enabled"),
         "execute_on_valid_entry": config.get("execute_on_valid_entry"),

@@ -31,6 +31,13 @@ TRADE_BOOST_RELAX_TREND = os.getenv("TRADE_BOOST_RELAX_TREND", "true").lower() i
 TRADE_BOOST_MIN_CONF_DELTA = float(os.getenv("TRADE_BOOST_MIN_CONF_DELTA", "15"))
 TRADE_BOOST_SKIP_COOLDOWN = os.getenv("TRADE_BOOST_SKIP_COOLDOWN", "true").lower() in ("1", "true", "yes")
 TRADE_BOOST_RETRY_SEC = float(os.getenv("TRADE_BOOST_RETRY_SEC", "3"))
+# When armed: skip ADX/RSI/MACD filters entirely (fixes adx_low on HTF while 1m is strong)
+TRADE_BOOST_BYPASS_INDICATORS = os.getenv("TRADE_BOOST_BYPASS_INDICATORS", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+TRADE_BOOST_DISABLE_RSI = os.getenv("TRADE_BOOST_DISABLE_RSI", "true").lower() in ("1", "true", "yes")
 
 
 def _utc_now() -> str:
@@ -131,6 +138,19 @@ class BoostApplyInfo:
 
 def _compute_relaxed(base: IndicatorFilterSettings, direction: str) -> dict[str, Any]:
     relaxed: dict[str, Any] = {}
+    if TRADE_BOOST_BYPASS_INDICATORS:
+        relaxed["bypass_indicators"] = True
+        relaxed["adx_min_trend"] = TRADE_BOOST_ADX_FLOOR
+        if TRADE_BOOST_ADX_USE_1M:
+            relaxed["adx_use_htf"] = False
+        if TRADE_BOOST_DISABLE_RSI and base.rsi_enabled:
+            relaxed["rsi_enabled"] = False
+        if TRADE_BOOST_DISABLE_MACD and base.macd_enabled:
+            relaxed["macd_enabled"] = False
+        if TRADE_BOOST_RELAX_TREND:
+            relaxed["relax_trend_align"] = True
+        return relaxed
+
     adx_min = max(TRADE_BOOST_ADX_FLOOR, base.adx_min_trend - TRADE_BOOST_ADX_DELTA)
     if adx_min < base.adx_min_trend:
         relaxed["adx_min_trend"] = adx_min
@@ -227,11 +247,21 @@ def get_status(
 
 
 def _format_summary(relaxed: dict[str, Any]) -> str:
+    if relaxed.get("bypass_indicators"):
+        parts = ["no ADX/RSI/MACD block"]
+        if relaxed.get("adx_use_htf") is False:
+            parts.append("ADX 1m")
+        if relaxed.get("relax_trend_align"):
+            parts.append("HTF trend OK")
+        return " · ".join(parts)
+
     parts: list[str] = []
     if "adx_min_trend" in relaxed:
         parts.append(f"ADX≥{relaxed['adx_min_trend']}")
     if relaxed.get("adx_use_htf") is False:
         parts.append("ADX 1m")
+    if relaxed.get("rsi_enabled") is False:
+        parts.append("no RSI")
     if "rsi_long_max" in relaxed:
         parts.append(f"RSI long≤{relaxed['rsi_long_max']}")
     if "rsi_short_min" in relaxed:
@@ -390,6 +420,18 @@ def effective_min_confidence(base_min: int) -> int:
     if TRADE_BOOST_MIN_CONF_DELTA <= 0:
         return base_min
     return max(0, int(base_min - TRADE_BOOST_MIN_CONF_DELTA))
+
+
+def min_confidence_for(symbol: str, direction: str, base_min: int) -> int:
+    if _read_active_boost(symbol, direction):
+        return effective_min_confidence(base_min)
+    return base_min
+
+
+def bypasses_indicators(symbol: str, direction: str) -> bool:
+    if not TRADE_BOOST_BYPASS_INDICATORS:
+        return False
+    return _read_active_boost(symbol, direction)
 
 
 def skips_signal_cooldown(symbol: str, direction: str) -> bool:
