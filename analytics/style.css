@@ -196,6 +196,27 @@ body {
     margin-bottom: 14px;
 }
 
+.suggestions-bulk-btn[hidden] {
+    display: none;
+}
+
+.suggestions-bulk-feedback {
+    margin-top: -6px;
+    margin-bottom: 14px;
+}
+
+.suggestions-bulk-feedback.is-ok {
+    color: #86efac;
+}
+
+.suggestions-bulk-feedback.is-error {
+    color: #fca5a5;
+}
+
+.suggestions-bulk-feedback.is-info {
+    color: #93c5fd;
+}
+
 .suggestion-summary {
     margin-bottom: 16px;
     padding: 12px 14px;

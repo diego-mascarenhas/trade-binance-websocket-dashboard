@@ -93,6 +93,161 @@ def apply_config_changes(
     }
 
 
+def _normalize_suggestion_symbol(symbol: Any) -> str | None:
+    if symbol is None:
+        return None
+    value = str(symbol).strip().upper()
+    return value or None
+
+
+def plan_suggestions_apply(suggestions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Merge DeepSeek suggestions: fleet-wide first, then per-symbol overrides."""
+    import dashboard_notify
+
+    fleet = dashboard_notify.load_fleet_symbols()
+    fleet_set = set(fleet)
+    per_symbol: dict[str, dict[str, Any]] = {}
+    global_changes: dict[str, Any] = {}
+
+    for item in suggestions:
+        if not isinstance(item, dict):
+            continue
+        raw_changes = item.get("config_changes") or {}
+        if not isinstance(raw_changes, dict) or not raw_changes:
+            continue
+        validated, error = validate_config_changes(raw_changes)
+        if error:
+            continue
+
+        symbol = _normalize_suggestion_symbol(item.get("symbol"))
+        if symbol:
+            bucket = per_symbol.setdefault(symbol, {})
+            bucket.update(validated)
+        else:
+            global_changes.update(validated)
+
+    plan: dict[str, dict[str, Any]] = {}
+    targets = fleet or sorted(per_symbol.keys())
+    for symbol in targets:
+        merged = dict(global_changes)
+        merged.update(per_symbol.get(symbol, {}))
+        if merged:
+            plan[symbol] = merged
+
+    for symbol, changes in per_symbol.items():
+        if symbol not in fleet_set and symbol not in plan:
+            plan[symbol] = dict(changes)
+
+    return plan
+
+
+def plan_suggestions_restore(suggestions: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Keys to remove per symbol so dashboards fall back to .env defaults."""
+    import dashboard_notify
+
+    fleet = dashboard_notify.load_fleet_symbols()
+    restore_map: dict[str, set[str]] = {symbol: set() for symbol in fleet}
+
+    for item in suggestions:
+        if not isinstance(item, dict):
+            continue
+        raw_changes = item.get("config_changes") or {}
+        if not isinstance(raw_changes, dict) or not raw_changes:
+            continue
+        keys = [key for key in raw_changes if key in symbol_config.OVERRIDABLE_KEYS]
+        if not keys:
+            continue
+
+        symbol = _normalize_suggestion_symbol(item.get("symbol"))
+        if symbol:
+            restore_map.setdefault(symbol, set()).update(keys)
+        else:
+            for fleet_symbol in fleet:
+                restore_map[fleet_symbol].update(keys)
+
+    return {
+        symbol: sorted(keys)
+        for symbol, keys in restore_map.items()
+        if keys
+    }
+
+
+def apply_suggestions_batch(
+    suggestions: list[dict[str, Any]],
+    *,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    if not db_store.is_enabled():
+        return {"ok": False, "error": "DB_ENABLED=false"}
+
+    plan = plan_suggestions_apply(suggestions)
+    if not plan:
+        return {"ok": False, "error": "No aplicable config_changes in suggestions"}
+
+    detail = reason or "DeepSeek bulk apply"
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for symbol, changes in sorted(plan.items()):
+        result = apply_config_changes(symbol, changes, reason=detail)
+        results.append(result)
+        if not result.get("ok"):
+            errors.append(f"{symbol}: {result.get('error', 'unknown')}")
+
+    applied = sum(1 for result in results if result.get("ok"))
+    message = f"Aplicado en {applied}/{len(plan)} símbolo(s). Vuelve a .env con Restaurar."
+    if errors:
+        message = f"Aplicado en {applied}/{len(plan)} símbolo(s). Fallos: {'; '.join(errors[:5])}"
+
+    return {
+        "ok": applied > 0 and not errors,
+        "partial": applied > 0 and bool(errors),
+        "applied_symbols": applied,
+        "total_symbols": len(plan),
+        "errors": errors,
+        "results": results,
+        "message": message,
+    }
+
+
+def restore_suggestions_batch(
+    suggestions: list[dict[str, Any]],
+    *,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    if not db_store.is_enabled():
+        return {"ok": False, "error": "DB_ENABLED=false"}
+
+    plan = plan_suggestions_restore(suggestions)
+    if not plan:
+        return {"ok": False, "error": "No aplicable config_changes to restore"}
+
+    detail = reason or "DeepSeek bulk restore"
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for symbol, keys in sorted(plan.items()):
+        result = restore_config_keys(symbol, keys, reason=detail)
+        results.append(result)
+        if not result.get("ok"):
+            errors.append(f"{symbol}: {result.get('error', 'unknown')}")
+
+    restored = sum(1 for result in results if result.get("ok"))
+    message = f"Restaurado a .env en {restored}/{len(plan)} símbolo(s)."
+    if errors:
+        message = f"Restaurado en {restored}/{len(plan)} símbolo(s). Fallos: {'; '.join(errors[:5])}"
+
+    return {
+        "ok": restored > 0 and not errors,
+        "partial": restored > 0 and bool(errors),
+        "restored_symbols": restored,
+        "total_symbols": len(plan),
+        "errors": errors,
+        "results": results,
+        "message": message,
+    }
+
+
 def restore_config_keys(
     symbol: str,
     config_keys: list[str],

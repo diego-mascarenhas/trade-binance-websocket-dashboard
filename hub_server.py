@@ -188,6 +188,30 @@ def symbol_config_apply():
     return _cors(jsonify(result)), status
 
 
+@app.route("/api/suggestions/apply-all", methods=["POST"])
+def suggestions_apply_all():
+    payload = request.get_json(silent=True) or {}
+    suggestions = payload.get("suggestions") or []
+    reason = payload.get("reason")
+    if not isinstance(suggestions, list) or not suggestions:
+        return _cors(jsonify({"ok": False, "error": "suggestions required"})), 400
+    result = symbol_config_admin.apply_suggestions_batch(suggestions, reason=reason)
+    status = 200 if result.get("ok") or result.get("partial") else 400
+    return _cors(jsonify(result)), status
+
+
+@app.route("/api/suggestions/restore-all", methods=["POST"])
+def suggestions_restore_all():
+    payload = request.get_json(silent=True) or {}
+    suggestions = payload.get("suggestions") or []
+    reason = payload.get("reason")
+    if not isinstance(suggestions, list) or not suggestions:
+        return _cors(jsonify({"ok": False, "error": "suggestions required"})), 400
+    result = symbol_config_admin.restore_suggestions_batch(suggestions, reason=reason)
+    status = 200 if result.get("ok") or result.get("partial") else 400
+    return _cors(jsonify(result)), status
+
+
 @app.route("/api/symbol-config/restore", methods=["POST"])
 def symbol_config_restore():
     payload = request.get_json(silent=True) or {}

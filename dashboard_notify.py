@@ -14,6 +14,22 @@ ROOT = Path(__file__).resolve().parent
 PAIRS_FILE = ROOT / "hub" / "pairs.json"
 
 
+def load_fleet_symbols() -> list[str]:
+    if not PAIRS_FILE.is_file():
+        return []
+    try:
+        pairs = json.loads(PAIRS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read %s: %s", PAIRS_FILE, exc)
+        return []
+    symbols: list[str] = []
+    for item in pairs:
+        symbol = str(item.get("symbol", "")).strip().upper()
+        if symbol:
+            symbols.append(symbol)
+    return symbols
+
+
 def _load_pair_port(symbol: str) -> int | None:
     symbol = symbol.strip().upper()
     if not PAIRS_FILE.is_file():

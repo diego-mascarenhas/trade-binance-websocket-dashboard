@@ -68,11 +68,18 @@
                 <h2>DeepSeek suggestions</h2>
                 <div class="panel-actions">
                     <button class="btn btn-primary" id="suggestions-btn" type="button">Analyze</button>
+                    <button class="btn btn-primary suggestions-bulk-btn" id="suggestions-apply-all-btn" type="button" hidden>
+                        Aplicar cambios
+                    </button>
+                    <button class="btn suggestions-bulk-btn" id="suggestions-restore-all-btn" type="button" hidden>
+                        Restaurar .env
+                    </button>
                 </div>
             </div>
             <p class="note" id="suggestions-note">
                 AI config advice from your decision_events (filters, cooldown, per-symbol tuning).
             </p>
+            <p class="note suggestions-bulk-feedback" id="suggestions-bulk-feedback" hidden></p>
             <div id="suggestions-content"></div>
         </section>
 

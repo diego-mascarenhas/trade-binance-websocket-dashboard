@@ -13,12 +13,16 @@ const exportBtn = document.getElementById("export-btn");
 const exportOutcomesBtn = document.getElementById("export-outcomes-btn");
 const refreshBtn = document.getElementById("refresh-btn");
 const suggestionsBtn = document.getElementById("suggestions-btn");
+const suggestionsApplyAllBtn = document.getElementById("suggestions-apply-all-btn");
+const suggestionsRestoreAllBtn = document.getElementById("suggestions-restore-all-btn");
+const suggestionsBulkFeedback = document.getElementById("suggestions-bulk-feedback");
 const suggestionsNote = document.getElementById("suggestions-note");
 const suggestionsContent = document.getElementById("suggestions-content");
 const accountKpiGrid = document.getElementById("account-kpi-grid");
 const accountNote = document.getElementById("account-note");
 let deepseekAvailable = false;
 let lastSuggestions = [];
+let bulkApplied = false;
 /** @type {Map<string, number>} */
 const symbolPorts = new Map();
 
@@ -623,22 +627,56 @@ function escapeHtml(value) {
         .replaceAll('"', "&quot;");
 }
 
-function canApplySuggestion(item) {
+function hasConfigChanges(item) {
     return Boolean(
         item &&
-            item.symbol &&
             item.config_changes &&
             typeof item.config_changes === "object" &&
             Object.keys(item.config_changes).length > 0
     );
 }
 
+function canApplySuggestion(item) {
+    return hasConfigChanges(item);
+}
+
+function hasBulkApplicableSuggestions(suggestions = lastSuggestions) {
+    return suggestions.some((item) => hasConfigChanges(item));
+}
+
+function updateBulkActionButtons() {
+    const applicable = hasBulkApplicableSuggestions();
+    if (suggestionsApplyAllBtn) {
+        suggestionsApplyAllBtn.hidden = !applicable || bulkApplied;
+    }
+    if (suggestionsRestoreAllBtn) {
+        suggestionsRestoreAllBtn.hidden = !applicable || !bulkApplied;
+    }
+}
+
+function setBulkFeedback(message, tone = "ok") {
+    if (!suggestionsBulkFeedback) {
+        return;
+    }
+    if (!message) {
+        suggestionsBulkFeedback.hidden = true;
+        suggestionsBulkFeedback.textContent = "";
+        suggestionsBulkFeedback.className = "note suggestions-bulk-feedback";
+        return;
+    }
+    suggestionsBulkFeedback.hidden = false;
+    suggestionsBulkFeedback.textContent = message;
+    suggestionsBulkFeedback.className = `note suggestions-bulk-feedback is-${tone}`;
+}
+
 function renderSuggestionActions(item, index) {
     if (!canApplySuggestion(item)) {
-        return `<div class="suggestion-actions"><span class="note" style="margin:0;font-size:0.75rem;">Sin override aplicable</span></div>`;
+        return `<div class="suggestion-actions"><span class="note" style="margin:0;font-size:0.75rem;">Sin cambios en config_changes</span></div>`;
     }
+    const scope = item.symbol ? escapeHtml(item.symbol) : "toda la flota";
     return `
         <div class="suggestion-actions">
+            <span class="note" style="margin:0 0 6px;font-size:0.72rem;">${scope}</span>
             <button class="btn btn-primary" type="button" data-action="apply" data-index="${index}">Aplicar</button>
             <button class="btn" type="button" data-action="restore" data-index="${index}">Restaurar</button>
         </div>
@@ -648,13 +686,18 @@ function renderSuggestionActions(item, index) {
 function renderSuggestions(payload) {
     if (!payload || payload.error) {
         lastSuggestions = [];
+        bulkApplied = false;
         suggestionsContent.innerHTML = "";
         suggestionsNote.className = "note warn";
         suggestionsNote.textContent = payload?.error || "Could not load suggestions.";
+        setBulkFeedback("");
+        updateBulkActionButtons();
         return;
     }
 
     lastSuggestions = payload.suggestions || [];
+    bulkApplied = false;
+    setBulkFeedback("");
 
     const cacheHint = payload.cached
         ? ` (cached ${payload.cached_seconds_ago}s ago — use Analyze to refresh after cooldown)`
@@ -698,6 +741,7 @@ function renderSuggestions(payload) {
         <div class="suggestion-list">${cards || '<div class="note">No suggestions returned.</div>'}</div>
         ${warnings}
     `;
+    updateBulkActionButtons();
 }
 
 async function postJson(path, body) {
@@ -741,12 +785,17 @@ async function applySuggestion(index) {
         button.textContent = "Aplicando…";
     }
     try {
-        const result = await postJson("/api/symbol-config/apply", {
-            symbol: item.symbol,
-            config_changes: item.config_changes,
-            reason: `DeepSeek: ${item.title || "suggestion"}`,
-        });
-        if (!result.ok) {
+        const result = item.symbol
+            ? await postJson("/api/symbol-config/apply", {
+                  symbol: item.symbol,
+                  config_changes: item.config_changes,
+                  reason: `DeepSeek: ${item.title || "suggestion"}`,
+              })
+            : await postJson("/api/suggestions/apply-all", {
+                  suggestions: [item],
+                  reason: `DeepSeek: ${item.title || "suggestion"}`,
+              });
+        if (!result.ok && !result.partial) {
             setSuggestionFeedback(index, result.error || "No se pudo aplicar.", "error");
             return;
         }
@@ -772,12 +821,17 @@ async function restoreSuggestion(index) {
         button.textContent = "Restaurando…";
     }
     try {
-        const result = await postJson("/api/symbol-config/restore", {
-            symbol: item.symbol,
-            config_keys: Object.keys(item.config_changes),
-            reason: `DeepSeek restore: ${item.title || "suggestion"}`,
-        });
-        if (!result.ok) {
+        const result = item.symbol
+            ? await postJson("/api/symbol-config/restore", {
+                  symbol: item.symbol,
+                  config_keys: Object.keys(item.config_changes),
+                  reason: `DeepSeek restore: ${item.title || "suggestion"}`,
+              })
+            : await postJson("/api/suggestions/restore-all", {
+                  suggestions: [item],
+                  reason: `DeepSeek restore: ${item.title || "suggestion"}`,
+              });
+        if (!result.ok && !result.partial) {
             setSuggestionFeedback(index, result.error || "No se pudo restaurar.", "error");
             return;
         }
@@ -789,6 +843,74 @@ async function restoreSuggestion(index) {
             button.disabled = false;
             button.textContent = "Restaurar";
         }
+    }
+}
+
+async function applyAllSuggestions() {
+    if (!hasBulkApplicableSuggestions()) {
+        return;
+    }
+    if (suggestionsApplyAllBtn) {
+        suggestionsApplyAllBtn.disabled = true;
+        suggestionsApplyAllBtn.textContent = "Aplicando…";
+    }
+    setBulkFeedback("Aplicando sugerencias en MySQL y recargando dashboards…", "info");
+    try {
+        const result = await postJson("/api/suggestions/apply-all", {
+            suggestions: lastSuggestions,
+            reason: "DeepSeek bulk apply",
+        });
+        if (!result.ok && !result.partial) {
+            setBulkFeedback(result.error || "No se pudo aplicar.", "error");
+            return;
+        }
+        bulkApplied = true;
+        setBulkFeedback(result.message || "Cambios aplicados.", result.partial ? "error" : "ok");
+        lastSuggestions.forEach((_, index) => {
+            setSuggestionFeedback(index, "Incluido en aplicación masiva.", "ok");
+        });
+    } catch (error) {
+        setBulkFeedback(error.message, "error");
+    } finally {
+        if (suggestionsApplyAllBtn) {
+            suggestionsApplyAllBtn.disabled = false;
+            suggestionsApplyAllBtn.textContent = "Aplicar cambios";
+        }
+        updateBulkActionButtons();
+    }
+}
+
+async function restoreAllSuggestions() {
+    if (!hasBulkApplicableSuggestions() || !bulkApplied) {
+        return;
+    }
+    if (suggestionsRestoreAllBtn) {
+        suggestionsRestoreAllBtn.disabled = true;
+        suggestionsRestoreAllBtn.textContent = "Restaurando…";
+    }
+    setBulkFeedback("Restaurando overrides a valores del .env…", "info");
+    try {
+        const result = await postJson("/api/suggestions/restore-all", {
+            suggestions: lastSuggestions,
+            reason: "DeepSeek bulk restore",
+        });
+        if (!result.ok && !result.partial) {
+            setBulkFeedback(result.error || "No se pudo restaurar.", "error");
+            return;
+        }
+        bulkApplied = false;
+        setBulkFeedback(result.message || "Restaurado a .env.", result.partial ? "error" : "info");
+        lastSuggestions.forEach((_, index) => {
+            setSuggestionFeedback(index, "Restaurado a .env.", "info");
+        });
+    } catch (error) {
+        setBulkFeedback(error.message, "error");
+    } finally {
+        if (suggestionsRestoreAllBtn) {
+            suggestionsRestoreAllBtn.disabled = false;
+            suggestionsRestoreAllBtn.textContent = "Restaurar .env";
+        }
+        updateBulkActionButtons();
     }
 }
 
@@ -909,6 +1031,12 @@ if (exportOutcomesBtn) {
 
 refreshBtn.addEventListener("click", refresh);
 suggestionsBtn.addEventListener("click", () => loadSuggestions(true));
+if (suggestionsApplyAllBtn) {
+    suggestionsApplyAllBtn.addEventListener("click", () => applyAllSuggestions());
+}
+if (suggestionsRestoreAllBtn) {
+    suggestionsRestoreAllBtn.addEventListener("click", () => restoreAllSuggestions());
+}
 suggestionsContent.addEventListener("click", (event) => {
     const button = event.target.closest("button[data-action]");
     if (!button) {
