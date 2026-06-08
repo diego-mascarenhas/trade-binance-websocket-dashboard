@@ -510,79 +510,55 @@ function renderAdxCell(row, kind) {
     return `<td class="${cls}" title="${escapeHtml(title)}">${formatted ?? "—"}${mark}</td>`;
 }
 
-function renderBlockDetail(row) {
-    const reason = row.block_reason;
-    if (!reason) {
-        return "<td>—</td>";
+function renderBlockSummary(payload) {
+    const container = document.getElementById("block-summary");
+    if (!container) {
+        return;
+    }
+    if (!payload?.enabled || !payload.items?.length) {
+        container.innerHTML = payload?.enabled
+            ? '<p class="note" style="margin:0 0 12px;">Sin bloqueos en este rango.</p>'
+            : "";
+        return;
     }
 
-    if (reason === "adx_low") {
-        const useHtf = isAdxUseHtf(row);
-        const source = useHtf ? "HTF" : "1m";
-        const value = useHtf ? row.htf_adx : row.adx;
-        const formatted = formatAdxNumber(value);
-        const min = row.adx_min_trend;
-        const interval = row.htf_interval ? ` ${row.htf_interval}` : "";
-        if (formatted == null || min == null) {
-            return `<td class="block-detail adx-filter-summary" title="Primer bloqueo: adx_low">${source}${interval} · min ?</td>`;
-        }
-        const text = `${source}${interval}: ${formatted} &lt; ${min}`;
-        return `<td class="block-detail adx-filter-summary adx-used-for-filter" title="Primer bloqueo: adx_low (solo este ADX se evalúa con ADX_USE_HTF)">${text}</td>`;
-    }
+    const total = payload.total_blocked || 0;
+    const top = payload.items[0];
+    const headline =
+        top && total
+            ? `Principal: <strong>${escapeHtml(top.block_reason)}</strong> — ${top.pct}% (${top.count}/${total})`
+            : "";
 
-    if (reason === "rsi_overbought") {
-        const rsi = formatAdxNumber(row.rsi);
-        const max = row.rsi_long_max;
-        const text =
-            rsi != null && max != null ? `RSI ${rsi} &gt; ${max}` : `RSI ${rsi ?? "—"} (LONG max ${max ?? "?"})`;
-        return `<td class="block-detail" title="Primer bloqueo: rsi_overbought">${text}</td>`;
-    }
+    const rows = payload.items
+        .map((item) => {
+            const width = total ? Math.max(4, (item.count / total) * 100) : 0;
+            return `
+                <div class="block-summary-row">
+                    <div class="block-summary-meta">
+                        <span class="block-summary-reason">${escapeHtml(item.block_reason)}</span>
+                        <span class="block-summary-count">${item.count} · ${item.pct}%</span>
+                    </div>
+                    <div class="bar-track"><div class="bar-fill block-summary-fill" style="width:${width}%"></div></div>
+                    <p class="block-summary-text">${escapeHtml(item.summary || "")}</p>
+                </div>
+            `;
+        })
+        .join("");
 
-    if (reason === "rsi_oversold") {
-        const rsi = formatAdxNumber(row.rsi);
-        const min = row.rsi_short_min;
-        const text =
-            rsi != null && min != null ? `RSI ${rsi} &lt; ${min}` : `RSI ${rsi ?? "—"} (SHORT min ${min ?? "?"})`;
-        return `<td class="block-detail" title="Primer bloqueo: rsi_oversold">${text}</td>`;
-    }
-
-    if (reason === "macd_bearish" || reason === "macd_bullish") {
-        const hist = row.macd_hist;
-        const formatted =
-            hist != null && Number.isFinite(Number(hist)) ? Number(hist).toFixed(4) : "—";
-        const text =
-            reason === "macd_bearish"
-                ? `MACD hist ${formatted} &lt; 0 (LONG)`
-                : `MACD hist ${formatted} &gt; 0 (SHORT)`;
-        return `<td class="block-detail" title="Primer bloqueo: ${reason}">${text}</td>`;
-    }
-
-    if (reason === "htf_mismatch") {
-        const signal = row.signal || "?";
-        const trend = row.trend || "?";
-        const text = `${signal} vs HTF ${trend}`;
-        return `<td class="block-detail" title="Primer bloqueo: htf_mismatch">${text}</td>`;
-    }
-
-    if (reason === "signal_cooldown") {
-        return `<td class="block-detail" title="Primer bloqueo: signal_cooldown">Cooldown entre entradas</td>`;
-    }
-
-    if (reason === "no_active_plan") {
-        return `<td class="block-detail" title="Primer bloqueo: no_active_plan">Plan SL/TP inactivo</td>`;
-    }
-
-    if (reason === "symbol_disabled") {
-        return `<td class="block-detail" title="Primer bloqueo: symbol_disabled">Símbolo deshabilitado</td>`;
-    }
-
-    return `<td class="block-detail" title="Primer bloqueo: ${escapeHtml(reason)}">${escapeHtml(reason)}</td>`;
+    container.innerHTML = `
+        <div class="block-summary-head">
+            <h3>Resumen de bloqueos</h3>
+            <p class="block-summary-total">${total} eventos con block_reason en el rango</p>
+        </div>
+        ${headline ? `<p class="block-summary-headline">${headline}</p>` : ""}
+        <div class="block-summary-list">${rows}</div>
+    `;
 }
 
 function renderRecent(rows) {
     const body = document.getElementById("recent-body");
     if (!rows.length) {
-        body.innerHTML = `<tr><td colspan="11">No events yet.</td></tr>`;
+        body.innerHTML = `<tr><td colspan="10">No events yet.</td></tr>`;
         return;
     }
     body.innerHTML = rows
@@ -599,7 +575,6 @@ function renderRecent(rows) {
                     <td>${row.rsi ?? "—"}</td>
                     ${renderAdxCell(row, "ltf")}
                     ${renderAdxCell(row, "htf")}
-                    ${renderBlockDetail(row)}
                 </tr>
             `
         )
@@ -1079,10 +1054,11 @@ async function refresh() {
 
         const seriesPath =
             granularityEl.value === "daily" ? "/api/series/daily" : "/api/series/hourly";
-        const [series, eventTypes, blockReasons, symbols, recent, features] = await Promise.all([
+        const [series, eventTypes, blockReasons, blockSummary, symbols, recent, features] = await Promise.all([
             fetchJson(seriesPath),
             fetchJson("/api/breakdown/event_type"),
             fetchJson("/api/breakdown/block_reason"),
+            fetchJson("/api/block-summary"),
             fetchJson("/api/breakdown/symbol"),
             fetchJson("/api/recent"),
             fetchJson("/api/features"),
@@ -1091,6 +1067,7 @@ async function refresh() {
         renderTimeline(series);
         renderBars("event-type-bars", eventTypes);
         renderBars("block-reason-bars", blockReasons);
+        renderBlockSummary(blockSummary);
         renderBars("symbol-bars", symbols);
         renderRecent(Array.isArray(recent) ? recent : recent.rows || []);
         renderFeatureColumns(features.columns || []);

@@ -118,6 +118,7 @@
 
         <section class="panel panel-wide">
             <h2>Recent events</h2>
+            <div id="block-summary" class="block-summary"></div>
             <div class="table-wrap">
                 <table>
                     <thead>
@@ -132,17 +133,16 @@
                             <th>RSI</th>
                             <th>ADX 1m</th>
                             <th>ADX HTF</th>
-                            <th>Block detail</th>
                         </tr>
                     </thead>
                     <tbody id="recent-body"></tbody>
                 </table>
             </div>
             <p class="note" style="margin-top:8px;">
-                Cada fila guarda <strong>una sola</strong> razón: la primera comprobación que bloqueó
-                (RSI → MACD → ADX en indicadores; trend/cooldown/plan en valid entry).
-                <span class="adx-used-for-filter">*</span> = ADX evaluado en el filtro
-                (<code>ADX_USE_HTF</code> elige 1m vs HTF · mínimo = <code>ADX_MIN_TREND</code>).
+                Cada fila = una razón de bloqueo (la primera que falló).
+                <span class="adx-used-for-filter">*</span> = ADX usado en filtro
+                (<code>ADX_USE_HTF</code> · mín = <code>ADX_MIN_TREND</code>).
+                Resumen arriba agrupa todos los bloqueos del rango.
             </p>
         </section>
 

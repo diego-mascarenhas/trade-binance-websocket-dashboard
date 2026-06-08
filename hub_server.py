@@ -136,6 +136,13 @@ def breakdown(field: str):
     return _cors(jsonify(db_analytics.get_breakdown(field, days=days, symbol=_optional_symbol())))
 
 
+@app.route("/api/block-summary")
+def block_summary():
+    days = _int_arg("days", 7, minimum=0, maximum=365)
+    days_filter = None if days == 0 else days
+    return _cors(jsonify(db_analytics.get_block_summary(days_filter, _optional_symbol())))
+
+
 @app.route("/api/recent")
 def recent():
     limit = _int_arg("limit", 50, minimum=1, maximum=500)

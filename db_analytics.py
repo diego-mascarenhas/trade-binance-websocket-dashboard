@@ -710,6 +710,152 @@ def get_block_indicator_stats(
     return result
 
 
+def _config_flag(value: Any, *, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() in ("1", "true", "yes")
+
+
+def _synthesize_block_reason(
+    reason: str,
+    *,
+    count: int,
+    pct: float,
+    stats: dict[str, Any],
+    config: dict[str, Any],
+) -> str:
+    avg_rsi = stats.get("avg_rsi")
+    avg_adx = stats.get("avg_adx")
+    avg_htf_adx = stats.get("avg_htf_adx")
+    avg_conf = stats.get("avg_confidence")
+
+    def fmt_num(value: Any, digits: int = 1) -> str:
+        if value is None:
+            return "—"
+        try:
+            return f"{float(value):.{digits}f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    if reason == "adx_low":
+        use_htf = _config_flag(config.get("ADX_USE_HTF"), default=True)
+        min_adx = config.get("ADX_MIN_TREND")
+        source = f"HTF ({config.get('HTF_INTERVAL') or 'HTF'})" if use_htf else "1m"
+        adx_val = avg_htf_adx if use_htf else avg_adx
+        min_text = fmt_num(min_adx, 0) if min_adx is not None else "?"
+        return (
+            f"ADX {source} medio {fmt_num(adx_val)} < mín {min_text} "
+            f"(ADX_USE_HTF={'true' if use_htf else 'false'})"
+        )
+
+    if reason == "htf_mismatch":
+        return (
+            f"Señal LONG/SHORT contra tendencia HTF "
+            f"(REQUIRE_TREND_ALIGN={str(_config_flag(config.get('REQUIRE_TREND_ALIGN'), default=True)).lower()})"
+        )
+
+    if reason == "signal_cooldown":
+        cooldown = config.get("SIGNAL_COOLDOWN_SEC")
+        return f"Entrada repetida antes del cooldown ({cooldown or '?'}s)"
+
+    if reason == "rsi_overbought":
+        max_rsi = config.get("RSI_LONG_MAX")
+        return f"RSI medio {fmt_num(avg_rsi)} > máx LONG {max_rsi or '?'}"
+
+    if reason == "rsi_oversold":
+        min_rsi = config.get("RSI_SHORT_MIN")
+        return f"RSI medio {fmt_num(avg_rsi)} < mín SHORT {min_rsi or '?'}"
+
+    if reason == "macd_bearish":
+        return "MACD histograma negativo en señales LONG"
+
+    if reason == "macd_bullish":
+        return "MACD histograma positivo en señales SHORT"
+
+    if reason == "no_active_plan":
+        return "Plan SL/TP inactivo — no hay niveles calculables"
+
+    if reason == "symbol_disabled":
+        return "Par deshabilitado (symbol_trading_enabled=false)"
+
+    if reason == "low signal" or reason == "low_confidence":
+        min_conf = config.get("MIN_CONFIDENCE")
+        return f"Confianza media {fmt_num(avg_conf, 0)}% < mín {min_conf or '?'}%"
+
+    if reason == "(none)":
+        return "Eventos sin block_reason registrado"
+
+    return f"{count} eventos ({pct:.1f}% del total bloqueado)"
+
+
+def get_block_summary(
+    days: int | None = 7,
+    symbol: str | None = None,
+) -> dict[str, Any]:
+    """Human-readable synthesis of block_reason distribution in the selected range."""
+    if not db_store.is_enabled():
+        return {"enabled": False, "items": [], "total_blocked": 0}
+
+    stats_rows = get_block_indicator_stats(days, symbol)
+    config = get_latest_config_snapshot()
+
+    if not stats_rows:
+        return {
+            "enabled": True,
+            "total_blocked": 0,
+            "items": [],
+            "config": {
+                "ADX_MIN_TREND": config.get("ADX_MIN_TREND"),
+                "ADX_USE_HTF": config.get("ADX_USE_HTF"),
+                "HTF_INTERVAL": config.get("HTF_INTERVAL"),
+                "REQUIRE_TREND_ALIGN": config.get("REQUIRE_TREND_ALIGN"),
+                "SIGNAL_COOLDOWN_SEC": config.get("SIGNAL_COOLDOWN_SEC"),
+            },
+        }
+
+    total = sum(row["count"] for row in stats_rows)
+    items: list[dict[str, Any]] = []
+
+    for row in stats_rows:
+        reason = row["block_reason"]
+        count = row["count"]
+        pct = round(100 * count / total, 1) if total else 0.0
+        items.append(
+            {
+                "block_reason": reason,
+                "count": count,
+                "pct": pct,
+                "avg_rsi": row.get("avg_rsi"),
+                "avg_adx": row.get("avg_adx"),
+                "avg_htf_adx": row.get("avg_htf_adx"),
+                "avg_confidence": row.get("avg_confidence"),
+                "summary": _synthesize_block_reason(
+                    reason,
+                    count=count,
+                    pct=pct,
+                    stats=row,
+                    config=config,
+                ),
+            }
+        )
+
+    return {
+        "enabled": True,
+        "total_blocked": total,
+        "items": items,
+        "config": {
+            "ADX_MIN_TREND": config.get("ADX_MIN_TREND"),
+            "ADX_USE_HTF": config.get("ADX_USE_HTF"),
+            "HTF_INTERVAL": config.get("HTF_INTERVAL"),
+            "REQUIRE_TREND_ALIGN": config.get("REQUIRE_TREND_ALIGN"),
+            "SIGNAL_COOLDOWN_SEC": config.get("SIGNAL_COOLDOWN_SEC"),
+            "MIN_CONFIDENCE": config.get("MIN_CONFIDENCE"),
+        },
+    }
+
+
 def get_symbol_event_stats(days: int | None = 7) -> list[dict[str, Any]]:
     if not db_store.is_enabled():
         return []
