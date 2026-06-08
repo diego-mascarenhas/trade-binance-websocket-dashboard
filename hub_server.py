@@ -15,6 +15,7 @@ import deepseek_advisor
 import execution
 import hub_proxy
 import symbol_config_admin
+import trade_boost
 
 load_dotenv()
 
@@ -196,6 +197,30 @@ def symbol_config_restore():
     if not symbol:
         return _cors(jsonify({"ok": False, "error": "symbol required"})), 400
     result = symbol_config_admin.restore_config_keys(symbol, config_keys, reason=reason)
+    status = 200 if result.get("ok") else 400
+    return _cors(jsonify(result)), status
+
+
+@app.route("/api/trade-boost/<symbol>", methods=["GET"])
+def trade_boost_get(symbol: str):
+    return _cors(jsonify(trade_boost.get_status(symbol)))
+
+
+@app.route("/api/trade-boost/<symbol>/<direction>", methods=["POST"])
+def trade_boost_set(symbol: str, direction: str):
+    payload = request.get_json(silent=True) or {}
+    action = (payload.get("action") or "activate").strip().lower()
+    try:
+        if action == "deactivate":
+            result = trade_boost.deactivate(symbol, direction)
+        else:
+            result = trade_boost.activate(
+                symbol,
+                direction,
+                created_by=payload.get("source") or "analytics",
+            )
+    except ValueError as exc:
+        result = {"ok": False, "error": str(exc)}
     status = 200 if result.get("ok") else 400
     return _cors(jsonify(result)), status
 

@@ -17,9 +17,9 @@ import aiohttp
 import pandas as pd
 import plotly.graph_objects as go
 import websockets
-from dash import Dash, Input, Output, dcc, html
+from dash import Dash, Input, Output, dcc, html, ctx
 from dotenv import load_dotenv
-from flask import jsonify
+from flask import jsonify, request
 from plotly.subplots import make_subplots
 
 load_dotenv()
@@ -27,6 +27,7 @@ load_dotenv()
 import execution
 import symbol_config
 import telegram_notify as telegram
+import trade_boost
 from indicators import IndicatorFilterSettings, evaluate_indicator_filters, compute_adx
 import db_store
 
@@ -221,6 +222,8 @@ zone_position_pct: float | None = None
 change_24h: float | None = None
 valid_entries: deque = deque(maxlen=MAX_ENTRY_MARKERS)
 active_trade_plan: dict | None = None
+_last_boost_entry_attempt: dict[str, float] = {}
+_last_boost_wait_reason: str | None = None
 active_trade_plan_created_at: str | None = None
 
 
@@ -905,6 +908,12 @@ def signal_aligned_with_trend(signal: str, trend_bias: str) -> bool:
     return False
 
 
+def entry_allowed_with_trend(signal: str, trend_bias: str) -> bool:
+    if signal_aligned_with_trend(signal, trend_bias):
+        return True
+    return trade_boost.trend_align_relaxed(SYMBOL, signal)
+
+
 def compute_market_analysis(
     closed_rows: list[dict],
     htf_closed_rows: list[dict],
@@ -1479,7 +1488,7 @@ def record_valid_entry(
     if not is_tradable_signal(signal, confidence) or entry is None or candle_time is None:
         return
 
-    if not signal_aligned_with_trend(signal, trend_bias):
+    if not entry_allowed_with_trend(signal, trend_bias):
         log_decision_event(
             "valid_entry_blocked",
             outcome="blocked",
@@ -1490,7 +1499,8 @@ def record_valid_entry(
 
     now = time.monotonic()
     if (
-        last_valid_entry_monotonic is not None
+        not trade_boost.skips_signal_cooldown(SYMBOL, signal)
+        and last_valid_entry_monotonic is not None
         and now - last_valid_entry_monotonic < SIGNAL_COOLDOWN_SEC
     ):
         log_decision_event(
@@ -1534,6 +1544,13 @@ def record_valid_entry(
         outcome="recorded",
         market_snapshot=market,
     )
+    if trade_boost.consume(SYMBOL, signal):
+        append_event_log("trades", "trade_boost_consumed", direction=signal)
+        log_decision_event(
+            "trade_boost_consumed",
+            outcome="consumed",
+            market_snapshot={**market, "trade_boost": signal},
+        )
     execution.stage_valid_entry_snapshot(SYMBOL, market)
     sl_val = trade_plan.get("sl") if trade_plan else None
     tp1_val = trade_plan.get("tp1") if trade_plan else None
@@ -1616,6 +1633,154 @@ def record_valid_entry(
     )
 
 
+def _attempt_signal_entry(
+    signal: str,
+    confidence: int,
+    reasons: str,
+    entry: float | None,
+    candle_time,
+    trend_bias: str,
+    trade_plan: dict | None,
+    market_analysis: dict | None,
+    *,
+    min_confidence: int = MIN_CONFIDENCE,
+) -> None:
+    if not is_tradable_signal(signal, confidence, min_confidence):
+        return
+
+    effective_plan = trade_plan
+    analysis = market_analysis
+    if not effective_plan or not effective_plan.get("active"):
+        if analysis is None:
+            closed_rows = [row for row in candles if row.get("x")]
+            htf_closed_rows = [row for row in htf_candles if row.get("x")]
+            price = latest_price or entry
+            analysis = compute_market_analysis(
+                closed_rows,
+                htf_closed_rows,
+                price,
+                support=support,
+                resistance=resistance,
+                ob_zone_pct=zone_position_pct,
+            )
+        effective_plan = compute_trade_plan(
+            signal,
+            confidence,
+            entry,
+            support,
+            resistance,
+            latest_price or entry,
+            analysis,
+            min_confidence,
+        )
+        if not effective_plan.get("active"):
+            market_snap = _decision_market_snapshot(signal, confidence, trend_bias, analysis)
+            if trade_boost.is_active(SYMBOL, signal):
+                market_snap["trade_boost"] = {"direction": signal, "waiting": True}
+            log_decision_event(
+                "valid_entry_blocked",
+                outcome="blocked",
+                block_reason="no_active_plan",
+                market_snapshot=market_snap,
+            )
+            return
+
+    if analysis is None:
+        closed_rows = [row for row in candles if row.get("x")]
+        htf_closed_rows = [row for row in htf_candles if row.get("x")]
+        analysis = compute_market_analysis(
+            closed_rows,
+            htf_closed_rows,
+            latest_price or entry,
+            support=support,
+            resistance=resistance,
+            ob_zone_pct=zone_position_pct,
+        )
+
+    filter_settings, boost_info = trade_boost.apply_indicator_settings(
+        SYMBOL,
+        signal,
+        indicator_filter_settings(),
+    )
+    filter_result = evaluate_indicator_filters(
+        signal,
+        confidence,
+        analysis,
+        filter_settings,
+    )
+    if not filter_result.allowed:
+        market_snap = _decision_market_snapshot(signal, confidence, trend_bias, analysis)
+        if boost_info:
+            market_snap["trade_boost"] = boost_info.as_dict()
+        log_decision_event(
+            "indicator_blocked",
+            outcome="blocked",
+            block_reason=filter_result.block_reason,
+            market_snapshot=market_snap,
+        )
+        return
+
+    if effective_plan and effective_plan.get("active"):
+        entry_reasons = reasons
+        if filter_result.notes:
+            entry_reasons = f"{reasons} · {filter_result.notes}".strip(" · ")
+        if boost_info:
+            entry_reasons = f"{entry_reasons} · boost {boost_info.direction}".strip(" · ")
+        record_valid_entry(
+            signal,
+            entry,
+            filter_result.confidence,
+            entry_reasons,
+            candle_time,
+            trend_bias,
+            effective_plan,
+            analysis,
+        )
+
+
+def maybe_process_boost_entry(
+    candidate: str,
+    confidence: int,
+    reasons: str,
+    entry: float | None,
+    candle_time,
+    trend_bias: str,
+    trade_plan: dict | None,
+    market_analysis: dict | None,
+) -> None:
+    """Re-evaluate entry while boost is armed (signal may already be stable)."""
+    global _last_boost_entry_attempt
+
+    if pending_signal_count < SIGNAL_DEBOUNCE_COUNT or candidate not in ("LONG", "SHORT"):
+        return
+    if candidate != stable_signal_dir:
+        return
+    if not trade_boost.is_active(SYMBOL, candidate):
+        return
+
+    min_conf = trade_boost.effective_min_confidence(MIN_CONFIDENCE)
+    if not is_tradable_signal(candidate, confidence, min_conf):
+        return
+
+    now = time.monotonic()
+    last = _last_boost_entry_attempt.get(candidate)
+    if last is not None and now - last < trade_boost.TRADE_BOOST_RETRY_SEC:
+        return
+    _last_boost_entry_attempt[candidate] = now
+
+    _attempt_signal_entry(
+        candidate,
+        confidence,
+        reasons,
+        entry,
+        candle_time,
+        trend_bias,
+        trade_plan,
+        market_analysis,
+        min_confidence=min_conf,
+    )
+
+
 def apply_signal_debounce(
     candidate: str,
     confidence: int,
@@ -1647,84 +1812,28 @@ def apply_signal_debounce(
             trend_bias=trend_bias,
         )
         if is_tradable_signal(candidate, confidence):
-            effective_plan = trade_plan
-            analysis = market_analysis
-            if not effective_plan or not effective_plan.get("active"):
-                if analysis is None:
-                    closed_rows = [row for row in candles if row.get("x")]
-                    htf_closed_rows = [row for row in htf_candles if row.get("x")]
-                    price = latest_price or entry
-                    analysis = compute_market_analysis(
-                        closed_rows,
-                        htf_closed_rows,
-                        price,
-                        support=support,
-                        resistance=resistance,
-                        ob_zone_pct=zone_position_pct,
-                    )
-                effective_plan = compute_trade_plan(
-                    candidate,
-                    confidence,
-                    entry,
-                    support,
-                    resistance,
-                    latest_price or entry,
-                    analysis,
-                    MIN_CONFIDENCE,
-                )
-                if not effective_plan.get("active"):
-                    effective_plan = None
-                    log_decision_event(
-                        "valid_entry_blocked",
-                        outcome="blocked",
-                        block_reason="no_active_plan",
-                        market_snapshot=_decision_market_snapshot(
-                            candidate, confidence, trend_bias, analysis
-                        ),
-                    )
-
-            if analysis is None:
-                closed_rows = [row for row in candles if row.get("x")]
-                htf_closed_rows = [row for row in htf_candles if row.get("x")]
-                analysis = compute_market_analysis(
-                    closed_rows,
-                    htf_closed_rows,
-                    latest_price or entry,
-                    support=support,
-                    resistance=resistance,
-                    ob_zone_pct=zone_position_pct,
-                )
-
-            filter_result = evaluate_indicator_filters(
+            _attempt_signal_entry(
                 candidate,
                 confidence,
-                analysis,
-                indicator_filter_settings(),
+                reasons,
+                entry,
+                candle_time,
+                trend_bias,
+                trade_plan,
+                market_analysis,
             )
-            if not filter_result.allowed:
-                log_decision_event(
-                    "indicator_blocked",
-                    outcome="blocked",
-                    block_reason=filter_result.block_reason,
-                    market_snapshot=_decision_market_snapshot(
-                        candidate, confidence, trend_bias, analysis
-                    ),
-                )
-            elif effective_plan and effective_plan.get("active"):
-                entry_reasons = reasons
-                if filter_result.notes:
-                    entry_reasons = f"{reasons} · {filter_result.notes}".strip(" · ")
-                record_valid_entry(
-                    candidate,
-                    entry,
-                    filter_result.confidence,
-                    entry_reasons,
-                    candle_time,
-                    trend_bias,
-                    effective_plan,
-                    analysis,
-                )
         stable_signal_dir = candidate
+
+    maybe_process_boost_entry(
+        candidate,
+        confidence,
+        reasons,
+        entry,
+        candle_time,
+        trend_bias,
+        trade_plan,
+        market_analysis,
+    )
 
     signal_dir = stable_signal_dir
     if pending_signal_count >= SIGNAL_DEBOUNCE_COUNT:
@@ -2280,7 +2389,7 @@ async def ws_loop() -> None:
                             if data["u"] <= last_update_id:
                                 continue
                             if not (data["U"] <= last_update_id + 1 <= data["u"]):
-                                log_error("orderbook_desync", last_update_id=last_update_id, event=data)
+                                log_error("orderbook_desync", last_update_id=last_update_id, payload=data)
                                 logger.warning("Order book desync detected, resyncing...")
                                 break
 
@@ -2444,6 +2553,11 @@ def get_candles_df(*, refresh_execution: bool = True) -> pd.DataFrame:
         **execution.get_execution_status(),
         "position": exposure,
     }
+    boost_status = trade_boost.get_status(SYMBOL, preview_base=indicator_filter_settings())
+    metrics["trade_boost_status"] = boost_status
+    metrics["boost_wait_reason"] = diagnose_boost_wait_reason(
+        {**metrics, "trade_boost_status": boost_status}
+    )
 
     return pd.DataFrame(rows), ob, metrics
 
@@ -3250,6 +3364,9 @@ def build_signal_panel_children(metrics: dict) -> list:
     )
     reasons = metrics.get("signal_reasons") or "No active setup"
     valid_count = len(metrics.get("valid_entries") or [])
+    boost_status = metrics.get("trade_boost_status") or {}
+    boost_boosts = boost_status.get("boosts") or {}
+    boost_wait = metrics.get("boost_wait_reason")
 
     children: list = [
         panel_section("Signal"),
@@ -3257,6 +3374,16 @@ def build_signal_panel_children(metrics: dict) -> list:
             [
                 html.Span(signal, className=signal_badge_class(signal)),
                 html.Span(action_label, className=confidence_badge_class(confidence, min_conf)),
+                *(
+                    [
+                        html.Span(
+                            f"BOOST {direction} · {boost_boosts[direction].get('remaining_display', '—')}",
+                            className="badge badge-trade boost-armed-badge",
+                        )
+                    ]
+                    for direction in ("LONG", "SHORT")
+                    if direction in boost_boosts
+                ),
             ],
             className="badge-row",
         ),
@@ -3271,8 +3398,118 @@ def build_signal_panel_children(metrics: dict) -> list:
     ]
     if pending_text:
         children.append(html.P(pending_text, className="signal-pending"))
+    if boost_wait:
+        children.append(html.P(boost_wait, className="boost-wait-hint"))
     children.append(html.P(f"Valid entries on chart: {valid_count}", className="panel-hint panel-footnote"))
     return children
+
+
+def format_boost_status_text(status: dict) -> str:
+    if not status.get("enabled"):
+        return "Trade boost disabled (TRADE_BOOST_ENABLED=false)."
+    boosts = status.get("boosts") or {}
+    parts: list[str] = []
+    for direction in ("LONG", "SHORT"):
+        entry = boosts.get(direction)
+        if entry:
+            countdown = entry.get("remaining_display") or "—"
+            parts.append(
+                f"{direction}: {entry.get('summary') or 'armed'} · {countdown} left"
+            )
+    if parts:
+        return f"ARMED — {' · '.join(parts)}. Used on next valid entry."
+    ttl = status.get("ttl_sec")
+    ttl_hint = f" Max {max(1, int(ttl) // 60)}m per boost." if ttl else ""
+    return (
+        "One boost at a time — LONG or SHORT replaces the other. "
+        f"Click an armed button or Cancel to disarm.{ttl_hint}"
+    )
+
+
+def format_boost_banner_countdown(status: dict) -> str:
+    boosts = status.get("boosts") or {}
+    if not boosts:
+        return ""
+    parts: list[str] = []
+    for direction in ("LONG", "SHORT"):
+        entry = boosts.get(direction)
+        if entry:
+            parts.append(f"{direction} {entry.get('remaining_display', '—')}")
+    return " · ".join(parts)
+
+
+def diagnose_boost_wait_reason(metrics: dict) -> str | None:
+    status = metrics.get("trade_boost_status") or {}
+    boosts = status.get("boosts") or {}
+    if not boosts:
+        return None
+
+    signal = str(metrics.get("signal") or "NEUTRAL").upper()
+    confidence = int(metrics.get("confidence") or 0)
+    min_conf = int(metrics.get("min_confidence") or MIN_CONFIDENCE)
+    boost_min_conf = trade_boost.effective_min_confidence(min_conf)
+    pending = str(metrics.get("pending_signal") or "NEUTRAL").upper()
+    pending_count = int(metrics.get("pending_signal_count") or 0)
+    debounce_target = int(metrics.get("signal_debounce_count") or SIGNAL_DEBOUNCE_COUNT)
+    analysis = metrics.get("market_analysis") or {}
+    trend = str(analysis.get("htf_bias") or "NEUTRAL")
+    plan = metrics.get("trade_plan") or {}
+    ex = metrics.get("execution") or {}
+
+    armed_dirs = [d for d in ("LONG", "SHORT") if d in boosts]
+    armed_label = " / ".join(armed_dirs)
+
+    if telegram.is_trading_paused():
+        return f"Boost {armed_label} armado — fleet pausado (/start en Telegram)."
+    if not ex.get("enabled"):
+        return f"Boost {armed_label} armado — EXECUTION_ENABLED=false."
+    if ex.get("enabled") and not ex.get("auto_execute"):
+        return f"Boost {armed_label} armado — EXECUTE_ON_VALID_ENTRY=false."
+
+    for direction in armed_dirs:
+        if signal != direction:
+            if pending == direction and pending_count < debounce_target:
+                return (
+                    f"Boost {direction} armado — confirmando señal "
+                    f"({pending_count}/{debounce_target})…"
+                )
+            return f"Boost {direction} armado — señal actual {signal}, esperando {direction}."
+
+        if pending_count < debounce_target:
+            return f"Boost {direction} armado — estabilizando señal ({pending_count}/{debounce_target})."
+
+        if confidence < boost_min_conf:
+            return (
+                f"Boost {direction} armado — conf {confidence}% "
+                f"< mínimo boost {boost_min_conf}% (normal {min_conf}%)."
+            )
+
+        if not plan.get("active"):
+            return f"Boost {direction} armado — plan de trade inactivo (SL/TP no calculable)."
+
+        filter_settings, boost_info = trade_boost.apply_indicator_settings(
+            SYMBOL,
+            direction,
+            indicator_filter_settings(),
+        )
+        filter_result = evaluate_indicator_filters(
+            direction,
+            confidence,
+            analysis,
+            filter_settings,
+        )
+        if not filter_result.allowed:
+            return (
+                f"Boost {direction} armado — aún bloqueado: "
+                f"{filter_result.block_reason} ({filter_result.notes or '—'})."
+            )
+
+        if not entry_allowed_with_trend(direction, trend):
+            return f"Boost {direction} armado — HTF trend {trend} (sin relax)."
+
+        return f"Boost {direction} ACTIVO — reevaluando entrada cada {trade_boost.TRADE_BOOST_RETRY_SEC:.0f}s…"
+
+    return f"Boost {armed_label} armado."
 
 
 def build_metrics_panel_children(metrics: dict) -> list:
@@ -3515,6 +3752,7 @@ app.title = f"Binance Live | {SYMBOL.upper()}"
 
 app.layout = html.Div(
     [
+        html.Div(id="boost-banner", className="boost-banner boost-banner-hidden"),
         html.Div(
             [
                 html.Div(
@@ -3535,7 +3773,52 @@ app.layout = html.Div(
         html.Div(
             [
                 html.Div(id="pattern-panel", className="panel panel-pattern"),
-                html.Div(id="signal-panel", className="panel panel-signal"),
+                html.Div(
+                    [
+                        html.Div(id="signal-panel", className="panel-signal-body"),
+                        html.Div(
+                            [
+                                panel_section("Trade boost"),
+                                html.P(
+                                    "One boost at a time. SHORT replaces LONG (and vice versa). "
+                                    "Click an armed button again or Cancel to disarm.",
+                                    className="panel-hint",
+                                ),
+                                html.Div(
+                                    [
+                                        html.Button(
+                                            "Boost LONG",
+                                            id="boost-long-btn",
+                                            n_clicks=0,
+                                            className="boost-btn boost-long",
+                                            type="button",
+                                        ),
+                                        html.Button(
+                                            "Boost SHORT",
+                                            id="boost-short-btn",
+                                            n_clicks=0,
+                                            className="boost-btn boost-short",
+                                            type="button",
+                                        ),
+                                        html.Button(
+                                            "Cancel boost",
+                                            id="boost-cancel-btn",
+                                            n_clicks=0,
+                                            className="boost-btn boost-cancel",
+                                            type="button",
+                                        ),
+                                    ],
+                                    className="boost-actions",
+                                ),
+                                html.P(id="boost-countdown-text", className="boost-countdown"),
+                                html.P(id="boost-status-text", className="panel-hint panel-footnote"),
+                            ],
+                            id="signal-boost-section",
+                            className="signal-boost-section",
+                        ),
+                    ],
+                    className="panel panel-signal",
+                ),
                 html.Div(id="metrics-panel", className="panel panel-metrics"),
                 html.Div(id="trade-plan-panel", className="panel panel-trade-plan"),
             ],
@@ -3547,6 +3830,7 @@ app.layout = html.Div(
             style={"minHeight": "900px"},
         ),
         dcc.Interval(id="interval", interval=METRICS_INTERVAL_MS, n_intervals=0),
+        dcc.Interval(id="boost-countdown-interval", interval=1000, n_intervals=0),
     ],
     className="app-shell",
 )
@@ -3803,6 +4087,159 @@ def build_hub_summary() -> dict:
         "adx": analysis.get("htf_adx") if ADX_USE_HTF else analysis.get("adx"),
         "config_version": symbol_config.config_version(),
     }
+
+
+@app.callback(
+    Output("boost-banner", "children"),
+    Output("boost-banner", "className"),
+    Output("signal-boost-section", "className"),
+    Output("boost-countdown-text", "children"),
+    Output("boost-countdown-text", "className"),
+    Output("boost-status-text", "children"),
+    Output("boost-long-btn", "className"),
+    Output("boost-short-btn", "className"),
+    Output("boost-long-btn", "children"),
+    Output("boost-short-btn", "children"),
+    Output("boost-cancel-btn", "className"),
+    Output("boost-cancel-btn", "disabled"),
+    Input("boost-long-btn", "n_clicks"),
+    Input("boost-short-btn", "n_clicks"),
+    Input("boost-cancel-btn", "n_clicks"),
+    Input("interval", "n_intervals"),
+    Input("boost-countdown-interval", "n_intervals"),
+)
+def update_boost_panel(
+    long_clicks: int,
+    short_clicks: int,
+    cancel_clicks: int,
+    _: int,
+    __: int,
+):
+    global _last_boost_entry_attempt, _last_boost_wait_reason
+    base = indicator_filter_settings()
+    triggered = ctx.triggered_id
+    try:
+        if triggered == "boost-long-btn" and long_clicks:
+            if trade_boost.is_active(SYMBOL, "LONG"):
+                trade_boost.deactivate(SYMBOL, "LONG")
+                _last_boost_entry_attempt.pop("LONG", None)
+            else:
+                trade_boost.activate(
+                    SYMBOL,
+                    "LONG",
+                    created_by="dashboard",
+                    base_settings=base,
+                )
+                _last_boost_entry_attempt.pop("LONG", None)
+                _last_boost_entry_attempt.pop("SHORT", None)
+        elif triggered == "boost-short-btn" and short_clicks:
+            if trade_boost.is_active(SYMBOL, "SHORT"):
+                trade_boost.deactivate(SYMBOL, "SHORT")
+                _last_boost_entry_attempt.pop("SHORT", None)
+            else:
+                trade_boost.activate(
+                    SYMBOL,
+                    "SHORT",
+                    created_by="dashboard",
+                    base_settings=base,
+                )
+                _last_boost_entry_attempt.pop("SHORT", None)
+                _last_boost_entry_attempt.pop("LONG", None)
+        elif triggered == "boost-cancel-btn" and cancel_clicks:
+            trade_boost.deactivate_all(SYMBOL)
+            _last_boost_entry_attempt.clear()
+    except OSError as exc:
+        logger.warning("trade_boost UI action failed for %s: %s", SYMBOL, exc)
+
+    status = trade_boost.get_status(SYMBOL, preview_base=base)
+    boosts = status.get("boosts") or {}
+    long_active = "LONG" in boosts
+    short_active = "SHORT" in boosts
+    any_active = bool(boosts)
+    countdown_line = format_boost_banner_countdown(status)
+
+    wait_reason = _last_boost_wait_reason
+    if triggered == "interval":
+        _, _, metrics = get_candles_df(refresh_execution=False)
+        _last_boost_wait_reason = diagnose_boost_wait_reason(
+            {**metrics, "trade_boost_status": status}
+        )
+        wait_reason = _last_boost_wait_reason
+    elif not any_active:
+        _last_boost_wait_reason = None
+        wait_reason = None
+
+    long_class = "boost-btn boost-long" + (" is-active" if long_active else "")
+    short_class = "boost-btn boost-short" + (" is-active" if short_active else "")
+    cancel_class = "boost-btn boost-cancel" + ("" if any_active else " boost-cancel-hidden")
+
+    banner_class = "boost-banner" + ("" if any_active else " boost-banner-hidden")
+    section_class = "signal-boost-section" + (" is-armed" if any_active else "")
+    countdown_class = "boost-countdown" + ("" if any_active else " boost-countdown-hidden")
+
+    if any_active:
+        armed = list(boosts.keys())
+        banner_text = f"⚡ BOOST ARMED — {' / '.join(armed)}"
+        countdown_text = f"⏱ {countdown_line} remaining"
+        banner_children = [
+            html.Strong(banner_text),
+            html.Span(countdown_text, className="boost-banner-countdown"),
+        ]
+        if wait_reason:
+            banner_children.append(html.Span(wait_reason, className="boost-banner-detail"))
+    else:
+        banner_children = []
+        countdown_text = ""
+
+    status_lines = [format_boost_status_text(status)]
+    if wait_reason and any_active:
+        status_lines.append(wait_reason)
+
+    return (
+        banner_children,
+        banner_class,
+        section_class,
+        countdown_text,
+        countdown_class,
+        html.Div([html.P(line, className="boost-status-line") for line in status_lines]),
+        long_class,
+        short_class,
+        "Boost LONG ✓ ARMED" if long_active else "Boost LONG",
+        "Boost SHORT ✓ ARMED" if short_active else "Boost SHORT",
+        cancel_class,
+        not any_active,
+    )
+
+
+@app.server.route("/api/trade-boost", methods=["GET"])
+def trade_boost_status_route():
+    response = jsonify(
+        trade_boost.get_status(SYMBOL, preview_base=indicator_filter_settings())
+    )
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+
+@app.server.route("/api/trade-boost/<direction>", methods=["POST"])
+def trade_boost_set_route(direction: str):
+    payload = request.get_json(silent=True) or {}
+    action = (payload.get("action") or "activate").strip().lower()
+    try:
+        if action == "deactivate":
+            result = trade_boost.deactivate(SYMBOL, direction)
+        else:
+            result = trade_boost.activate(
+                SYMBOL,
+                direction,
+                created_by=payload.get("source") or "dashboard",
+                base_settings=indicator_filter_settings(),
+            )
+    except ValueError as exc:
+        result = {"ok": False, "error": str(exc)}
+    status = 200 if result.get("ok") else 400
+    response = jsonify(result)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response, status
 
 
 def start_ws() -> None:
