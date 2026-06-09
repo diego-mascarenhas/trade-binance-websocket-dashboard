@@ -746,7 +746,7 @@ function renderBlockSummary(payload) {
         </div>
         <p class="block-summary-dedup-note">
             La dedup (<code>DECISION_LOG_DEDUP_SEC</code>) solo reduce filas en MySQL — <strong>no impide trades</strong>.
-            ${dedupExtra ? `+${dedupExtra} bloqueos extra no logueados (campo dedup_suppressed).` : "Si el bot bloquea a cada rato, verás pocas filas nuevas aunque siga bloqueando."}
+            ${dedupExtra ? `+${dedupExtra} bloqueos extra agrupados por dedup (campo dedup_suppressed).` : "Con <code>DECISION_LOG_DEDUP_SEC=0</code> cada bloqueo genera una fila (actividad visible en la tabla)."}
         </p>
         ${configBits ? `<p class="block-summary-config">Config activa (último snapshot${payload.fleet_overrides_active ? " + overrides MySQL" : ""}): ${escapeHtml(configBits)}</p>` : ""}
     `;
