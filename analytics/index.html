@@ -129,20 +129,23 @@
                             <th>Outcome</th>
                             <th>Block</th>
                             <th>Signal</th>
-                            <th>Conf</th>
-                            <th>RSI</th>
-                            <th>ADX 1m</th>
-                            <th>ADX HTF</th>
+                            <th class="filter-col" title="Confianza vs MIN_CONFIDENCE">Conf</th>
+                            <th class="filter-col" title="RSI vs RSI_LONG_MAX / RSI_SHORT_MIN">RSI</th>
+                            <th class="filter-col" title="MACD histograma vs señal">MACD</th>
+                            <th class="filter-col" title="ADX vs ADX_MIN_TREND (HTF o 1m)">ADX</th>
+                            <th class="filter-col" title="Señal alineada con tendencia HTF">HTF</th>
                         </tr>
                     </thead>
                     <tbody id="recent-body"></tbody>
                 </table>
             </div>
             <p class="note" style="margin-top:8px;">
-                Cada fila = una razón de bloqueo (la primera que falló).
-                <span class="adx-used-for-filter">*</span> = ADX usado en filtro
-                (<code>ADX_USE_HTF</code> · mín = <code>ADX_MIN_TREND</code>).
-                Resumen arriba agrupa todos los bloqueos del rango.
+                Columnas <strong>Conf · RSI · MACD · ADX · HTF</strong>:
+                <span class="filter-pass-inline">verde</span> = pasa,
+                <span class="filter-fail-inline">rojo</span> = bloquearía,
+                gris = filtro off o N/A.
+                Borde ámbar = motivo registrado en <code>Block</code>.
+                Evalúa todos los filtros en la fila (no solo el primero que falló).
             </p>
         </section>
 

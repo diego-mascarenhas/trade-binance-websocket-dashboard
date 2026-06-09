@@ -121,6 +121,11 @@ def _flatten_row(row: dict[str, Any]) -> dict[str, Any]:
         "adx_use_htf": config.get("ADX_USE_HTF"),
         "rsi_long_max": config.get("RSI_LONG_MAX"),
         "rsi_short_min": config.get("RSI_SHORT_MIN"),
+        "require_trend_align": config.get("REQUIRE_TREND_ALIGN"),
+        "indicator_filters_enabled": config.get("INDICATOR_FILTERS_ENABLED"),
+        "rsi_filter_enabled": config.get("RSI_FILTER_ENABLED"),
+        "macd_filter_enabled": config.get("MACD_FILTER_ENABLED"),
+        "adx_filter_enabled": config.get("ADX_FILTER_ENABLED"),
         "execution_mode": config.get("execution_mode"),
         "execution_enabled": config.get("execution_enabled"),
         "execute_on_valid_entry": config.get("execute_on_valid_entry"),
@@ -801,18 +806,27 @@ def get_block_summary(
     stats_rows = get_block_indicator_stats(days, symbol)
     config = get_latest_config_snapshot()
 
+    try:
+        import symbol_config_admin
+
+        fleet_status = symbol_config_admin.get_fleet_overrides_status()
+        fleet_wide = fleet_status.get("fleet_wide") or {}
+        if fleet_wide:
+            config = {**config, **fleet_wide}
+    except Exception:
+        fleet_status = {"active": False}
+
+    activity = _get_block_activity_counts(days, symbol)
+
     if not stats_rows:
         return {
             "enabled": True,
             "total_blocked": 0,
             "items": [],
-            "config": {
-                "ADX_MIN_TREND": config.get("ADX_MIN_TREND"),
-                "ADX_USE_HTF": config.get("ADX_USE_HTF"),
-                "HTF_INTERVAL": config.get("HTF_INTERVAL"),
-                "REQUIRE_TREND_ALIGN": config.get("REQUIRE_TREND_ALIGN"),
-                "SIGNAL_COOLDOWN_SEC": config.get("SIGNAL_COOLDOWN_SEC"),
-            },
+            "activity": activity,
+            "fleet_overrides_active": bool(fleet_status.get("active")),
+            "dedup_log_only": True,
+            "config": _block_summary_config(config),
         }
 
     total = sum(row["count"] for row in stats_rows)
@@ -845,14 +859,72 @@ def get_block_summary(
         "enabled": True,
         "total_blocked": total,
         "items": items,
-        "config": {
-            "ADX_MIN_TREND": config.get("ADX_MIN_TREND"),
-            "ADX_USE_HTF": config.get("ADX_USE_HTF"),
-            "HTF_INTERVAL": config.get("HTF_INTERVAL"),
-            "REQUIRE_TREND_ALIGN": config.get("REQUIRE_TREND_ALIGN"),
-            "SIGNAL_COOLDOWN_SEC": config.get("SIGNAL_COOLDOWN_SEC"),
-            "MIN_CONFIDENCE": config.get("MIN_CONFIDENCE"),
-        },
+        "activity": activity,
+        "fleet_overrides_active": bool(fleet_status.get("active")),
+        "dedup_log_only": True,
+        "config": _block_summary_config(config),
+    }
+
+
+def _block_summary_config(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ADX_MIN_TREND": config.get("ADX_MIN_TREND"),
+        "ADX_USE_HTF": config.get("ADX_USE_HTF"),
+        "ADX_FILTER_ENABLED": config.get("ADX_FILTER_ENABLED"),
+        "HTF_INTERVAL": config.get("HTF_INTERVAL"),
+        "REQUIRE_TREND_ALIGN": config.get("REQUIRE_TREND_ALIGN"),
+        "SIGNAL_COOLDOWN_SEC": config.get("SIGNAL_COOLDOWN_SEC"),
+        "MIN_CONFIDENCE": config.get("MIN_CONFIDENCE"),
+    }
+
+
+def _get_block_activity_counts(
+    days: int | None,
+    symbol: str | None,
+) -> dict[str, int]:
+    if not db_store.is_enabled():
+        return {}
+
+    where_sql, params = _where_parts(days, symbol)
+    try:
+        conn = db_store.connect()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT
+                        SUM(event_type = 'valid_entry') AS valid_entries,
+                        SUM(event_type = 'order_live_open') AS live_opens,
+                        SUM(event_type = 'order_dry_run') AS dry_runs,
+                        SUM(event_type = 'indicator_blocked') AS indicator_blocked,
+                        SUM(event_type = 'valid_entry_blocked') AS valid_entry_blocked,
+                        SUM(
+                            COALESCE(
+                                CAST(JSON_UNQUOTE(JSON_EXTRACT(market_snapshot, '$.dedup_suppressed')) AS UNSIGNED),
+                                0
+                            )
+                        ) AS dedup_suppressed_logged
+                    FROM decision_events
+                    WHERE {where_sql}
+                    """,
+                    params,
+                )
+                row = cursor.fetchone() or {}
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+
+    return {
+        key: int(row.get(key) or 0)
+        for key in (
+            "valid_entries",
+            "live_opens",
+            "dry_runs",
+            "indicator_blocked",
+            "valid_entry_blocked",
+            "dedup_suppressed_logged",
+        )
     }
 
 

@@ -471,43 +471,234 @@ function renderTimeline(rows) {
     );
 }
 
-function formatAdxNumber(value) {
-    if (value == null || value === "") {
-        return null;
-    }
-    const num = Number(value);
-    return Number.isFinite(num) ? num.toFixed(1) : null;
-}
-
-function isAdxUseHtf(row) {
-    const value = row.adx_use_htf;
+function configFlag(value, defaultValue = true) {
     if (value == null) {
-        return true;
+        return defaultValue;
     }
     if (typeof value === "boolean") {
         return value;
     }
-    return String(value).toLowerCase() in ("1", "true", "yes");
+    return ["1", "true", "yes"].includes(String(value).toLowerCase());
 }
 
-function renderAdxCell(row, kind) {
-    const useHtf = isAdxUseHtf(row);
-    const isFilterTarget =
-        row.block_reason === "adx_low" && ((kind === "htf" && useHtf) || (kind === "ltf" && !useHtf));
-    const value = kind === "htf" ? row.htf_adx : row.adx;
-    const formatted = formatAdxNumber(value);
-    const interval = kind === "htf" ? row.htf_interval || "HTF" : "1m";
-    let title = kind === "htf" ? `ADX ${interval}` : "ADX 1m (LTF)";
-    if (isFilterTarget) {
-        const min = row.adx_min_trend;
-        title +=
-            min != null
-                ? ` — usado en adx_low (min ${min})`
-                : " — usado en adx_low";
+function isAdxUseHtf(row) {
+    return configFlag(row.adx_use_htf, true);
+}
+
+const BLOCK_REASON_FILTER = {
+    rsi_overbought: "rsi",
+    rsi_oversold: "rsi",
+    macd_bearish: "macd",
+    macd_bullish: "macd",
+    adx_low: "adx",
+    htf_mismatch: "htf",
+    low_confidence: "conf",
+};
+
+function evaluateRowFilters(row) {
+    const signal = String(row.signal || "").toUpperCase();
+    const tradable = signal === "LONG" || signal === "SHORT";
+    const blockReason = row.block_reason || "";
+    const primaryKey = BLOCK_REASON_FILTER[blockReason] || null;
+
+    const checks = {};
+
+    const conf = Number(row.confidence);
+    const minConf = Number(row.min_confidence);
+    if (!tradable) {
+        checks.conf = { status: "na", text: "—", title: "Señal NEUTRAL / WATCH" };
+    } else if (!Number.isFinite(conf) || !Number.isFinite(minConf)) {
+        checks.conf = { status: "na", text: "?", title: "Confianza desconocida" };
+    } else if (conf >= minConf) {
+        checks.conf = {
+            status: "pass",
+            text: `${Math.round(conf)}`,
+            title: `Conf ${conf}% ≥ min ${minConf}%`,
+        };
+    } else {
+        checks.conf = {
+            status: "fail",
+            text: `${Math.round(conf)}`,
+            title: `Conf ${conf}% < min ${minConf}%`,
+        };
     }
-    const mark = isFilterTarget ? "*" : "";
-    const cls = isFilterTarget ? "adx-used-for-filter" : "";
-    return `<td class="${cls}" title="${escapeHtml(title)}">${formatted ?? "—"}${mark}</td>`;
+
+    const filtersOn = configFlag(row.indicator_filters_enabled, true);
+
+    const rsi = Number(row.rsi);
+    const rsiLongMax = Number(row.rsi_long_max);
+    const rsiShortMin = Number(row.rsi_short_min);
+    if (!tradable || !filtersOn || !configFlag(row.rsi_filter_enabled, true)) {
+        checks.rsi = {
+            status: "off",
+            text: "off",
+            title: filtersOn ? "RSI_FILTER_ENABLED=false" : "INDICATOR_FILTERS_ENABLED=false",
+        };
+    } else if (!Number.isFinite(rsi)) {
+        checks.rsi = { status: "na", text: "—", title: "RSI no disponible" };
+    } else if (signal === "LONG" && rsi > rsiLongMax) {
+        checks.rsi = {
+            status: "fail",
+            text: rsi.toFixed(0),
+            title: `RSI ${rsi.toFixed(1)} > max LONG ${rsiLongMax}`,
+        };
+    } else if (signal === "SHORT" && rsi < rsiShortMin) {
+        checks.rsi = {
+            status: "fail",
+            text: rsi.toFixed(0),
+            title: `RSI ${rsi.toFixed(1)} < min SHORT ${rsiShortMin}`,
+        };
+    } else {
+        checks.rsi = {
+            status: "pass",
+            text: rsi.toFixed(0),
+            title: `RSI ${rsi.toFixed(1)} OK (${signal})`,
+        };
+    }
+
+    const macdHist = Number(row.macd_hist);
+    if (!tradable || !filtersOn || !configFlag(row.macd_filter_enabled, false)) {
+        checks.macd = {
+            status: "off",
+            text: "off",
+            title: filtersOn ? "MACD_FILTER_ENABLED=false" : "INDICATOR_FILTERS_ENABLED=false",
+        };
+    } else if (!Number.isFinite(macdHist)) {
+        checks.macd = { status: "na", text: "—", title: "MACD no disponible" };
+    } else if (signal === "LONG" && macdHist < 0) {
+        checks.macd = {
+            status: "fail",
+            text: macdHist.toFixed(3),
+            title: `MACD hist ${macdHist.toFixed(4)} < 0 (LONG)`,
+        };
+    } else if (signal === "SHORT" && macdHist > 0) {
+        checks.macd = {
+            status: "fail",
+            text: macdHist.toFixed(3),
+            title: `MACD hist ${macdHist.toFixed(4)} > 0 (SHORT)`,
+        };
+    } else {
+        checks.macd = {
+            status: "pass",
+            text: macdHist.toFixed(3),
+            title: `MACD hist ${macdHist.toFixed(4)} OK`,
+        };
+    }
+
+    const useHtf = isAdxUseHtf(row);
+    const adxVal = Number(useHtf ? row.htf_adx : row.adx);
+    const adxMin = Number(row.adx_min_trend);
+    const adxLabel = useHtf ? row.htf_interval || "HTF" : "1m";
+    if (!tradable || !filtersOn || !configFlag(row.adx_filter_enabled, true)) {
+        checks.adx = {
+            status: "off",
+            text: "off",
+            title: filtersOn ? "ADX_FILTER_ENABLED=false" : "INDICATOR_FILTERS_ENABLED=false",
+        };
+    } else if (!Number.isFinite(adxVal)) {
+        checks.adx = { status: "na", text: "—", title: "ADX no disponible" };
+    } else if (Number.isFinite(adxMin) && adxVal < adxMin) {
+        checks.adx = {
+            status: "fail",
+            text: adxVal.toFixed(1),
+            title: `ADX ${adxLabel} ${adxVal.toFixed(1)} < min ${adxMin}`,
+        };
+    } else {
+        checks.adx = {
+            status: "pass",
+            text: adxVal.toFixed(1),
+            title: `ADX ${adxLabel} ${adxVal.toFixed(1)} ≥ min ${Number.isFinite(adxMin) ? adxMin : "?"}`,
+        };
+    }
+
+    const trend = String(row.trend || "NEUTRAL").toUpperCase();
+    const requireTrend = configFlag(row.require_trend_align, true);
+    if (!tradable) {
+        checks.htf = { status: "na", text: "—", title: "Señal NEUTRAL / WATCH" };
+    } else if (!requireTrend) {
+        checks.htf = { status: "off", text: "off", title: "REQUIRE_TREND_ALIGN=false" };
+    } else if (row.trend_aligned === true) {
+        checks.htf = {
+            status: "pass",
+            text: trend.slice(0, 4),
+            title: `${signal} alineado con HTF ${trend}`,
+        };
+    } else if (row.trend_aligned === false) {
+        checks.htf = {
+            status: "fail",
+            text: trend.slice(0, 4),
+            title: `${signal} vs HTF ${trend} (desalineado)`,
+        };
+    } else if (trend === "NEUTRAL") {
+        checks.htf = {
+            status: "fail",
+            text: "NEU",
+            title: `${signal} con HTF NEUTRAL (REQUIRE_TREND_ALIGN=true)`,
+        };
+    } else if (
+        (signal === "LONG" && trend === "BULLISH") ||
+        (signal === "SHORT" && trend === "BEARISH")
+    ) {
+        checks.htf = {
+            status: "pass",
+            text: trend.slice(0, 4),
+            title: `${signal} alineado con HTF ${trend}`,
+        };
+    } else {
+        checks.htf = {
+            status: "fail",
+            text: trend.slice(0, 4),
+            title: `${signal} vs HTF ${trend}`,
+        };
+    }
+
+    for (const [key, check] of Object.entries(checks)) {
+        check.primary = primaryKey === key;
+    }
+
+    return checks;
+}
+
+function renderFilterCell(check) {
+    if (!check) {
+        return '<td class="filter-cell filter-na">—</td>';
+    }
+    const cls = [
+        "filter-cell",
+        `filter-${check.status}`,
+        check.primary ? "filter-primary" : "",
+    ]
+        .filter(Boolean)
+        .join(" ");
+    return `<td class="${cls}" title="${escapeHtml(check.title || "")}">${escapeHtml(check.text)}</td>`;
+}
+
+function renderRecent(rows) {
+    const body = document.getElementById("recent-body");
+    if (!rows.length) {
+        body.innerHTML = `<tr><td colspan="11">No events yet.</td></tr>`;
+        return;
+    }
+    body.innerHTML = rows
+        .map((row) => {
+            const filters = evaluateRowFilters(row);
+            return `
+                <tr>
+                    <td>${row.created_at || "—"}</td>
+                    <td>${renderSymbolLink(row.symbol)}</td>
+                    <td>${row.event_type || "—"}</td>
+                    <td>${row.outcome || "—"}</td>
+                    <td>${row.block_reason || "—"}</td>
+                    <td>${row.signal || "—"}</td>
+                    ${renderFilterCell(filters.conf)}
+                    ${renderFilterCell(filters.rsi)}
+                    ${renderFilterCell(filters.macd)}
+                    ${renderFilterCell(filters.adx)}
+                    ${renderFilterCell(filters.htf)}
+                </tr>
+            `;
+        })
+        .join("");
 }
 
 function renderBlockSummary(payload) {
@@ -515,10 +706,56 @@ function renderBlockSummary(payload) {
     if (!container) {
         return;
     }
-    if (!payload?.enabled || !payload.items?.length) {
-        container.innerHTML = payload?.enabled
-            ? '<p class="note" style="margin:0 0 12px;">Sin bloqueos en este rango.</p>'
-            : "";
+    if (!payload?.enabled) {
+        container.innerHTML = "";
+        return;
+    }
+
+    const activity = payload.activity || {};
+    const validEntries = activity.valid_entries || 0;
+    const liveOpens = activity.live_opens || 0;
+    const dryRuns = activity.dry_runs || 0;
+    const dedupExtra = activity.dedup_suppressed_logged || 0;
+    const loggedBlocked = payload.total_blocked || 0;
+    const estimatedBlocks = loggedBlocked + dedupExtra;
+
+    const config = payload.config || {};
+    const configBits = [
+        config.REQUIRE_TREND_ALIGN != null ? `REQUIRE_TREND_ALIGN=${config.REQUIRE_TREND_ALIGN}` : null,
+        config.ADX_MIN_TREND != null ? `ADX_MIN=${config.ADX_MIN_TREND}` : null,
+        config.ADX_USE_HTF != null ? `ADX_USE_HTF=${config.ADX_USE_HTF}` : null,
+    ]
+        .filter(Boolean)
+        .join(" · ");
+
+    const funnelHtml = `
+        <div class="block-funnel">
+            <div class="block-funnel-item">
+                <span class="block-funnel-value">${validEntries}</span>
+                <span class="block-funnel-label">valid_entry</span>
+            </div>
+            <div class="block-funnel-arrow">→</div>
+            <div class="block-funnel-item">
+                <span class="block-funnel-value">${dryRuns + liveOpens}</span>
+                <span class="block-funnel-label">órdenes</span>
+            </div>
+            <div class="block-funnel-item block-funnel-blocked">
+                <span class="block-funnel-value">${estimatedBlocks}</span>
+                <span class="block-funnel-label">bloqueos (est.)</span>
+            </div>
+        </div>
+        <p class="block-summary-dedup-note">
+            La dedup (<code>DECISION_LOG_DEDUP_SEC</code>) solo reduce filas en MySQL — <strong>no impide trades</strong>.
+            ${dedupExtra ? `+${dedupExtra} bloqueos extra no logueados (campo dedup_suppressed).` : "Si el bot bloquea a cada rato, verás pocas filas nuevas aunque siga bloqueando."}
+        </p>
+        ${configBits ? `<p class="block-summary-config">Config activa (último snapshot${payload.fleet_overrides_active ? " + overrides MySQL" : ""}): ${escapeHtml(configBits)}</p>` : ""}
+    `;
+
+    if (!payload.items?.length) {
+        container.innerHTML = `
+            ${funnelHtml}
+            <p class="note" style="margin:0;">Sin bloqueos con block_reason en este rango.</p>
+        `;
         return;
     }
 
@@ -526,7 +763,7 @@ function renderBlockSummary(payload) {
     const top = payload.items[0];
     const headline =
         top && total
-            ? `Principal: <strong>${escapeHtml(top.block_reason)}</strong> — ${top.pct}% (${top.count}/${total})`
+            ? `Principal: <strong>${escapeHtml(top.block_reason)}</strong> — ${top.pct}% (${top.count}/${total} logueados)`
             : "";
 
     const rows = payload.items
@@ -545,40 +782,21 @@ function renderBlockSummary(payload) {
         })
         .join("");
 
+    const zeroTradesWarn =
+        validEntries === 0 && estimatedBlocks > 50
+            ? `<p class="block-summary-warn">0 valid_entry en el rango — el bot evalúa señales pero ninguna pasa todos los filtros. Revisa overrides MySQL o usa Trade Boost por par.</p>`
+            : "";
+
     container.innerHTML = `
+        ${funnelHtml}
+        ${zeroTradesWarn}
         <div class="block-summary-head">
-            <h3>Resumen de bloqueos</h3>
-            <p class="block-summary-total">${total} eventos con block_reason en el rango</p>
+            <h3>Resumen de bloqueos (logueados)</h3>
+            <p class="block-summary-total">${total} filas con block_reason</p>
         </div>
         ${headline ? `<p class="block-summary-headline">${headline}</p>` : ""}
         <div class="block-summary-list">${rows}</div>
     `;
-}
-
-function renderRecent(rows) {
-    const body = document.getElementById("recent-body");
-    if (!rows.length) {
-        body.innerHTML = `<tr><td colspan="10">No events yet.</td></tr>`;
-        return;
-    }
-    body.innerHTML = rows
-        .map(
-            (row) => `
-                <tr>
-                    <td>${row.created_at || "—"}</td>
-                    <td>${renderSymbolLink(row.symbol)}</td>
-                    <td>${row.event_type || "—"}</td>
-                    <td>${row.outcome || "—"}</td>
-                    <td>${row.block_reason || "—"}</td>
-                    <td>${row.signal || "—"}</td>
-                    <td>${row.confidence ?? "—"}</td>
-                    <td>${row.rsi ?? "—"}</td>
-                    ${renderAdxCell(row, "ltf")}
-                    ${renderAdxCell(row, "htf")}
-                </tr>
-            `
-        )
-        .join("");
 }
 
 function renderFeatureColumns(columns) {
