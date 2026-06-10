@@ -481,6 +481,38 @@ function configFlag(value, defaultValue = true) {
     return ["1", "true", "yes"].includes(String(value).toLowerCase());
 }
 
+/** MACD histogram is in price units; alts often have |hist| << 0.001. */
+function formatMacdHist(value, { tooltip = false } = {}) {
+    if (!Number.isFinite(value)) {
+        return "—";
+    }
+    if (value === 0) {
+        return "0";
+    }
+    const abs = Math.abs(value);
+    const decimals = tooltip
+        ? abs >= 1
+            ? 4
+            : abs >= 0.01
+              ? 6
+              : 8
+        : abs >= 100
+          ? 1
+          : abs >= 10
+            ? 2
+            : abs >= 1
+              ? 3
+              : abs >= 0.01
+                ? 4
+                : abs >= 0.0001
+                  ? 6
+                  : null;
+    if (decimals == null) {
+        return value.toExponential(2);
+    }
+    return value.toFixed(decimals);
+}
+
 function isAdxUseHtf(row) {
     return configFlag(row.adx_use_htf, true);
 }
@@ -568,20 +600,20 @@ function evaluateRowFilters(row) {
     } else if (signal === "LONG" && macdHist < 0) {
         checks.macd = {
             status: "fail",
-            text: macdHist.toFixed(3),
-            title: `MACD hist ${macdHist.toFixed(4)} < 0 (LONG)`,
+            text: formatMacdHist(macdHist),
+            title: `MACD hist ${formatMacdHist(macdHist, { tooltip: true })} < 0 (LONG)`,
         };
     } else if (signal === "SHORT" && macdHist > 0) {
         checks.macd = {
             status: "fail",
-            text: macdHist.toFixed(3),
-            title: `MACD hist ${macdHist.toFixed(4)} > 0 (SHORT)`,
+            text: formatMacdHist(macdHist),
+            title: `MACD hist ${formatMacdHist(macdHist, { tooltip: true })} > 0 (SHORT)`,
         };
     } else {
         checks.macd = {
             status: "pass",
-            text: macdHist.toFixed(3),
-            title: `MACD hist ${macdHist.toFixed(4)} OK`,
+            text: formatMacdHist(macdHist),
+            title: `MACD hist ${formatMacdHist(macdHist, { tooltip: true })} OK`,
         };
     }
 
