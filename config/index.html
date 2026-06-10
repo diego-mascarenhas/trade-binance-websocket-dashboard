@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Fleet config</title>
+    <link rel="stylesheet" href="/analytics/style.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="shell">
+        <header class="header">
+            <div class="header-main">
+                <h1>Configuración de flota</h1>
+                <p class="subtitle">
+                    Overrides en MySQL para todos los pares de <code>hub/pairs.json</code>.
+                    Misma lógica que <strong>Aplicar cambios</strong> en Analytics: guarda, recarga cada dashboard
+                    y deja el <code>.env</code> como respaldo (Restaurar).
+                </p>
+            </div>
+            <div class="header-actions">
+                <a class="nav-link" href="/">Hub</a>
+                <a class="nav-link" href="/analytics/">Analytics</a>
+            </div>
+        </header>
+
+        <p class="note" id="status-note">Cargando configuración…</p>
+        <noscript>
+            <p class="note">JavaScript es necesario. Si ves esta página sin formulario, abre
+            <code>/config/?token=TU_CONFIG_PAGE_TOKEN</code>.</p>
+        </noscript>
+
+        <section class="panel" id="overrides-panel" hidden>
+            <div class="panel-head">
+                <h2>Overrides activos</h2>
+            </div>
+            <div id="overrides-summary" class="config-summary"></div>
+        </section>
+
+        <section class="panel panel-wide">
+            <div class="panel-head">
+                <h2>Parámetros</h2>
+                <div class="panel-actions">
+                    <button class="btn" id="reset-form-btn" type="button">Valores .env</button>
+                    <button class="btn" id="restore-fleet-btn" type="button">Restaurar .env</button>
+                    <button class="btn btn-primary" id="apply-fleet-btn" type="button">Aplicar a flota</button>
+                </div>
+            </div>
+            <p class="note config-hint">
+                Solo se envían campos modificados (borde azul). Fuente actual:
+                <span class="tag tag-env">.env</span> o
+                <span class="tag tag-mysql">MySQL</span>.
+            </p>
+            <form id="config-form" class="config-form" autocomplete="off"></form>
+            <p class="note" id="feedback-note" hidden></p>
+        </section>
+
+        <section class="panel panel-wide" id="per-symbol-panel" hidden>
+            <div class="panel-head">
+                <h2>Overrides por par (distintos a flota)</h2>
+            </div>
+            <pre id="per-symbol-json" class="config-pre"></pre>
+        </section>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>

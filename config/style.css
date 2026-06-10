@@ -1,0 +1,178 @@
+.config-form {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 14px 20px;
+    margin-top: 12px;
+}
+
+.config-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px;
+    background: #12151c;
+    border: 1px solid #2a2f3a;
+    border-radius: 10px;
+}
+
+.config-field.changed {
+    border-color: #2563eb;
+    box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.35);
+}
+
+.config-field label {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: #e8ecf1;
+}
+
+.config-field .key-code {
+    font-size: 0.72rem;
+    color: #6b7280;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.config-field input[type="text"],
+.config-field input[type="number"] {
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid #2a2f3a;
+    background: #0f1117;
+    color: #f5f5f5;
+    font-size: 0.9rem;
+}
+
+.config-field select {
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid #2a2f3a;
+    background: #0f1117;
+    color: #f5f5f5;
+}
+
+.config-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    font-size: 0.72rem;
+    color: #9aa4b2;
+}
+
+.config-hint {
+    margin: 0 0 4px;
+}
+
+.tag {
+    display: inline-block;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    font-weight: 600;
+}
+
+.tag-env {
+    background: #1e293b;
+    color: #94a3b8;
+}
+
+.tag-mysql {
+    background: #172554;
+    color: #93c5fd;
+}
+
+.config-summary {
+    font-size: 0.9rem;
+    color: #c5cdd8;
+    line-height: 1.5;
+}
+
+.config-pre {
+    margin: 0;
+    padding: 12px;
+    background: #0f1117;
+    border: 1px solid #2a2f3a;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: 0.8rem;
+    color: #c5cdd8;
+}
+
+#feedback-note.ok {
+    color: #4ade80;
+}
+
+#feedback-note.error {
+    color: #f87171;
+}
+
+#feedback-note.info {
+    color: #93c5fd;
+}
+
+.config-help {
+    margin: 0;
+    font-size: 0.75rem;
+    color: #9aa4b2;
+}
+
+.config-presets {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 2px;
+    padding-top: 8px;
+    border-top: 1px dashed #2a2f3a;
+}
+
+.config-preset-line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 6px;
+    font-size: 0.72rem;
+    line-height: 1.35;
+}
+
+.config-preset-label {
+    font-weight: 600;
+    min-width: 5.5rem;
+}
+
+.config-preset-permissive {
+    color: #4ade80;
+}
+
+.config-preset-conservative {
+    color: #fbbf24;
+}
+
+.config-preset-hint {
+    color: #6b7280;
+    flex: 1 1 auto;
+}
+
+.config-preset-btn {
+    padding: 2px 8px;
+    border-radius: 6px;
+    border: 1px solid #2a2f3a;
+    background: #1a1f2a;
+    color: #c5cdd8;
+    font-size: 0.68rem;
+    cursor: pointer;
+}
+
+.config-preset-btn:hover {
+    border-color: #4b5563;
+    color: #fff;
+}
+
+.config-preset-btn-loose:hover {
+    border-color: #16a34a;
+}
+
+.config-preset-btn-tight:hover {
+    border-color: #d97706;
+}

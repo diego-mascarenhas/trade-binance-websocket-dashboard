@@ -1476,6 +1476,19 @@ def _decision_market_snapshot(
     return symbol_config.build_market_snapshot(metrics, trend_aligned=aligned)
 
 
+def resolve_entry_candle_time(
+    forming: dict | None,
+    candle_rows: list[dict],
+) -> Any:
+    """Prefer forming 1m candle; fall back to last closed kline for valid_entry."""
+    if forming and forming.get("t") is not None:
+        return forming["t"]
+    closed = [row for row in candle_rows if row.get("x")]
+    if closed:
+        return closed[-1].get("t")
+    return None
+
+
 def record_valid_entry(
     signal: str,
     entry: float | None,
@@ -1499,7 +1512,25 @@ def record_valid_entry(
         )
         return
 
-    if not is_tradable_signal(signal, confidence) or entry is None or candle_time is None:
+    if not is_tradable_signal(signal, confidence):
+        return
+
+    if entry is None:
+        log_decision_event(
+            "valid_entry_blocked",
+            outcome="blocked",
+            block_reason="missing_entry",
+            market_snapshot=market,
+        )
+        return
+
+    if candle_time is None:
+        log_decision_event(
+            "valid_entry_blocked",
+            outcome="blocked",
+            block_reason="missing_candle",
+            market_snapshot=market,
+        )
         return
 
     if not entry_allowed_with_trend(signal, trend_bias):
@@ -1832,7 +1863,7 @@ def apply_signal_debounce(
             entry=entry,
             trend_bias=trend_bias,
         )
-        if is_tradable_signal(
+        if candidate in ("LONG", "SHORT") and is_tradable_signal(
             candidate,
             confidence,
             trade_boost.min_confidence_for(SYMBOL, candidate, MIN_CONFIDENCE),
@@ -2002,7 +2033,7 @@ def update_trading_signal(
     else:
         zone_position_pct = None
 
-    candle_time = forming_candle["t"] if forming_candle else None
+    candle_time = resolve_entry_candle_time(forming_candle, candles)
     closed_rows = [row for row in candles if row.get("x")]
     htf_closed_rows = [row for row in htf_candles if row.get("x")]
     analysis = compute_market_analysis(

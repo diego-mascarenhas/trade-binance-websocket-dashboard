@@ -785,6 +785,12 @@ def _synthesize_block_reason(
     if reason == "symbol_disabled":
         return "Par deshabilitado (symbol_trading_enabled=false)"
 
+    if reason == "missing_candle":
+        return "Sin vela 1m (forming o cerrada) — no se registra valid_entry"
+
+    if reason == "missing_entry":
+        return "Precio de entrada no disponible en el cambio de señal"
+
     if reason == "low signal" or reason == "low_confidence":
         min_conf = config.get("MIN_CONFIDENCE")
         return f"Confianza media {fmt_num(avg_conf, 0)}% < mín {min_conf or '?'}%"

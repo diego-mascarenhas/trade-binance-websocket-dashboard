@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import db_store
@@ -11,6 +12,155 @@ import symbol_config
 import dashboard_notify
 
 UPDATED_BY = "deepseek_analytics"
+CONFIG_PAGE_UPDATED_BY = "config_page"
+
+CONFIG_KEY_LABELS: dict[str, str] = {
+    "MIN_CONFIDENCE": "Confianza mínima (TRADE)",
+    "HTF_INTERVAL": "Intervalo HTF",
+    "INTERVAL": "Intervalo LTF",
+    "REQUIRE_TREND_ALIGN": "Exigir alineación HTF",
+    "SIGNAL_DEBOUNCE_COUNT": "Debounce de señal (ticks)",
+    "SIGNAL_COOLDOWN_SEC": "Cooldown entre entradas (s)",
+    "MIN_PATTERN_RANGE_PCT": "Rango mínimo patrón (%)",
+    "OB_WALL_RANGE_PCT": "Rango muros OB (%)",
+    "INDICATOR_FILTERS_ENABLED": "Filtros indicadores (master)",
+    "RSI_FILTER_ENABLED": "Filtro RSI",
+    "RSI_LONG_MAX": "RSI máx LONG",
+    "RSI_SHORT_MIN": "RSI mín SHORT",
+    "MACD_FILTER_ENABLED": "Filtro MACD",
+    "ADX_FILTER_ENABLED": "Filtro ADX",
+    "ADX_MIN_TREND": "ADX mínimo",
+    "ADX_USE_HTF": "ADX en velas HTF",
+    "symbol_trading_enabled": "Trading habilitado (par)",
+}
+
+CONFIG_KEY_HELP: dict[str, str] = {
+    "MIN_CONFIDENCE": "LONG/SHORT con confianza ≥ este valor = TRADE.",
+    "REQUIRE_TREND_ALIGN": "LONG solo con HTF BULLISH; SHORT solo con BEARISH.",
+    "SIGNAL_DEBOUNCE_COUNT": "Ticks OB consecutivos antes de señal estable (0 = inmediato).",
+    "ADX_USE_HTF": "Si true, ADX usa velas HTF; si false, usa 1m.",
+    "symbol_trading_enabled": "false desactiva entradas en ese par.",
+}
+
+# Suggested bounds for /config/ UI (more trades vs fewer/stricter).
+CONFIG_KEY_PRESETS: dict[str, dict[str, Any]] = {
+    "MIN_CONFIDENCE": {
+        "permissive": 40,
+        "conservative": 65,
+        "permissive_hint": "más señales TRADE",
+        "conservative_hint": "solo confianza alta",
+    },
+    "HTF_INTERVAL": {
+        "permissive": "5m",
+        "conservative": "1h",
+        "permissive_hint": "HTF reactivo",
+        "conservative_hint": "tendencia más estable",
+    },
+    "INTERVAL": {
+        "permissive": "1m",
+        "conservative": "5m",
+        "permissive_hint": "OB en tiempo real",
+        "conservative_hint": "menos ruido LTF",
+    },
+    "REQUIRE_TREND_ALIGN": {
+        "permissive": False,
+        "conservative": True,
+        "permissive_hint": "entra contra HTF",
+        "conservative_hint": "solo a favor de HTF",
+    },
+    "SIGNAL_DEBOUNCE_COUNT": {
+        "permissive": 0,
+        "conservative": 8,
+        "permissive_hint": "cambio inmediato",
+        "conservative_hint": "confirma varios ticks",
+    },
+    "SIGNAL_COOLDOWN_SEC": {
+        "permissive": 60,
+        "conservative": 300,
+        "permissive_hint": "reentrada rápida",
+        "conservative_hint": "evita repetir entrada",
+    },
+    "MIN_PATTERN_RANGE_PCT": {
+        "permissive": 0.01,
+        "conservative": 0.08,
+        "permissive_hint": "patrones pequeños",
+        "conservative_hint": "solo rangos amplios",
+    },
+    "OB_WALL_RANGE_PCT": {
+        "permissive": 1.0,
+        "conservative": 0.35,
+        "permissive_hint": "zonas OB amplias",
+        "conservative_hint": "muros muy cercanos al precio",
+    },
+    "INDICATOR_FILTERS_ENABLED": {
+        "permissive": False,
+        "conservative": True,
+        "permissive_hint": "sin bloqueo indicadores",
+        "conservative_hint": "master filtros ON",
+    },
+    "RSI_FILTER_ENABLED": {
+        "permissive": False,
+        "conservative": True,
+        "permissive_hint": "ignora RSI",
+        "conservative_hint": "bloquea extremos RSI",
+    },
+    "RSI_LONG_MAX": {
+        "permissive": 85,
+        "conservative": 65,
+        "permissive_hint": "LONG con RSI alto",
+        "conservative_hint": "no LONG sobrecomprado",
+    },
+    "RSI_SHORT_MIN": {
+        "permissive": 15,
+        "conservative": 35,
+        "permissive_hint": "SHORT con RSI bajo",
+        "conservative_hint": "no SHORT sobrevendido",
+    },
+    "MACD_FILTER_ENABLED": {
+        "permissive": False,
+        "conservative": True,
+        "permissive_hint": "ignora MACD",
+        "conservative_hint": "exige MACD a favor",
+    },
+    "ADX_FILTER_ENABLED": {
+        "permissive": False,
+        "conservative": True,
+        "permissive_hint": "ignora ADX",
+        "conservative_hint": "exige tendencia fuerte",
+    },
+    "ADX_MIN_TREND": {
+        "permissive": 5,
+        "conservative": 28,
+        "permissive_hint": "mercado lateral OK",
+        "conservative_hint": "solo ADX alto",
+    },
+    "ADX_USE_HTF": {
+        "permissive": False,
+        "conservative": True,
+        "permissive_hint": "ADX en 1m",
+        "conservative_hint": "ADX en HTF",
+    },
+    "symbol_trading_enabled": {
+        "permissive": True,
+        "conservative": False,
+        "permissive_hint": "entradas activas",
+        "conservative_hint": "sin nuevas entradas",
+    },
+}
+
+_BOOL_KEYS = frozenset(
+    {
+        "REQUIRE_TREND_ALIGN",
+        "INDICATOR_FILTERS_ENABLED",
+        "RSI_FILTER_ENABLED",
+        "MACD_FILTER_ENABLED",
+        "ADX_FILTER_ENABLED",
+        "ADX_USE_HTF",
+        "symbol_trading_enabled",
+    }
+)
+
+_INT_KEYS = frozenset({"MIN_CONFIDENCE", "SIGNAL_DEBOUNCE_COUNT", "SIGNAL_COOLDOWN_SEC"})
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -47,11 +197,138 @@ def get_symbol_override(symbol: str) -> dict[str, Any]:
     }
 
 
+def _key_field_type(key: str) -> str:
+    if key in _BOOL_KEYS:
+        return "bool"
+    if key in _INT_KEYS:
+        return "int"
+    if key in ("MIN_PATTERN_RANGE_PCT", "OB_WALL_RANGE_PCT", "RSI_LONG_MAX", "RSI_SHORT_MIN", "ADX_MIN_TREND"):
+        return "float"
+    return "string"
+
+
+def read_env_defaults() -> dict[str, Any]:
+    """Parse .env for overridable keys (hub has no app.py globals loaded)."""
+    env_path = Path(__file__).resolve().parent / ".env"
+    raw: dict[str, str] = {}
+    if env_path.is_file():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, _, value = stripped.partition("=")
+            raw[key.strip()] = value.strip().strip('"').strip("'")
+
+    defaults: dict[str, Any] = {}
+    for key, caster in symbol_config.OVERRIDABLE_KEYS.items():
+        if key not in raw:
+            if key == "symbol_trading_enabled":
+                defaults[key] = True
+            continue
+        try:
+            defaults[key] = caster(raw[key])
+        except (TypeError, ValueError):
+            defaults[key] = raw[key]
+    return defaults
+
+
+def get_config_editor_state() -> dict[str, Any]:
+    env_defaults = read_env_defaults()
+    fleet = dashboard_notify.load_fleet_symbols()
+    fleet_status = get_fleet_overrides_status()
+    fleet_wide = fleet_status.get("fleet_wide") or {}
+
+    keys: list[dict[str, Any]] = []
+    for key in symbol_config.OVERRIDABLE_KEYS:
+        env_val = env_defaults.get(key)
+        effective = fleet_wide.get(key, env_val)
+        source = "mysql_fleet" if key in fleet_wide else "env"
+        preset = CONFIG_KEY_PRESETS.get(key, {})
+        keys.append(
+            {
+                "key": key,
+                "type": _key_field_type(key),
+                "label": CONFIG_KEY_LABELS.get(key, key),
+                "help": CONFIG_KEY_HELP.get(key, ""),
+                "env_default": env_val,
+                "effective": effective,
+                "source": source,
+                "presets": {
+                    "permissive": preset.get("permissive"),
+                    "conservative": preset.get("conservative"),
+                    "permissive_hint": preset.get("permissive_hint", ""),
+                    "conservative_hint": preset.get("conservative_hint", ""),
+                }
+                if preset
+                else None,
+            }
+        )
+
+    return {
+        "enabled": db_store.is_enabled(),
+        "fleet_size": len(fleet),
+        "fleet_symbols": fleet,
+        "overrides": fleet_status,
+        "keys": keys,
+        "env_defaults": env_defaults,
+    }
+
+
+def apply_fleet_config(
+    config_changes: dict[str, Any],
+    *,
+    reason: str | None = None,
+    updated_by: str = CONFIG_PAGE_UPDATED_BY,
+) -> dict[str, Any]:
+    if not db_store.is_enabled():
+        return {"ok": False, "error": "DB_ENABLED=false"}
+
+    validated, error = validate_config_changes(config_changes)
+    if error:
+        return {"ok": False, "error": error}
+
+    fleet = dashboard_notify.load_fleet_symbols()
+    if not fleet:
+        return {"ok": False, "error": "No hay símbolos en hub/pairs.json"}
+
+    detail = reason or "Config page fleet apply"
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for symbol in fleet:
+        result = apply_config_changes(
+            symbol,
+            validated,
+            reason=detail,
+            updated_by=updated_by,
+        )
+        results.append(result)
+        if not result.get("ok"):
+            errors.append(f"{symbol}: {result.get('error', 'unknown')}")
+
+    applied = sum(1 for result in results if result.get("ok"))
+    message = f"Aplicado en {applied}/{len(fleet)} símbolo(s). Vuelve a .env con Restaurar."
+    if errors:
+        message = f"Aplicado en {applied}/{len(fleet)} símbolo(s). Fallos: {'; '.join(errors[:5])}"
+
+    return {
+        "ok": applied > 0 and not errors,
+        "partial": applied > 0 and bool(errors),
+        "applied_symbols": applied,
+        "total_symbols": len(fleet),
+        "errors": errors,
+        "results": results,
+        "applied": validated,
+        "message": message,
+    }
+
+
 def apply_config_changes(
     symbol: str,
     config_changes: dict[str, Any],
     *,
     reason: str | None = None,
+    updated_by: str = UPDATED_BY,
 ) -> dict[str, Any]:
     if not db_store.is_enabled():
         return {"ok": False, "error": "DB_ENABLED=false"}
@@ -69,7 +346,7 @@ def apply_config_changes(
     version = db_store.upsert_symbol_config(
         symbol,
         merged,
-        updated_by=UPDATED_BY,
+        updated_by=updated_by,
         reason=detail,
     )
     if version is None:

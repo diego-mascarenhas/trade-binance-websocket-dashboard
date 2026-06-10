@@ -55,6 +55,14 @@ def _normalize_direction(direction: str) -> str:
     return value
 
 
+def _tradable_direction(direction: str) -> str | None:
+    """LONG/SHORT only; NEUTRAL/WATCH must not raise in read-only boost helpers."""
+    value = direction.strip().upper()
+    if value in ("LONG", "SHORT"):
+        return value
+    return None
+
+
 def _boost_path(symbol: str) -> Path:
     return BOOST_DIR / f"{_normalize_symbol(symbol)}.json"
 
@@ -381,7 +389,9 @@ def _read_active_boost(symbol: str, direction: str) -> bool:
     if not TRADE_BOOST_ENABLED:
         return False
     symbol = _normalize_symbol(symbol)
-    direction = _normalize_direction(direction)
+    direction = _tradable_direction(direction)
+    if direction is None:
+        return False
     if not _acquire_lock(symbol):
         return False
     try:
@@ -411,7 +421,7 @@ def apply_indicator_settings(
 
 
 def trend_align_relaxed(symbol: str, signal: str) -> bool:
-    if signal not in ("LONG", "SHORT") or not TRADE_BOOST_RELAX_TREND:
+    if _tradable_direction(signal) is None or not TRADE_BOOST_RELAX_TREND:
         return False
     return _read_active_boost(symbol, signal)
 
@@ -423,18 +433,22 @@ def effective_min_confidence(base_min: int) -> int:
 
 
 def min_confidence_for(symbol: str, direction: str, base_min: int) -> int:
+    if _tradable_direction(direction) is None:
+        return base_min
     if _read_active_boost(symbol, direction):
         return effective_min_confidence(base_min)
     return base_min
 
 
 def bypasses_indicators(symbol: str, direction: str) -> bool:
-    if not TRADE_BOOST_BYPASS_INDICATORS:
+    if not TRADE_BOOST_BYPASS_INDICATORS or _tradable_direction(direction) is None:
         return False
     return _read_active_boost(symbol, direction)
 
 
 def skips_signal_cooldown(symbol: str, direction: str) -> bool:
+    if _tradable_direction(direction) is None:
+        return False
     return TRADE_BOOST_SKIP_COOLDOWN and _read_active_boost(symbol, direction)
 
 

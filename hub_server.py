@@ -22,8 +22,10 @@ load_dotenv()
 ROOT = Path(__file__).resolve().parent
 HUB_DIR = ROOT / "hub"
 ANALYTICS_DIR = ROOT / "analytics"
+CONFIG_DIR = ROOT / "config"
 HOST = os.getenv("HUB_HOST", os.getenv("ANALYTICS_HOST", "0.0.0.0"))
 PORT = int(os.getenv("HUB_PORT", "8050"))
+CONFIG_PAGE_TOKEN = os.getenv("CONFIG_PAGE_TOKEN", "").strip()
 
 app = Flask(__name__)
 
@@ -44,6 +46,89 @@ def _int_arg(name: str, default: int, *, minimum: int = 1, maximum: int = 365) -
 def _optional_symbol() -> str | None:
     symbol = (request.args.get("symbol") or "").strip().upper()
     return symbol or None
+
+
+def _config_page_token_ok() -> bool:
+    if not CONFIG_PAGE_TOKEN:
+        return True
+    supplied = (
+        request.args.get("token")
+        or request.headers.get("X-Config-Token")
+        or ""
+    ).strip()
+    return supplied == CONFIG_PAGE_TOKEN
+
+
+def _config_page_guard() -> None:
+    if not _config_page_token_ok():
+        abort(403)
+
+
+def _config_forbidden_html() -> str:
+    return """<!DOCTYPE html>
+<html lang="es"><head><meta charset="UTF-8"><title>Config</title>
+<style>body{font-family:system-ui;background:#0f1117;color:#e8ecf1;padding:2rem;max-width:520px;margin:auto}
+code{background:#1e293b;padding:2px 6px;border-radius:4px}</style></head><body>
+<h1>Token requerido</h1>
+<p>Define <code>CONFIG_PAGE_TOKEN</code> en <code>.env</code> y abre:</p>
+<p><code>/config/?token=TU_TOKEN</code></p>
+<p>Ejemplo: <code>http://127.0.0.1:8050/config/?token=…</code></p>
+</body></html>"""
+
+
+@app.route("/config")
+def config_redirect():
+    token = request.args.get("token")
+    if token:
+        return redirect(f"/config/?token={token}", code=302)
+    return redirect("/config/", code=302)
+
+
+@app.route("/config/")
+def config_index():
+    if not _config_page_token_ok():
+        return _config_forbidden_html(), 403, {"Content-Type": "text/html; charset=utf-8"}
+    return send_from_directory(CONFIG_DIR, "index.html")
+
+
+@app.route("/config/<path:filename>")
+def config_static(filename: str):
+    if ".." in filename:
+        abort(404)
+    # JS/CSS load without token (APIs remain protected); avoids blank page when token is in ?query only.
+    allowed = filename.endswith(".js") or filename.endswith(".css")
+    if not allowed:
+        _config_page_guard()
+    return send_from_directory(CONFIG_DIR, filename)
+
+
+@app.route("/api/config/editor", methods=["GET"])
+def config_editor_state():
+    _config_page_guard()
+    return _cors(jsonify(symbol_config_admin.get_config_editor_state()))
+
+
+@app.route("/api/config/apply-fleet", methods=["POST"])
+def config_apply_fleet():
+    _config_page_guard()
+    payload = request.get_json(silent=True) or {}
+    config_changes = payload.get("config_changes") or {}
+    reason = payload.get("reason") or "Config page fleet apply"
+    if not isinstance(config_changes, dict) or not config_changes:
+        return _cors(jsonify({"ok": False, "error": "config_changes required"})), 400
+    result = symbol_config_admin.apply_fleet_config(config_changes, reason=reason)
+    status = 200 if result.get("ok") or result.get("partial") else 400
+    return _cors(jsonify(result)), status
+
+
+@app.route("/api/config/restore-fleet", methods=["POST"])
+def config_restore_fleet():
+    _config_page_guard()
+    payload = request.get_json(silent=True) or {}
+    reason = payload.get("reason") or "Config page restore to .env"
+    result = symbol_config_admin.restore_fleet_to_env_defaults(reason=reason)
+    status = 200 if result.get("ok") or result.get("partial") else 400
+    return _cors(jsonify(result)), status
 
 
 @app.route("/analytics")
@@ -339,7 +424,7 @@ def help_page():
 
 @app.route("/<path:filename>")
 def hub_static(filename: str):
-    if filename.startswith("api/") or filename.startswith("analytics/"):
+    if filename.startswith("api/") or filename.startswith("analytics/") or filename.startswith("config/"):
         abort(404)
     if ".." in filename:
         abort(404)
@@ -355,6 +440,10 @@ def main() -> None:
     print(f"Hub http://{HOST}:{PORT}/")
     print(f"Help http://{HOST}:{PORT}/help")
     print(f"Analytics http://{HOST}:{PORT}/analytics/")
+    if CONFIG_PAGE_TOKEN:
+        print(f"Config http://{HOST}:{PORT}/config/?token=<CONFIG_PAGE_TOKEN>")
+    else:
+        print(f"Config http://{HOST}:{PORT}/config/ (set CONFIG_PAGE_TOKEN in .env to protect)")
     app.run(host=HOST, port=PORT, debug=False, use_reloader=False)
 
 
