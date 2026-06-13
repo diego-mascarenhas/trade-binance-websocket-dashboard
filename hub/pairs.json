@@ -1,9 +1,12 @@
 [
   {"symbol": "ADAUSDT", "port": 8051},
+  {"symbol": "WIFUSDT", "port": 8053},
   {"symbol": "ATOMUSDT", "port": 8054},
   {"symbol": "AVAXUSDT", "port": 8055},
   {"symbol": "BNBUSDT", "port": 8056},
   {"symbol": "DOGEUSDT", "port": 8058},
+  {"symbol": "1000PEPEUSDT", "port": 8052},
+  {"symbol": "1000SHIBUSDT", "port": 8057},
   {"symbol": "DOTUSDT", "port": 8059},
   {"symbol": "ETCUSDT", "port": 8060},
   {"symbol": "ETHUSDT", "port": 8061},
