@@ -277,6 +277,23 @@ def _classify_stream(stream: str) -> str:
     return "other"
 
 
+def _classify_feed_message(stream: str, data: dict) -> str:
+    """Classify WS payload for feed_summary (stream name + event body fallback)."""
+    if stream:
+        classified = _classify_stream(stream)
+        if classified != "other":
+            return classified
+    event = data.get("e")
+    if event == "kline" or "k" in data:
+        interval = (data.get("k") or {}).get("i") or INTERVAL
+        return f"kline_{interval}"
+    if event in ("24hrMiniTicker", "24hrTicker"):
+        return "ticker"
+    if "U" in data and "u" in data:
+        return "depth"
+    return "other"
+
+
 def record_feed_message(stream: str, data: dict) -> None:
     """Count WS messages per stream and (optionally) dump the raw payload.
 
@@ -284,7 +301,7 @@ def record_feed_message(stream: str, data: dict) -> None:
     """
     if WS_FEED_SUMMARY_SEC <= 0 and not WS_RAW_LOG:
         return
-    stream_type = _classify_stream(stream)
+    stream_type = _classify_feed_message(stream, data)
     _feed_counts[stream_type] = _feed_counts.get(stream_type, 0) + 1
     if WS_RAW_LOG:
         append_event_log(
@@ -2400,6 +2417,21 @@ async def bootstrap_orderbook_from_ws(
     return bid_map, ask_map, last_update_id, pending_messages
 
 
+async def resync_orderbook_from_rest(
+    session: aiohttp.ClientSession,
+    bid_map: dict[float, float],
+    ask_map: dict[float, float],
+) -> int:
+    """Refresh local depth maps from REST snapshot (same connection, no WS reconnect)."""
+    snapshot = await fetch_depth_snapshot(session)
+    last_update_id = int(snapshot["lastUpdateId"])
+    bid_map.clear()
+    ask_map.clear()
+    bid_map.update({float(p): float(q) for p, q in snapshot["bids"]})
+    ask_map.update({float(p): float(q) for p, q in snapshot["asks"]})
+    return last_update_id
+
+
 def reload_symbol_config_from_db(*, force: bool = False) -> dict:
     result = symbol_config.reload_from_db(globals(), SYMBOL, force=force)
     if result.get("needs_ws_reconnect"):
@@ -2502,7 +2534,7 @@ async def ws_loop() -> None:
                     ping_interval=WS_PING_INTERVAL,
                     ping_timeout=WS_PING_TIMEOUT,
                     close_timeout=10,
-                    max_queue=512,
+                    max_queue=2048,
                 ) as ws:
                     logger.info("Futures WebSocket connected for %s (%s)", SYMBOL.upper(), FSTREAM_WS_BASE)
                     ws_status = "buffering depth"
@@ -2603,20 +2635,66 @@ async def ws_loop() -> None:
                                     logger.debug("miniTicker without 24h pct: %s", data)
 
                             elif "U" in data and "u" in data:
-                                if int(data["u"]) <= last_update_id:
+                                final_id = int(data["u"])
+                                if final_id <= last_update_id:
                                     continue
+                                pu_raw = data.get("pu")
+                                if pu_raw is not None:
+                                    pu = int(pu_raw)
+                                    if pu < last_update_id:
+                                        continue
+                                    if pu > last_update_id:
+                                        gap = pu - last_update_id
+                                        logger.warning(
+                                            "%s: depth gap pu=%s > last=%s (gap=%s) — REST resync",
+                                            SYMBOL.upper(),
+                                            pu,
+                                            last_update_id,
+                                            gap,
+                                        )
+                                        try:
+                                            last_update_id = await resync_orderbook_from_rest(
+                                                session, bid_map, ask_map
+                                            )
+                                            with state_lock:
+                                                sync_orderbook_maps(bid_map, ask_map)
+                                        except Exception as exc:
+                                            log_error(
+                                                "orderbook_resync_failed",
+                                                last_update_id=last_update_id,
+                                                error=str(exc),
+                                            )
+                                            disconnect_reason = "orderbook_desync"
+                                            break
+                                        continue
                                 if not _depth_update_follows(last_update_id, data):
-                                    log_error(
-                                        "orderbook_desync",
-                                        last_update_id=last_update_id,
-                                        payload=data,
+                                    logger.warning(
+                                        "%s: depth chain break at last=%s U=%s u=%s pu=%s — REST resync",
+                                        SYMBOL.upper(),
+                                        last_update_id,
+                                        data.get("U"),
+                                        data.get("u"),
+                                        data.get("pu"),
                                     )
-                                    logger.warning("Order book desync detected, resyncing...")
-                                    disconnect_reason = "orderbook_desync"
-                                    break
+                                    try:
+                                        last_update_id = await resync_orderbook_from_rest(
+                                            session, bid_map, ask_map
+                                        )
+                                        with state_lock:
+                                            sync_orderbook_maps(bid_map, ask_map)
+                                    except Exception as exc:
+                                        log_error(
+                                            "orderbook_desync",
+                                            last_update_id=last_update_id,
+                                            payload=data,
+                                            error=str(exc),
+                                        )
+                                        disconnect_reason = "orderbook_desync"
+                                        break
+                                    continue
 
                                 apply_depth_update(data, bid_map, ask_map)
-                                last_update_id = int(data["u"])
+                                last_update_id = final_id
 
                                 now_mono = time.monotonic()
                                 with state_lock:
