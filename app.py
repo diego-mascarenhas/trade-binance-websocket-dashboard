@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import atexit
+import contextlib
 import json
 import logging
 import os
@@ -197,6 +198,15 @@ FAPI_BASE = os.getenv("FAPI_BASE", "https://fapi.binance.com").rstrip("/")
 FSTREAM_WS_BASE = os.getenv("FSTREAM_WS_BASE", "wss://fstream.binance.com").rstrip("/")
 FAPI_MARKET_PATH = f"{FAPI_BASE}/fapi/v1"
 
+# Raw Binance WebSocket feed debugging (local only).
+# WS_RAW_LOG: dump every message to logs/raw_<SYMBOL>.log (HIGH volume — depth@100ms). Off by default.
+# WS_FEED_SUMMARY_SEC: write a per-stream message-count line to logs/feed_summary.log every N seconds.
+#   0 disables the summary. Low volume; useful to confirm every stream keeps arriving.
+WS_RAW_LOG = os.getenv("WS_RAW_LOG", "false").strip().lower() in ("1", "true", "yes")
+WS_FEED_SUMMARY_SEC = float(os.getenv("WS_FEED_SUMMARY_SEC", "60"))
+# Spread fleet WS/REST bootstrap over this many seconds (19 pairs → avoids fapi -1003 burst).
+FLEET_WS_STAGGER_MAX_SEC = max(30.0, float(os.getenv("FLEET_WS_STAGGER_MAX_SEC", "120")))
+
 state_lock = Lock()
 candles: deque = deque(maxlen=MAX_CANDLES)
 htf_candles: deque = deque(maxlen=HTF_CANDLES)
@@ -251,6 +261,79 @@ def append_event_log(log_name: str, event: str, **fields) -> None:
 def log_error(event: str, **fields) -> None:
     append_event_log("errors", event, **fields)
     logger.error("%s %s", event, fields)
+
+
+_feed_counts: dict[str, int] = {}
+_feed_summary_mono: float = 0.0
+
+
+def _classify_stream(stream: str) -> str:
+    if "@kline_" in stream:
+        return "kline_" + stream.split("@kline_")[-1]
+    if "@depth" in stream:
+        return "depth"
+    if "miniTicker" in stream:
+        return "ticker"
+    return "other"
+
+
+def record_feed_message(stream: str, data: dict) -> None:
+    """Count WS messages per stream and (optionally) dump the raw payload.
+
+    Gated by WS_FEED_SUMMARY_SEC (counts) and WS_RAW_LOG (full dump); both off → no-op.
+    """
+    if WS_FEED_SUMMARY_SEC <= 0 and not WS_RAW_LOG:
+        return
+    stream_type = _classify_stream(stream)
+    _feed_counts[stream_type] = _feed_counts.get(stream_type, 0) + 1
+    if WS_RAW_LOG:
+        append_event_log(
+            f"raw_{SYMBOL.upper()}",
+            "ws_message",
+            stream=stream,
+            stream_type=stream_type,
+            data=data,
+        )
+
+
+def maybe_flush_feed_summary() -> None:
+    """Emit a per-stream message-count line every WS_FEED_SUMMARY_SEC seconds."""
+    global _feed_summary_mono
+    if WS_FEED_SUMMARY_SEC <= 0:
+        return
+    now = time.monotonic()
+    if _feed_summary_mono == 0.0:
+        _feed_summary_mono = now
+        return
+    if now - _feed_summary_mono < WS_FEED_SUMMARY_SEC:
+        return
+    flush_feed_summary(reason="interval")
+
+
+def flush_feed_summary(
+    *,
+    reason: str = "interval",
+    ws_status_val: str | None = None,
+    extra: dict | None = None,
+) -> None:
+    """Write accumulated per-stream counts (interval tick or disconnect/resync)."""
+    global _feed_summary_mono
+    if WS_FEED_SUMMARY_SEC <= 0 and reason == "interval":
+        return
+    now = time.monotonic()
+    window_sec = round(now - _feed_summary_mono, 1) if _feed_summary_mono else 0.0
+    counts = dict(_feed_counts)
+    _feed_counts.clear()
+    _feed_summary_mono = now
+    payload: dict[str, Any] = {
+        "window_sec": window_sec,
+        "counts": counts,
+        "reason": reason,
+        "ws_status": ws_status_val or ws_status,
+    }
+    if extra:
+        payload.update(extra)
+    append_event_log("feed_summary", "feed_summary", **payload)
 
 
 def indicator_filter_settings() -> IndicatorFilterSettings:
@@ -1398,6 +1481,46 @@ def apply_depth_update(data: dict, bids: dict[float, float], asks: dict[float, f
             asks[price] = qty
 
 
+def _depth_update_follows(last_update_id: int, data: dict) -> bool:
+    """True when `data` continues the local book (Binance Futures `pu` chain)."""
+    final_id = data.get("u")
+    if final_id is None or int(final_id) <= last_update_id:
+        return False
+    pu = data.get("pu")
+    if pu is not None:
+        try:
+            return int(pu) == last_update_id
+        except (TypeError, ValueError):
+            pass
+    first_id = data.get("U")
+    if first_id is None:
+        return False
+    return int(first_id) <= last_update_id + 1 <= int(final_id)
+
+
+def _apply_buffered_depth_updates(
+    depth_buffer: list[dict],
+    last_update_id: int,
+    bid_map: dict[float, float],
+    ask_map: dict[float, float],
+) -> int:
+    start_idx: int | None = None
+    for index, event in enumerate(depth_buffer):
+        if _depth_update_follows(last_update_id, event):
+            start_idx = index
+            break
+    if start_idx is None:
+        return last_update_id
+    for event in depth_buffer[start_idx:]:
+        if int(event["u"]) <= last_update_id:
+            continue
+        if not _depth_update_follows(last_update_id, event):
+            break
+        apply_depth_update(event, bid_map, ask_map)
+        last_update_id = int(event["u"])
+    return last_update_id
+
+
 def snapshot_to_levels(snapshot: dict) -> tuple[list[list[float]], list[list[float]]]:
     bids = [[float(p), float(q)] for p, q in snapshot["bids"]]
     asks = [[float(p), float(q)] for p, q in snapshot["asks"]]
@@ -2223,30 +2346,58 @@ async def fetch_historical_klines(
 
 async def sync_orderbook(session: aiohttp.ClientSession, depth_buffer: list[dict]) -> tuple[dict[float, float], dict[float, float], int]:
     snapshot = await fetch_depth_snapshot(session)
-    last_update_id = snapshot["lastUpdateId"]
+    last_update_id = int(snapshot["lastUpdateId"])
 
     bid_map = {float(p): float(q) for p, q in snapshot["bids"]}
     ask_map = {float(p): float(q) for p, q in snapshot["asks"]}
 
-    valid_events: list[dict] = []
-    for event in depth_buffer:
-        if event["u"] <= last_update_id:
-            continue
-        if event["U"] <= last_update_id + 1 <= event["u"]:
-            valid_events.append(event)
-            break
-
-    if not valid_events:
-        return bid_map, ask_map, last_update_id
-
-    start_idx = depth_buffer.index(valid_events[0])
-    for event in depth_buffer[start_idx:]:
-        if event["u"] < last_update_id:
-            continue
-        apply_depth_update(event, bid_map, ask_map)
-        last_update_id = event["u"]
+    bridged_before = last_update_id
+    last_update_id = _apply_buffered_depth_updates(depth_buffer, last_update_id, bid_map, ask_map)
+    if last_update_id == bridged_before and depth_buffer:
+        logger.warning(
+            "%s: no depth bridge in %s buffered events (snapshot lastUpdateId=%s)",
+            SYMBOL.upper(),
+            len(depth_buffer),
+            bridged_before,
+        )
 
     return bid_map, ask_map, last_update_id
+
+
+async def bootstrap_orderbook_from_ws(
+    session: aiohttp.ClientSession,
+    ws,
+) -> tuple[dict[float, float], dict[float, float], int, list[str]]:
+    """Buffer depth while fetching REST snapshot (Binance-recommended sync)."""
+    depth_buffer: list[dict] = []
+    pending_messages: list[str] = []
+    collecting = True
+
+    async def collect_while_syncing() -> None:
+        while collecting:
+            raw = await ws.recv()
+            raw_text = raw if isinstance(raw, str) else raw.decode()
+            msg = json.loads(raw_text)
+            stream = msg.get("stream", "")
+            data = msg.get("data", {})
+            record_feed_message(stream, data)
+            maybe_flush_feed_summary()
+            if "U" in data and "u" in data:
+                depth_buffer.append(data)
+            else:
+                pending_messages.append(raw_text)
+
+    collector = asyncio.create_task(collect_while_syncing())
+    try:
+        await asyncio.sleep(0.05)
+        bid_map, ask_map, last_update_id = await sync_orderbook(session, depth_buffer)
+    finally:
+        collecting = False
+        collector.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await collector
+
+    return bid_map, ask_map, last_update_id, pending_messages
 
 
 def reload_symbol_config_from_db(*, force: bool = False) -> dict:
@@ -2297,16 +2448,16 @@ def _websocket_reconnect_delay(exc: Exception, attempt: int) -> float:
 async def ws_loop() -> None:
     global forming_candle, htf_forming_candle, latest_price, orderbook, ws_status, change_24h
 
-    depth_buffer: list[dict] = []
     last_htf_interval = HTF_INTERVAL
     reconnect_attempt = 0
     last_depth_metrics_mono = 0.0
 
-    stagger_s = (hash(SYMBOL.upper()) % 30) + random.uniform(0.0, 2.0)
+    stagger_s = (hash(SYMBOL.upper()) % int(FLEET_WS_STAGGER_MAX_SEC)) + random.uniform(0.0, 2.0)
     logger.info(
-        "%s: Futures WS stagger %.1fs (reduces fapi REST burst on fleet start)",
+        "%s: Futures WS stagger %.1fs (max %ss — reduces fapi REST burst on fleet start)",
         SYMBOL.upper(),
         stagger_s,
+        int(FLEET_WS_STAGGER_MAX_SEC),
     )
     await asyncio.sleep(stagger_s)
 
@@ -2344,7 +2495,7 @@ async def ws_loop() -> None:
             try:
                 ws_force_reconnect.clear()
                 ws_status = "connecting"
-                depth_buffer.clear()
+                disconnect_reason = "unknown"
 
                 async with websockets.connect(
                     stream_url,
@@ -2356,121 +2507,140 @@ async def ws_loop() -> None:
                     logger.info("Futures WebSocket connected for %s (%s)", SYMBOL.upper(), FSTREAM_WS_BASE)
                     ws_status = "buffering depth"
 
-                    while len(depth_buffer) < 3:
-                        msg = json.loads(await ws.recv())
-                        data = msg.get("data", {})
-                        if "U" in data and "u" in data:
-                            depth_buffer.append(data)
+                    try:
+                        bid_map, ask_map, last_update_id, pending_messages = await bootstrap_orderbook_from_ws(
+                            session, ws
+                        )
 
-                    bid_map, ask_map, last_update_id = await sync_orderbook(session, depth_buffer)
+                        with state_lock:
+                            sync_orderbook_state(bid_map, ask_map)
 
-                    with state_lock:
-                        sync_orderbook_state(bid_map, ask_map)
+                        ws_status = "live"
+                        reconnect_attempt = 0
+                        logger.info("Order book synced at updateId=%s", last_update_id)
 
-                    ws_status = "live"
-                    reconnect_attempt = 0
-                    logger.info("Order book synced at updateId=%s", last_update_id)
-
-                    with state_lock:
-                        need_kline_refill = len(candles) < 10
-                    if need_kline_refill:
-                        try:
-                            refill = await fetch_historical_klines(
-                                session, current_ltf, MAX_CANDLES
-                            )
-                            with state_lock:
-                                candles.clear()
-                                candles.extend(refill)
-                            logger.warning(
-                                "%s: refilled %s klines after WS connect (chart recovery)",
-                                SYMBOL.upper(),
-                                len(refill),
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "%s: kline refill after connect failed: %s",
-                                SYMBOL.upper(),
-                                exc,
-                            )
-
-                    await _ensure_change_24h_from_rest(session)
-
-                    async for raw in ws:
-                        if ws_force_reconnect.is_set():
-                            logger.info("%s: config change — reconnecting WebSocket", SYMBOL.upper())
-                            break
-
-                        msg = json.loads(raw)
-                        data = msg.get("data", {})
-
-                        if "k" in data:
-                            k = data["k"]
-                            row = kline_row(k)
-                            interval = k.get("i", current_ltf)
-
-                            with state_lock:
-                                if interval == current_htf:
-                                    htf_forming_candle = row
-                                    if row["x"]:
-                                        if htf_candles and htf_candles[-1]["t"] == row["t"]:
-                                            htf_candles[-1] = row
-                                        else:
-                                            htf_candles.append(row)
-                                elif interval == current_ltf:
-                                    latest_price = row["c"]
-                                    forming_candle = row
-                                    if row["x"]:
-                                        candles.append(row)
-                                    if orderbook.get("bids") and orderbook.get("asks"):
-                                        update_metrics(
-                                            orderbook["bids"],
-                                            orderbook["asks"],
-                                            analysis_orderbook.get("bids"),
-                                            analysis_orderbook.get("asks"),
-                                        )
-
-                        elif data.get("e") == "24hrMiniTicker" or msg.get("stream", "").endswith("@miniTicker"):
-                            pct = _parse_mini_ticker_change_pct(data)
-                            if pct is not None:
+                        with state_lock:
+                            need_kline_refill = len(candles) < 10
+                        if need_kline_refill:
+                            try:
+                                refill = await fetch_historical_klines(
+                                    session, current_ltf, MAX_CANDLES
+                                )
                                 with state_lock:
-                                    change_24h = pct
-                                    if orderbook.get("bids") and orderbook.get("asks"):
-                                        update_metrics(
-                                            orderbook["bids"],
-                                            orderbook["asks"],
-                                            analysis_orderbook.get("bids"),
-                                            analysis_orderbook.get("asks"),
-                                        )
-                            else:
-                                logger.debug("miniTicker without 24h pct: %s", data)
+                                    candles.clear()
+                                    candles.extend(refill)
+                                logger.warning(
+                                    "%s: refilled %s klines after WS connect (chart recovery)",
+                                    SYMBOL.upper(),
+                                    len(refill),
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "%s: kline refill after connect failed: %s",
+                                    SYMBOL.upper(),
+                                    exc,
+                                )
 
-                        elif "U" in data and "u" in data:
-                            if data["u"] <= last_update_id:
-                                continue
-                            if not (data["U"] <= last_update_id + 1 <= data["u"]):
-                                log_error("orderbook_desync", last_update_id=last_update_id, payload=data)
-                                logger.warning("Order book desync detected, resyncing...")
+                        await _ensure_change_24h_from_rest(session)
+
+                        async def ws_message_stream():
+                            for raw in pending_messages:
+                                yield raw
+                            async for raw in ws:
+                                yield raw
+
+                        async for raw in ws_message_stream():
+                            if ws_force_reconnect.is_set():
+                                disconnect_reason = "config_reconnect"
+                                logger.info("%s: config change — reconnecting WebSocket", SYMBOL.upper())
                                 break
 
-                            apply_depth_update(data, bid_map, ask_map)
-                            last_update_id = data["u"]
+                            msg = json.loads(raw)
+                            data = msg.get("data", {})
 
-                            now_mono = time.monotonic()
-                            with state_lock:
-                                sync_orderbook_maps(bid_map, ask_map)
-                                if (
-                                    now_mono - last_depth_metrics_mono
-                                    >= DEPTH_METRICS_INTERVAL_SEC
-                                ):
-                                    last_depth_metrics_mono = now_mono
-                                    update_metrics(
-                                        orderbook["bids"],
-                                        orderbook["asks"],
-                                        analysis_orderbook["bids"],
-                                        analysis_orderbook["asks"],
+                            record_feed_message(msg.get("stream", ""), data)
+                            maybe_flush_feed_summary()
+
+                            if "k" in data:
+                                k = data["k"]
+                                row = kline_row(k)
+                                interval = k.get("i", current_ltf)
+
+                                with state_lock:
+                                    if interval == current_htf:
+                                        htf_forming_candle = row
+                                        if row["x"]:
+                                            if htf_candles and htf_candles[-1]["t"] == row["t"]:
+                                                htf_candles[-1] = row
+                                            else:
+                                                htf_candles.append(row)
+                                    elif interval == current_ltf:
+                                        latest_price = row["c"]
+                                        forming_candle = row
+                                        if row["x"]:
+                                            candles.append(row)
+                                        if orderbook.get("bids") and orderbook.get("asks"):
+                                            update_metrics(
+                                                orderbook["bids"],
+                                                orderbook["asks"],
+                                                analysis_orderbook.get("bids"),
+                                                analysis_orderbook.get("asks"),
+                                            )
+
+                            elif data.get("e") == "24hrMiniTicker" or msg.get("stream", "").endswith("@miniTicker"):
+                                pct = _parse_mini_ticker_change_pct(data)
+                                if pct is not None:
+                                    with state_lock:
+                                        change_24h = pct
+                                        if orderbook.get("bids") and orderbook.get("asks"):
+                                            update_metrics(
+                                                orderbook["bids"],
+                                                orderbook["asks"],
+                                                analysis_orderbook.get("bids"),
+                                                analysis_orderbook.get("asks"),
+                                            )
+                                else:
+                                    logger.debug("miniTicker without 24h pct: %s", data)
+
+                            elif "U" in data and "u" in data:
+                                if int(data["u"]) <= last_update_id:
+                                    continue
+                                if not _depth_update_follows(last_update_id, data):
+                                    log_error(
+                                        "orderbook_desync",
+                                        last_update_id=last_update_id,
+                                        payload=data,
                                     )
+                                    logger.warning("Order book desync detected, resyncing...")
+                                    disconnect_reason = "orderbook_desync"
+                                    break
+
+                                apply_depth_update(data, bid_map, ask_map)
+                                last_update_id = int(data["u"])
+
+                                now_mono = time.monotonic()
+                                with state_lock:
+                                    sync_orderbook_maps(bid_map, ask_map)
+                                    if (
+                                        now_mono - last_depth_metrics_mono
+                                        >= DEPTH_METRICS_INTERVAL_SEC
+                                    ):
+                                        last_depth_metrics_mono = now_mono
+                                        update_metrics(
+                                            orderbook["bids"],
+                                            orderbook["asks"],
+                                            analysis_orderbook["bids"],
+                                            analysis_orderbook["asks"],
+                                        )
+                    finally:
+                        flush_feed_summary(reason=disconnect_reason, ws_status_val=ws_status)
 
             except Exception as exc:
+                flush_feed_summary(
+                    reason="websocket_error",
+                    ws_status_val=ws_status,
+                    extra={"error": str(exc)},
+                )
                 delay = _websocket_reconnect_delay(exc, reconnect_attempt)
                 reconnect_attempt += 1
                 log_error(
