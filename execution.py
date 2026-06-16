@@ -72,6 +72,7 @@ FLEET_REST_CACHE_SEC = max(10.0, float(os.getenv("FLEET_REST_CACHE_SEC", "60")))
 FLEET_REST_CACHE_ENABLED = _env_bool("FLEET_REST_CACHE_ENABLED", "true")
 FAPI_SIGNED_RECOVERY_SEC = max(0.0, float(os.getenv("FAPI_SIGNED_RECOVERY_SEC", "0")))
 FAPI_SIGNED_PACE_SEC = max(0.0, float(os.getenv("FAPI_SIGNED_PACE_SEC", "1.0")))
+FAPI_DEPTH_PACE_SEC = max(0.0, float(os.getenv("FAPI_DEPTH_PACE_SEC", "2.0")))
 EXECUTION_BLOCK_IF_OPEN = _env_bool("EXECUTION_BLOCK_IF_OPEN", "true")
 EXECUTION_POSITION_CACHE_SEC = float(os.getenv("EXECUTION_POSITION_CACHE_SEC", "60"))
 ACCOUNT_SNAPSHOT_CACHE_SEC = float(os.getenv("ACCOUNT_SNAPSHOT_CACHE_SEC", "120"))
@@ -1561,6 +1562,10 @@ def _fapi_signed_pace_path() -> Path:
     return Path(LOG_DIR) / "fapi_signed_pace.json"
 
 
+def _fapi_depth_pace_path() -> Path:
+    return Path(LOG_DIR) / "fapi_depth_pace.json"
+
+
 def _read_signed_recovery_until() -> float:
     path = _fapi_recovery_path()
     if not path.exists():
@@ -1803,15 +1808,14 @@ def notify_fapi_rest_result(
         _apply_fapi_error_backoff(detail)
 
 
-def _acquire_signed_rest_pace() -> None:
-    """Fleet-wide minimum gap between signed REST calls (avoids post-ban stampede)."""
-    if FAPI_SIGNED_PACE_SEC <= 0:
+def _acquire_fleet_rest_pace(pace_path: Path, pace_sec: float) -> None:
+    """Fleet-wide minimum gap between REST calls of the same kind (avoids IP stampede)."""
+    if pace_sec <= 0:
         return
     Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
-    lock_handle = open(_fapi_signed_pace_path().with_suffix(".lock"), "w", encoding="utf-8")
+    lock_handle = open(pace_path.with_suffix(".lock"), "w", encoding="utf-8")
     try:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        pace_path = _fapi_signed_pace_path()
         last_at = 0.0
         if pace_path.exists():
             try:
@@ -1820,7 +1824,7 @@ def _acquire_signed_rest_pace() -> None:
                 last_at = 0.0
         while True:
             now = time.time()
-            wait = FAPI_SIGNED_PACE_SEC - (now - last_at)
+            wait = pace_sec - (now - last_at)
             if wait <= 0:
                 break
             time.sleep(min(wait, 0.25))
@@ -1831,6 +1835,16 @@ def _acquire_signed_rest_pace() -> None:
     finally:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
         lock_handle.close()
+
+
+def _acquire_signed_rest_pace() -> None:
+    """Fleet-wide minimum gap between signed REST calls (avoids post-ban stampede)."""
+    _acquire_fleet_rest_pace(_fapi_signed_pace_path(), FAPI_SIGNED_PACE_SEC)
+
+
+def acquire_fapi_depth_rest_pace() -> None:
+    """Fleet-wide minimum gap between public depth snapshots (all dashboards share one IP)."""
+    _acquire_fleet_rest_pace(_fapi_depth_pace_path(), FAPI_DEPTH_PACE_SEC)
 
 
 def _fapi_metrics_path() -> Path:

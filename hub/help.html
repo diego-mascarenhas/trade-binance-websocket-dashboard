@@ -334,7 +334,7 @@
                     <li>Debounce: ~5 × <code>DEPTH_METRICS_INTERVAL_SEC</code> ≈ 1.25 s mínimo (si depth estable).</li>
                     <li>Cooldown entre entradas del mismo par: <code>SIGNAL_COOLDOWN_SEC</code> (180 s).</li>
                     <li>Hub refresh: 5 s. UI individual: <code>METRICS_INTERVAL_MS</code> (8000 ms default).</li>
-                    <li>WS ping: cada <code>WS_PING_INTERVAL</code> (20 s), timeout <code>WS_PING_TIMEOUT</code> (120 s).</li>
+                    <li>WS ping: cada <code>WS_PING_INTERVAL</code> (20 s), timeout <code>WS_PING_TIMEOUT</code> (180 s).</li>
                 </ul>
                 <p class="help-warn">Si <em>todos</em> los pares muestran precio «—» y <em>connecting</em> durante mucho tiempo, revisa que <code>./run-all.sh</code> esté activo y que los procesos escuchen en los puertos de <code>hub/pairs.json</code>.</p>
             </section>
@@ -433,7 +433,10 @@
                         <thead><tr><th>Variable</th><th>Default</th><th>Descripción</th></tr></thead>
                         <tbody>
                             <tr><td><code>WS_PING_INTERVAL</code></td><td>20</td><td>Segundos entre pings WS</td></tr>
-                            <tr><td><code>WS_PING_TIMEOUT</code></td><td>120</td><td>Timeout sin pong</td></tr>
+                            <tr><td><code>WS_PING_TIMEOUT</code></td><td>180</td><td>Timeout sin pong (subir en flota grande)</td></tr>
+                            <tr><td><code>FAPI_DEPTH_PACE_SEC</code></td><td>2</td><td>Gap mínimo entre snapshots depth REST (toda la flota)</td></tr>
+                            <tr><td><code>DEPTH_SNAPSHOT_LIMIT</code></td><td>500</td><td>Menos peso REST que 1000</td></tr>
+                            <tr><td><code>ORDERBOOK_REST_RESYNC_COOLDOWN_SEC</code></td><td>30</td><td>Evita ráfagas de resync en el mismo par</td></tr>
                             <tr><td><code>DEPTH_METRICS_INTERVAL_SEC</code></td><td>0.25</td><td>Throttle recálculo señal en depth</td></tr>
                             <tr><td><code>METRICS_INTERVAL_MS</code></td><td>8000</td><td>Poll UI dashboard (ms)</td></tr>
                             <tr><td><code>DASH_HOST</code> / <code>DASH_PORT</code></td><td>0.0.0.0 / 8050</td><td>Bind dashboard individual</td></tr>

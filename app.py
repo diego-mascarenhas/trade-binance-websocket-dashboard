@@ -121,7 +121,11 @@ _NOISY_DECISION_EVENTS = frozenset({"indicator_blocked", "valid_entry_blocked"})
 _last_decision_log_mono: dict[tuple[str, str, str], float] = {}
 _dedup_suppressed_count: dict[tuple[str, str, str], int] = {}
 WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "20"))
-WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "120"))
+WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "180"))
+DEPTH_SNAPSHOT_LIMIT = int(os.getenv("DEPTH_SNAPSHOT_LIMIT", "500"))
+ORDERBOOK_REST_RESYNC_COOLDOWN_SEC = max(
+    0.0, float(os.getenv("ORDERBOOK_REST_RESYNC_COOLDOWN_SEC", "30"))
+)
 METRICS_INTERVAL_MS = max(3000, int(os.getenv("METRICS_INTERVAL_MS", "8000")))
 DEPTH_METRICS_INTERVAL_SEC = float(os.getenv("DEPTH_METRICS_INTERVAL_SEC", "0.25"))
 EMA_FAST = int(os.getenv("EMA_FAST", "9"))
@@ -2285,8 +2289,49 @@ async def _fapi_market_get(
 
 
 async def fetch_depth_snapshot(session: aiohttp.ClientSession) -> dict:
-    params = {"symbol": SYMBOL.upper(), "limit": 1000}
+    execution.acquire_fapi_depth_rest_pace()
+    params = {"symbol": SYMBOL.upper(), "limit": DEPTH_SNAPSHOT_LIMIT}
     return await _fapi_market_get(session, "/fapi/v1/depth", params)
+
+
+async def rest_resync_orderbook(
+    session: aiohttp.ClientSession,
+    bid_map: dict[float, float],
+    ask_map: dict[float, float],
+    *,
+    last_update_id: int,
+    last_resync_mono: float,
+) -> tuple[int, float, bool]:
+    """REST-refresh depth maps. Returns (last_update_id, last_resync_mono, break_ws_loop)."""
+    now_mono = time.monotonic()
+    if (
+        ORDERBOOK_REST_RESYNC_COOLDOWN_SEC > 0
+        and last_resync_mono > 0.0
+        and now_mono - last_resync_mono < ORDERBOOK_REST_RESYNC_COOLDOWN_SEC
+    ):
+        logger.warning(
+            "%s: orderbook REST resync throttled (%.0fs / %.0fs cooldown) — reconnecting WS",
+            SYMBOL.upper(),
+            now_mono - last_resync_mono,
+            ORDERBOOK_REST_RESYNC_COOLDOWN_SEC,
+        )
+        return last_update_id, last_resync_mono, True
+
+    block = execution.fapi_public_blocked_reason()
+    if block:
+        logger.warning("%s: orderbook REST resync blocked (%s) — reconnecting WS", SYMBOL.upper(), block)
+        return last_update_id, last_resync_mono, True
+
+    try:
+        new_last = await resync_orderbook_from_rest(session, bid_map, ask_map)
+        return new_last, time.monotonic(), False
+    except Exception as exc:
+        log_error(
+            "orderbook_resync_failed",
+            last_update_id=last_update_id,
+            error=str(exc),
+        )
+        return last_update_id, last_resync_mono, True
 
 
 async def fetch_24h_ticker(session: aiohttp.ClientSession) -> float | None:
@@ -2483,6 +2528,7 @@ async def ws_loop() -> None:
     last_htf_interval = HTF_INTERVAL
     reconnect_attempt = 0
     last_depth_metrics_mono = 0.0
+    last_orderbook_rest_resync_mono = 0.0
 
     stagger_s = (hash(SYMBOL.upper()) % int(FLEET_WS_STAGGER_MAX_SEC)) + random.uniform(0.0, 2.0)
     logger.info(
@@ -2652,20 +2698,22 @@ async def ws_loop() -> None:
                                             last_update_id,
                                             gap,
                                         )
-                                        try:
-                                            last_update_id = await resync_orderbook_from_rest(
-                                                session, bid_map, ask_map
-                                            )
-                                            with state_lock:
-                                                sync_orderbook_maps(bid_map, ask_map)
-                                        except Exception as exc:
-                                            log_error(
-                                                "orderbook_resync_failed",
-                                                last_update_id=last_update_id,
-                                                error=str(exc),
-                                            )
+                                        (
+                                            last_update_id,
+                                            last_orderbook_rest_resync_mono,
+                                            break_ws,
+                                        ) = await rest_resync_orderbook(
+                                            session,
+                                            bid_map,
+                                            ask_map,
+                                            last_update_id=last_update_id,
+                                            last_resync_mono=last_orderbook_rest_resync_mono,
+                                        )
+                                        if break_ws:
                                             disconnect_reason = "orderbook_desync"
                                             break
+                                        with state_lock:
+                                            sync_orderbook_maps(bid_map, ask_map)
                                         continue
                                 if not _depth_update_follows(last_update_id, data):
                                     logger.warning(
@@ -2676,21 +2724,28 @@ async def ws_loop() -> None:
                                         data.get("u"),
                                         data.get("pu"),
                                     )
-                                    try:
-                                        last_update_id = await resync_orderbook_from_rest(
-                                            session, bid_map, ask_map
-                                        )
-                                        with state_lock:
-                                            sync_orderbook_maps(bid_map, ask_map)
-                                    except Exception as exc:
+                                    (
+                                        last_update_id,
+                                        last_orderbook_rest_resync_mono,
+                                        break_ws,
+                                    ) = await rest_resync_orderbook(
+                                        session,
+                                        bid_map,
+                                        ask_map,
+                                        last_update_id=last_update_id,
+                                        last_resync_mono=last_orderbook_rest_resync_mono,
+                                    )
+                                    if break_ws:
                                         log_error(
                                             "orderbook_desync",
                                             last_update_id=last_update_id,
                                             payload=data,
-                                            error=str(exc),
+                                            error="REST resync failed or throttled",
                                         )
                                         disconnect_reason = "orderbook_desync"
                                         break
+                                    with state_lock:
+                                        sync_orderbook_maps(bid_map, ask_map)
                                     continue
 
                                 apply_depth_update(data, bid_map, ask_map)
