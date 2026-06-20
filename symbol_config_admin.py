@@ -148,6 +148,140 @@ CONFIG_KEY_PRESETS: dict[str, dict[str, Any]] = {
     },
 }
 
+# Fleet-wide presets for /config/ (load or apply in one click).
+FLEET_PRESET_META: dict[str, dict[str, Any]] = {
+    "permissive": {
+        "label": "Permisivo",
+        "hint": "Más señales: HTF off, conf 40, filtros relajados",
+    },
+    "balanced": {
+        "label": "Equilibrado",
+        "hint": "Conf 50, HTF align, filtros moderados (similar a .env.example)",
+    },
+    "conservative": {
+        "label": "Conservador",
+        "hint": "Pocas señales: conf 65, HTF estricto, ADX alto",
+    },
+    "scalp_aggressive": {
+        "label": "Scalping agresivo",
+        "hint": "1m/3m, debounce 0, cooldown 30s, sin HTF align ni filtros",
+    },
+    "scalp_moderate": {
+        "label": "Scalping moderado",
+        "hint": "1m/5m, debounce 2, cooldown 90s, filtros ligeros en 1m",
+    },
+    "env": {
+        "label": "Default (.env)",
+        "hint": "Elimina overrides MySQL; cada par usa su .env",
+        "restore_only": True,
+    },
+}
+
+BALANCED_FLEET_VALUES: dict[str, Any] = {
+    "MIN_CONFIDENCE": 50,
+    "HTF_INTERVAL": "15m",
+    "INTERVAL": "1m",
+    "REQUIRE_TREND_ALIGN": True,
+    "SIGNAL_DEBOUNCE_COUNT": 5,
+    "SIGNAL_COOLDOWN_SEC": 180,
+    "MIN_PATTERN_RANGE_PCT": 0.02,
+    "OB_WALL_RANGE_PCT": 0.6,
+    "INDICATOR_FILTERS_ENABLED": True,
+    "RSI_FILTER_ENABLED": True,
+    "RSI_LONG_MAX": 70.0,
+    "RSI_SHORT_MIN": 30.0,
+    "MACD_FILTER_ENABLED": False,
+    "ADX_FILTER_ENABLED": True,
+    "ADX_MIN_TREND": 25.0,
+    "ADX_USE_HTF": True,
+    "symbol_trading_enabled": True,
+}
+
+SCALP_AGGRESSIVE_FLEET_VALUES: dict[str, Any] = {
+    "MIN_CONFIDENCE": 40,
+    "HTF_INTERVAL": "3m",
+    "INTERVAL": "1m",
+    "REQUIRE_TREND_ALIGN": False,
+    "SIGNAL_DEBOUNCE_COUNT": 0,
+    "SIGNAL_COOLDOWN_SEC": 30,
+    "MIN_PATTERN_RANGE_PCT": 0.01,
+    "OB_WALL_RANGE_PCT": 1.0,
+    "INDICATOR_FILTERS_ENABLED": False,
+    "RSI_FILTER_ENABLED": False,
+    "RSI_LONG_MAX": 85.0,
+    "RSI_SHORT_MIN": 15.0,
+    "MACD_FILTER_ENABLED": False,
+    "ADX_FILTER_ENABLED": False,
+    "ADX_MIN_TREND": 5.0,
+    "ADX_USE_HTF": False,
+    "symbol_trading_enabled": True,
+}
+
+SCALP_MODERATE_FLEET_VALUES: dict[str, Any] = {
+    "MIN_CONFIDENCE": 45,
+    "HTF_INTERVAL": "5m",
+    "INTERVAL": "1m",
+    "REQUIRE_TREND_ALIGN": False,
+    "SIGNAL_DEBOUNCE_COUNT": 2,
+    "SIGNAL_COOLDOWN_SEC": 90,
+    "MIN_PATTERN_RANGE_PCT": 0.015,
+    "OB_WALL_RANGE_PCT": 0.85,
+    "INDICATOR_FILTERS_ENABLED": True,
+    "RSI_FILTER_ENABLED": True,
+    "RSI_LONG_MAX": 78.0,
+    "RSI_SHORT_MIN": 22.0,
+    "MACD_FILTER_ENABLED": False,
+    "ADX_FILTER_ENABLED": True,
+    "ADX_MIN_TREND": 12.0,
+    "ADX_USE_HTF": False,
+    "symbol_trading_enabled": True,
+}
+
+
+def build_fleet_preset_values(preset_id: str) -> dict[str, Any] | None:
+    """Build full override dict for a named fleet preset."""
+    if preset_id == "env":
+        return None
+    if preset_id == "balanced":
+        return dict(BALANCED_FLEET_VALUES)
+    if preset_id == "scalp_aggressive":
+        return dict(SCALP_AGGRESSIVE_FLEET_VALUES)
+    if preset_id == "scalp_moderate":
+        return dict(SCALP_MODERATE_FLEET_VALUES)
+    if preset_id not in ("permissive", "conservative"):
+        return None
+
+    values: dict[str, Any] = {}
+    for key in symbol_config.OVERRIDABLE_KEYS:
+        preset = CONFIG_KEY_PRESETS.get(key, {})
+        if preset_id in preset:
+            values[key] = preset[preset_id]
+    values.setdefault("symbol_trading_enabled", True)
+    return values
+
+
+def list_fleet_presets(*, env_defaults: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Metadata + values for /config/ preset picker."""
+    env_defaults = env_defaults if env_defaults is not None else read_env_defaults()
+    items: list[dict[str, Any]] = []
+    for preset_id, meta in FLEET_PRESET_META.items():
+        restore_only = bool(meta.get("restore_only"))
+        if restore_only:
+            values = dict(env_defaults)
+        else:
+            values = build_fleet_preset_values(preset_id) or {}
+        items.append(
+            {
+                "id": preset_id,
+                "label": meta.get("label", preset_id),
+                "hint": meta.get("hint", ""),
+                "restore_only": restore_only,
+                "values": values,
+            }
+        )
+    return items
+
+
 _BOOL_KEYS = frozenset(
     {
         "REQUIRE_TREND_ALIGN",
@@ -271,6 +405,7 @@ def get_config_editor_state() -> dict[str, Any]:
         "overrides": fleet_status,
         "keys": keys,
         "env_defaults": env_defaults,
+        "fleet_presets": list_fleet_presets(env_defaults=env_defaults),
     }
 
 

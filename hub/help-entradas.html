@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Disparador de entradas — Ayuda Binance Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="shell help-shell">
+        <header class="header help-header">
+            <div>
+                <h1>Disparador de entradas y señales</h1>
+                <p class="subtitle">Qué genera una entrada, por qué hay pocas señales y cómo relajar filtros sin perder el control.</p>
+                <nav class="help-nav-top">
+                    <a class="header-link" href="/help">← Guía completa</a>
+                    <a class="header-link" href="/">Hub</a>
+                    <a class="header-link" href="/analytics/">Analytics</a>
+                    <a class="header-link" href="/config/">Config flota</a>
+                </nav>
+            </div>
+        </header>
+
+        <nav class="help-toc" aria-label="Índice">
+            <h2>Índice</h2>
+            <ol>
+                <li><a href="#disparador">Disparador de entrada</a></li>
+                <li><a href="#pipeline">Cadena completa hasta la orden</a></li>
+                <li><a href="#analytics">Leer Analytics (valid_entry_blocked)</a></li>
+                <li><a href="#pocas-senales">Por qué hay pocas señales</a></li>
+                <li><a href="#menos-conservador">Cómo ser menos conservador</a></li>
+                <li><a href="#config">Aplicar cambios (/config/ y .env)</a></li>
+            </ol>
+        </nav>
+
+        <main class="help-content">
+
+            <section id="disparador" class="help-section">
+                <h2>1. Disparador de entrada</h2>
+                <p>La señal <strong>no sale de RSI, MACD ni ADX</strong>. Esos indicadores solo pueden <strong>bloquear</strong> después de que ya existe un candidato LONG/SHORT. El disparador principal es el <strong>order book</strong> (libro de órdenes).</p>
+
+                <h3>Paso a paso</h3>
+                <ol>
+                    <li><strong>Muros de liquidez</strong> — Se identifican el bid y el ask con más volumen dentro de <code>OB_WALL_RANGE_PCT</code> del precio medio.</li>
+                    <li><strong>Posición en el rango</strong> — Se calcula dónde está el precio entre soporte (muro de compra) y resistencia (muro de venta), en escala 0–100%.</li>
+                    <li><strong>Zonas con histéresis</strong> — Para evitar flip-flop entre LONG y SHORT:
+                        <ul>
+                            <li><strong>LONG</strong> si posición &lt; <code>SIGNAL_ZONE_LONG_ENTER</code> (default <strong>20%</strong>, cerca del soporte).</li>
+                            <li><strong>SHORT</strong> si posición &gt; <code>SIGNAL_ZONE_SHORT_ENTER</code> (default <strong>80%</strong>, cerca de la resistencia).</li>
+                            <li>Salida a NEUTRAL en <code>SIGNAL_ZONE_LONG_EXIT</code> (35%) y <code>SIGNAL_ZONE_SHORT_EXIT</code> (65%).</li>
+                        </ul>
+                    </li>
+                    <li><strong>Confianza base</strong> — Cerca de soporte/resistencia: <strong>65%</strong>, motivo <code>OB: near support</code> o <code>OB: near resistance</code>. Bonus +15% si el movimiento 24h es extremo en sentido contrario (reversal).</li>
+                    <li><strong>Fallback 24h</strong> — Si no hay señal de zona OB, usa <code>@miniTicker</code>: extremos ±5% (conf 50), tendencia ±2% (conf 40, suele quedar en WATCH si <code>MIN_CONFIDENCE=50</code>).</li>
+                </ol>
+
+                <p class="help-note">Sin bids/asks (WebSocket en <em>connecting</em> o libro vacío) no se calcula señal: el proceso retorna antes de analizar el order book.</p>
+            </section>
+
+            <section id="pipeline" class="help-section">
+                <h2>2. Cadena completa hasta la orden</h2>
+                <p>Un <em>valid entry</em> (entrada ejecutable o registrada en dry-run) pasa por todos estos pasos:</p>
+                <pre class="help-diagram">Depth WS → candidato LONG/SHORT/NEUTRAL
+         → debounce (N lecturas iguales seguidas)
+         → confianza ≥ MIN_CONFIDENCE (TRADE)
+         → plan de trade activo (SL/TP calculables)
+         → filtros RSI / ADX / MACD (si INDICATOR_FILTERS_ENABLED)
+         → alineación HTF (si REQUIRE_TREND_ALIGN)
+         → cooldown entre entradas (SIGNAL_COOLDOWN_SEC)
+         → valid entry → orden (si EXECUTION_ENABLED)</pre>
+
+                <div class="help-table-wrap">
+                    <table class="help-table">
+                        <thead>
+                            <tr>
+                                <th>Etapa</th>
+                                <th>Evento / bloqueo típico</th>
+                                <th>¿Genera señal?</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Order book</td>
+                                <td><code>signal_stable</code></td>
+                                <td>Sí — aquí nace LONG/SHORT</td>
+                            </tr>
+                            <tr>
+                                <td>Plan DCA</td>
+                                <td><code>plan_opened</code> / <code>no_active_plan</code></td>
+                                <td>No — proyecta niveles; no es una orden</td>
+                            </tr>
+                            <tr>
+                                <td>Indicadores</td>
+                                <td><code>indicator_blocked</code></td>
+                                <td>No — filtra candidatos ya válidos</td>
+                            </tr>
+                            <tr>
+                                <td>HTF</td>
+                                <td><code>htf_mismatch</code></td>
+                                <td>No — exige LONG con HTF BULL o SHORT con HTF BEAR</td>
+                            </tr>
+                            <tr>
+                                <td>Cooldown</td>
+                                <td><code>signal_cooldown</code></td>
+                                <td>No — evita reentradas muy seguidas</td>
+                            </tr>
+                            <tr>
+                                <td>Ejecución</td>
+                                <td><code>order_dry_run</code> / <code>order_live_open</code></td>
+                                <td>Orden real o simulada</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section id="analytics" class="help-section">
+                <h2>3. Leer Analytics (<code>valid_entry_blocked</code>)</h2>
+                <p>En la tabla de eventos recientes, cada fila evalúa <strong>todos</strong> los filtros. Los colores indican si ese filtro pasaría o bloquearía:</p>
+                <ul>
+                    <li><strong>Verde</strong> — El valor pasa el filtro.</li>
+                    <li><strong>Rojo</strong> — El valor bloquearía la entrada.</li>
+                    <li><strong>Gris</strong> — Filtro desactivado o N/A.</li>
+                    <li><strong>Borde ámbar</strong> — Motivo registrado en la columna <em>Block</em> (el bloqueo efectivo).</li>
+                </ul>
+
+                <h3>Ejemplo típico: LONG bloqueado por HTF</h3>
+                <p>Caso frecuente (p. ej. DOTUSDT):</p>
+                <ul>
+                    <li><strong>Event:</strong> <code>valid_entry_blocked</code></li>
+                    <li><strong>Block:</strong> <code>htf_mismatch</code></li>
+                    <li><strong>Signal:</strong> LONG — confianza 65, RSI y ADX en verde</li>
+                    <li><strong>HTF:</strong> BEAR (rojo, borde ámbar)</li>
+                </ul>
+                <p>Interpretación: la señal <strong>sí se generó</strong> (order book + confianza suficiente). Los indicadores no la bloquearon. El sistema la rechazó porque con <code>REQUIRE_TREND_ALIGN=true</code> un LONG exige HTF <strong>BULLISH</strong>; con HTF <strong>BEARISH</strong> siempre gana <code>htf_mismatch</code>.</p>
+                <p class="help-warn">Con <code>REQUIRE_TREND_ALIGN=true</code>, HTF <strong>NEUTRAL</strong> también bloquea todo valid entry. Solo pasan LONG+BULL y SHORT+BEAR.</p>
+            </section>
+
+            <section id="pocas-senales" class="help-section">
+                <h2>4. Por qué hay pocas señales</h2>
+                <p>Muchas filas en Analytics pueden ser <code>valid_entry_blocked</code> aunque el hub muestre TRADE. Eso no significa que no haya señales: significa que el embudo es selectivo.</p>
+                <ul>
+                    <li><strong>Zona media del OB (35–65%)</strong> — Precio lejos de soporte/resistencia → NEUTRAL prolongado.</li>
+                    <li><strong>HTF desalineado</strong> — El bloqueo más común cuando conf/RSI/ADX pasan: <code>htf_mismatch</code>.</li>
+                    <li><strong>Confianza 40% (fallback 24h)</strong> — Queda en WATCH si <code>MIN_CONFIDENCE=50</code>.</li>
+                    <li><strong>Debounce alto</strong> — <code>SIGNAL_DEBOUNCE_COUNT=5</code> exige 5 ticks consecutivos iguales.</li>
+                    <li><strong>Cooldown</strong> — Tras un valid entry, el mismo par espera <code>SIGNAL_COOLDOWN_SEC</code> segundos.</li>
+                    <li><strong>Más pares</strong> — Añadir símbolos ayuda poco si el cuello de botella es HTF o filtros: verás más bloqueos, no necesariamente más trades.</li>
+                </ul>
+            </section>
+
+            <section id="menos-conservador" class="help-section">
+                <h2>5. Cómo ser menos conservador</h2>
+                <p>Ordenado por impacto (de mayor a menor). Valores «permisivo» vs «conservador» coinciden con los presets de <a href="/config/">/config/</a>.</p>
+
+                <div class="help-table-wrap">
+                    <table class="help-table">
+                        <thead>
+                            <tr>
+                                <th>Parámetro</th>
+                                <th>Conservador → Permisivo</th>
+                                <th>Efecto</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>REQUIRE_TREND_ALIGN</code></td>
+                                <td><code>true</code> → <strong><code>false</code></strong></td>
+                                <td>Dejar de bloquear LONG cuando HTF es BEAR (caso DOTUSDT)</td>
+                            </tr>
+                            <tr>
+                                <td><code>SIGNAL_ZONE_LONG_ENTER</code> / <code>SHORT_ENTER</code></td>
+                                <td>20 / 80 → <strong>35 / 65</strong></td>
+                                <td>Zonas LONG/SHORT más amplias en el rango OB</td>
+                            </tr>
+                            <tr>
+                                <td><code>OB_WALL_RANGE_PCT</code></td>
+                                <td>0.35 → <strong>1.0</strong></td>
+                                <td>Muros más lejos del mid → rango OB más ancho</td>
+                            </tr>
+                            <tr>
+                                <td><code>MIN_CONFIDENCE</code></td>
+                                <td>50 → <strong>40</strong></td>
+                                <td>Señales fallback 24h y OB débiles alcanzan TRADE</td>
+                            </tr>
+                            <tr>
+                                <td><code>INDICATOR_FILTERS_ENABLED</code></td>
+                                <td><code>true</code> → <strong><code>false</code></strong></td>
+                                <td>Sin bloqueo maestro RSI/ADX/MACD</td>
+                            </tr>
+                            <tr>
+                                <td><code>ADX_FILTER_ENABLED</code> / <code>ADX_MIN_TREND</code></td>
+                                <td>ON / 28 → <strong>OFF / 5</strong></td>
+                                <td>Permite mercados laterales o ADX bajo</td>
+                            </tr>
+                            <tr>
+                                <td><code>SIGNAL_DEBOUNCE_COUNT</code></td>
+                                <td>5–8 → <strong>0–1</strong></td>
+                                <td>Entrada casi inmediata al cambio de señal</td>
+                            </tr>
+                            <tr>
+                                <td><code>SIGNAL_COOLDOWN_SEC</code></td>
+                                <td>180–300 → <strong>60</strong></td>
+                                <td>Reentradas más frecuentes en el mismo par</td>
+                            </tr>
+                            <tr>
+                                <td><code>HTF_INTERVAL</code></td>
+                                <td>15m → <strong>5m</strong></td>
+                                <td>HTF más reactivo; menos tiempo en BEAR/BULL rígido</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <p class="help-note"><strong>Acción más directa</strong> si ves muchos <code>htf_mismatch</code>: poner <code>REQUIRE_TREND_ALIGN=false</code> en el <code>.env</code> del servidor o aplicar preset <em>Permisivo</em> en fleet-wide desde <code>/config/</code>, y reiniciar los workers (<code>./run-all.sh</code>).</p>
+            </section>
+
+            <section id="config" class="help-section">
+                <h2>6. Aplicar cambios (/config/ y .env)</h2>
+                <p>Hay dos capas de configuración:</p>
+                <ol>
+                    <li><strong><code>.env</code></strong> — Base por proceso. Si una clave no está en MySQL, manda el valor del entorno. Default de <code>REQUIRE_TREND_ALIGN</code> en código es <code>true</code> si no se define.</li>
+                    <li><strong>MySQL fleet-wide / por par</strong> — Overrides desde <a href="/config/">/config/</a> (requiere <code>CONFIG_PAGE_TOKEN</code>). Pueden relajar o endurecer sin tocar el repo.</li>
+                </ol>
+                <p>Claves overrideables en MySQL incluyen: <code>MIN_CONFIDENCE</code>, <code>HTF_INTERVAL</code>, <code>REQUIRE_TREND_ALIGN</code>, <code>SIGNAL_DEBOUNCE_COUNT</code>, <code>SIGNAL_COOLDOWN_SEC</code>, <code>OB_WALL_RANGE_PCT</code>, filtros RSI/ADX/MACD y <code>symbol_trading_enabled</code>.</p>
+                <p>Si Analytics muestra HTF en rojo con borde ámbar pero creías tener <code>REQUIRE_TREND_ALIGN=false</code>, comprueba el snapshot del evento (columna config) o el estado en <code>/config/</code>: el proceso en producción puede estar usando otro <code>.env</code> o un override distinto al de tu máquina local.</p>
+
+                <h3>Relacionado</h3>
+                <ul>
+                    <li><a href="/help#orderbook">Señal por order book</a> — detalle de zonas y fallback 24h</li>
+                    <li><a href="/help#filtros">Filtros y bloqueos</a> — tabla completa de variables</li>
+                    <li><a href="/help#esperas">¿Cuánto tarda en haber señales?</a> — tiempos y causas de espera</li>
+                </ul>
+            </section>
+
+        </main>
+
+        <footer class="help-footer">
+            <p class="help-disclaimer">Documentación operativa del dashboard. No es asesoramiento financiero.</p>
+        </footer>
+    </div>
+</body>
+</html>

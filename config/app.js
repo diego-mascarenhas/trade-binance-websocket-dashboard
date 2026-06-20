@@ -1,9 +1,11 @@
 const statusNote = document.getElementById("status-note");
 const configForm = document.getElementById("config-form");
 const feedbackNote = document.getElementById("feedback-note");
-const applyFleetBtn = document.getElementById("apply-fleet-btn");
-const restoreFleetBtn = document.getElementById("restore-fleet-btn");
-const resetFormBtn = document.getElementById("reset-form-btn");
+const fleetPresetBar = document.getElementById("fleet-preset-bar");
+const fleetPresetSelect = document.getElementById("fleet-preset-select");
+const fleetPresetHint = document.getElementById("fleet-preset-hint");
+const loadPresetBtn = document.getElementById("load-preset-btn");
+const applyPresetBtn = document.getElementById("apply-preset-btn");
 const overridesPanel = document.getElementById("overrides-panel");
 const overridesSummary = document.getElementById("overrides-summary");
 const perSymbolPanel = document.getElementById("per-symbol-panel");
@@ -103,6 +105,18 @@ function setFeedback(message, kind = "info") {
     feedbackNote.className = `note ${kind}`;
 }
 
+function setPresetControlsEnabled(enabled) {
+    if (loadPresetBtn) {
+        loadPresetBtn.disabled = !enabled;
+    }
+    if (applyPresetBtn) {
+        applyPresetBtn.disabled = !enabled;
+    }
+    if (fleetPresetSelect) {
+        fleetPresetSelect.disabled = !enabled;
+    }
+}
+
 function renderOverridesSummary(status) {
     if (!status?.active) {
         overridesPanel.hidden = true;
@@ -194,11 +208,7 @@ function buildField(field) {
     };
 
     const applyPresetValue = (value) => {
-        if (field.type === "bool") {
-            input.value = formatValue(value);
-        } else {
-            input.value = formatValue(value);
-        }
+        input.value = formatValue(value);
         markChanged();
         input.focus();
     };
@@ -249,33 +259,87 @@ function buildField(field) {
     return wrap;
 }
 
-function renderForm(state) {
-    configForm.innerHTML = "";
-    baseline.clear();
-    for (const field of state.keys || []) {
-        configForm.appendChild(buildField(field));
+function getSelectedPreset() {
+    const id = fleetPresetSelect?.value;
+    if (!id || !editorState?.fleet_presets) {
+        return null;
     }
+    return editorState.fleet_presets.find((preset) => preset.id === id) || null;
 }
 
-function resetToEnvDefaults() {
-    if (!editorState) {
+function updatePresetHint() {
+    const preset = getSelectedPreset();
+    if (!fleetPresetHint) {
         return;
     }
+    if (!preset) {
+        fleetPresetHint.textContent = "";
+        return;
+    }
+    fleetPresetHint.textContent = preset.restore_only
+        ? `${preset.hint} — vuelve al default del .env del servidor.`
+        : preset.hint;
+}
+
+function renderFleetPresets(presets) {
+    if (!fleetPresetSelect || !fleetPresetBar) {
+        return;
+    }
+    fleetPresetSelect.innerHTML = "";
+    for (const preset of presets || []) {
+        const opt = document.createElement("option");
+        opt.value = preset.id;
+        opt.textContent = preset.label;
+        fleetPresetSelect.appendChild(opt);
+    }
+    fleetPresetBar.hidden = !(presets || []).length;
+    updatePresetHint();
+}
+
+function setFieldValue(field, value) {
+    const input = document.getElementById(`cfg-${field.key}`);
+    const wrap = configForm.querySelector(`[data-key="${field.key}"]`);
+    if (!input || !wrap) {
+        return;
+    }
+    input.value = formatValue(value);
+    const baselineValue = baseline.get(field.key);
+    wrap.classList.toggle("changed", !valuesEqual(value, baselineValue));
+}
+
+function loadPresetIntoForm(preset) {
+    if (!preset || !editorState) {
+        return 0;
+    }
+    const values = preset.values || {};
+    let touched = 0;
     for (const field of editorState.keys || []) {
-        const input = document.getElementById(`cfg-${field.key}`);
-        const wrap = configForm.querySelector(`[data-key="${field.key}"]`);
-        if (!input || !wrap) {
+        if (!(field.key in values)) {
             continue;
         }
-        const envVal = field.env_default;
-        if (field.type === "bool") {
-            input.value = formatValue(envVal) || "false";
-        } else {
-            input.value = formatValue(envVal);
+        const nextValue = values[field.key];
+        const baselineValue = baseline.get(field.key);
+        setFieldValue(field, nextValue);
+        if (!valuesEqual(nextValue, baselineValue)) {
+            touched += 1;
         }
-        wrap.classList.toggle("changed", !valuesEqual(envVal, field.effective ?? field.env_default));
     }
-    setFeedback("Formulario alineado a valores .env (sin guardar).", "info");
+    return touched;
+}
+
+function loadSelectedPreset() {
+    const preset = getSelectedPreset();
+    if (!preset) {
+        setFeedback("Selecciona un preset.", "error");
+        return;
+    }
+    const touched = loadPresetIntoForm(preset);
+    setFeedback(
+        touched
+            ? `Preset «${preset.label}» cargado (${touched} campo(s) distintos). Revisa y pulsa Aplicar preset.`
+            : `Preset «${preset.label}» cargado — ya coincide con la flota activa.`,
+        touched ? "info" : "ok",
+    );
 }
 
 function collectChanges() {
@@ -291,70 +355,84 @@ function collectChanges() {
     return changes;
 }
 
+async function applySelectedPreset() {
+    const preset = getSelectedPreset();
+    if (!preset) {
+        setFeedback("Selecciona un preset.", "error");
+        return;
+    }
+
+    const manualChanges = collectChanges();
+    const useManual = Object.keys(manualChanges).length > 0;
+
+    if (preset.restore_only && useManual) {
+        setFeedback("«Default (.env)» no admite ajustes manuales. Carga el preset de nuevo o elige otro.", "error");
+        return;
+    }
+
+    const confirmText = preset.restore_only
+        ? `¿Aplicar «${preset.label}»? Se eliminarán los overrides MySQL y volverás al .env.`
+        : useManual
+          ? `¿Aplicar ${Object.keys(manualChanges).length} cambio(s) manual(es) a toda la flota?`
+          : `¿Aplicar preset «${preset.label}» a toda la flota (${editorState?.fleet_size || "?"} pares)?`;
+    if (!window.confirm(confirmText)) {
+        return;
+    }
+
+    applyPresetBtn.disabled = true;
+    applyPresetBtn.textContent = "Aplicando…";
+    setFeedback("Guardando y recargando dashboards…", "info");
+    try {
+        let result;
+        if (useManual) {
+            result = await postJson("/api/config/apply-fleet", {
+                config_changes: manualChanges,
+                reason: `Config page manual (${preset.id})`,
+            });
+        } else {
+            result = await postJson("/api/config/apply-preset", {
+                preset_id: preset.id,
+                reason: `Config page preset: ${preset.id}`,
+            });
+        }
+        setFeedback(result.message || "Aplicado.", result.partial ? "error" : "ok");
+        await loadEditor();
+    } catch (error) {
+        setFeedback(error.message, "error");
+    } finally {
+        applyPresetBtn.disabled = false;
+        applyPresetBtn.textContent = "Aplicar preset";
+    }
+}
+
+function renderForm(state) {
+    configForm.innerHTML = "";
+    baseline.clear();
+    for (const field of state.keys || []) {
+        configForm.appendChild(buildField(field));
+    }
+}
+
 async function loadEditor() {
     statusNote.textContent = "Cargando configuración…";
     const state = await fetchJson("/api/config/editor");
     editorState = state;
     if (!state.enabled) {
         statusNote.textContent = "DB_ENABLED=false — activa MySQL para usar overrides.";
-        applyFleetBtn.disabled = true;
-        restoreFleetBtn.disabled = true;
+        setPresetControlsEnabled(false);
         return;
     }
+    setPresetControlsEnabled(true);
     statusNote.textContent = `Flota: ${state.fleet_size} par(es). ${state.fleet_symbols?.join(", ") || ""}`;
+    renderFleetPresets(state.fleet_presets);
     renderForm(state);
     renderOverridesSummary(state.overrides);
     renderPerSymbol(state.overrides);
 }
 
-async function applyFleet() {
-    const changes = collectChanges();
-    if (!Object.keys(changes).length) {
-        setFeedback("Modifica al menos un campo (borde azul) antes de aplicar.", "error");
-        return;
-    }
-    applyFleetBtn.disabled = true;
-    applyFleetBtn.textContent = "Aplicando…";
-    setFeedback("Guardando en MySQL y recargando dashboards…", "info");
-    try {
-        const result = await postJson("/api/config/apply-fleet", {
-            config_changes: changes,
-            reason: "Config page manual apply",
-        });
-        setFeedback(result.message || "Aplicado.", result.partial ? "error" : "ok");
-        await loadEditor();
-    } catch (error) {
-        setFeedback(error.message, "error");
-    } finally {
-        applyFleetBtn.disabled = false;
-        applyFleetBtn.textContent = "Aplicar a flota";
-    }
-}
-
-async function restoreFleet() {
-    if (!window.confirm("¿Restaurar todos los overrides de la flota a valores del .env?")) {
-        return;
-    }
-    restoreFleetBtn.disabled = true;
-    restoreFleetBtn.textContent = "Restaurando…";
-    setFeedback("Eliminando overrides MySQL…", "info");
-    try {
-        const result = await postJson("/api/config/restore-fleet", {
-            reason: "Config page restore to .env",
-        });
-        setFeedback(result.message || "Restaurado.", result.partial ? "error" : "ok");
-        await loadEditor();
-    } catch (error) {
-        setFeedback(error.message, "error");
-    } finally {
-        restoreFleetBtn.disabled = false;
-        restoreFleetBtn.textContent = "Restaurar .env";
-    }
-}
-
-applyFleetBtn?.addEventListener("click", applyFleet);
-restoreFleetBtn?.addEventListener("click", restoreFleet);
-resetFormBtn?.addEventListener("click", resetToEnvDefaults);
+loadPresetBtn?.addEventListener("click", loadSelectedPreset);
+applyPresetBtn?.addEventListener("click", applySelectedPreset);
+fleetPresetSelect?.addEventListener("change", updatePresetHint);
 
 loadEditor().catch((error) => {
     const msg = error.message || "Error al cargar";

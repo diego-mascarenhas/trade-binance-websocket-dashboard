@@ -15,8 +15,7 @@
                 <h1>Configuración de flota</h1>
                 <p class="subtitle">
                     Overrides en MySQL para todos los pares de <code>hub/pairs.json</code>.
-                    Misma lógica que <strong>Aplicar cambios</strong> en Analytics: guarda, recarga cada dashboard
-                    y deja el <code>.env</code> como respaldo (Restaurar).
+                    Elige un preset, revísalo en el formulario y aplícalo a toda la flota.
                 </p>
             </div>
             <div class="header-actions">
@@ -39,19 +38,16 @@
         </section>
 
         <section class="panel panel-wide">
-            <div class="panel-head">
+            <div class="panel-head panel-head-config">
                 <h2>Parámetros</h2>
-                <div class="panel-actions">
-                    <button class="btn" id="reset-form-btn" type="button">Valores .env</button>
-                    <button class="btn" id="restore-fleet-btn" type="button">Restaurar .env</button>
-                    <button class="btn btn-primary" id="apply-fleet-btn" type="button">Aplicar a flota</button>
+                <div class="fleet-preset-controls" id="fleet-preset-bar">
+                    <label class="fleet-preset-label" for="fleet-preset-select">Preset flota</label>
+                    <select id="fleet-preset-select" class="fleet-preset-select"></select>
+                    <button class="btn" id="load-preset-btn" type="button">Cargar preset</button>
+                    <button class="btn btn-primary" id="apply-preset-btn" type="button">Aplicar preset</button>
                 </div>
             </div>
-            <p class="note config-hint">
-                Solo se envían campos modificados (borde azul). Fuente actual:
-                <span class="tag tag-env">.env</span> o
-                <span class="tag tag-mysql">MySQL</span>.
-            </p>
+            <p class="note fleet-preset-hint" id="fleet-preset-hint"></p>
             <form id="config-form" class="config-form" autocomplete="off"></form>
             <p class="note" id="feedback-note" hidden></p>
         </section>

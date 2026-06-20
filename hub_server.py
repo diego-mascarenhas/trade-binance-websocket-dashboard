@@ -131,6 +131,31 @@ def config_restore_fleet():
     return _cors(jsonify(result)), status
 
 
+@app.route("/api/config/apply-preset", methods=["POST"])
+def config_apply_preset():
+    _config_page_guard()
+    payload = request.get_json(silent=True) or {}
+    preset_id = str(payload.get("preset_id") or "").strip()
+    if not preset_id:
+        return _cors(jsonify({"ok": False, "error": "preset_id required"})), 400
+
+    meta = symbol_config_admin.FLEET_PRESET_META.get(preset_id)
+    if not meta:
+        return _cors(jsonify({"ok": False, "error": f"Unknown preset: {preset_id}"})), 400
+
+    reason = payload.get("reason") or f"Config page preset: {preset_id}"
+    if meta.get("restore_only"):
+        result = symbol_config_admin.restore_fleet_to_env_defaults(reason=reason)
+    else:
+        values = symbol_config_admin.build_fleet_preset_values(preset_id)
+        if not values:
+            return _cors(jsonify({"ok": False, "error": f"Preset empty: {preset_id}"})), 400
+        result = symbol_config_admin.apply_fleet_config(values, reason=reason)
+
+    status = 200 if result.get("ok") or result.get("partial") else 400
+    return _cors(jsonify(result)), status
+
+
 @app.route("/analytics")
 def analytics_redirect():
     return redirect("/analytics/", code=302)
@@ -422,6 +447,12 @@ def help_page():
     return send_from_directory(HUB_DIR, "help.html")
 
 
+@app.route("/help/entradas")
+@app.route("/help/entradas/")
+def help_entradas_page():
+    return send_from_directory(HUB_DIR, "help-entradas.html")
+
+
 @app.route("/<path:filename>")
 def hub_static(filename: str):
     if filename.startswith("api/") or filename.startswith("analytics/") or filename.startswith("config/"):
@@ -439,6 +470,7 @@ def main() -> None:
         db_store.run_migrations()
     print(f"Hub http://{HOST}:{PORT}/")
     print(f"Help http://{HOST}:{PORT}/help")
+    print(f"Help entradas http://{HOST}:{PORT}/help/entradas")
     print(f"Analytics http://{HOST}:{PORT}/analytics/")
     if CONFIG_PAGE_TOKEN:
         print(f"Config http://{HOST}:{PORT}/config/?token=<CONFIG_PAGE_TOKEN>")
