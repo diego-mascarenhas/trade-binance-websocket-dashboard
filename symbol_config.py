@@ -29,6 +29,19 @@ OVERRIDABLE_KEYS: dict[str, Callable[[Any], Any]] = {
     "symbol_trading_enabled": lambda v: str(v).lower() in ("1", "true", "yes"),
 }
 
+_EXEC_BOOL = lambda v: str(v).lower() in ("1", "true", "yes")
+
+EXECUTION_OVERRIDABLE_KEYS: dict[str, Callable[[Any], Any]] = {
+    "POSITION_SIZE_USDT": float,
+    "OB_EXIT_ON_OPPOSITE": _EXEC_BOOL,
+    "OB_EXIT_REQUIRE_OB_REASON": _EXEC_BOOL,
+    "OB_EXIT_MIN_PROFIT_PCT": float,
+}
+
+
+def all_overridable_keys() -> dict[str, Callable[[Any], Any]]:
+    return {**OVERRIDABLE_KEYS, **EXECUTION_OVERRIDABLE_KEYS}
+
 _symbol_config_version: int = 0
 _symbol_trading_enabled: bool = True
 _cached_config_snapshot: dict[str, Any] = {}
@@ -64,7 +77,9 @@ def capture_env_defaults(module_globals: dict[str, Any]) -> None:
 
     import execution
 
-    _execution_env_defaults["POSITION_SIZE_USDT"] = execution.POSITION_SIZE_USDT
+    for key, caster in EXECUTION_OVERRIDABLE_KEYS.items():
+        if hasattr(execution, key):
+            _execution_env_defaults[key] = getattr(execution, key)
 
 
 def _reset_module_globals(module_globals: dict[str, Any]) -> None:
@@ -104,10 +119,10 @@ def _apply_overrides(module_globals: dict[str, Any], overrides: dict[str, Any]) 
 
     import execution
 
-    for key in ("POSITION_SIZE_USDT",):
+    for key, caster in EXECUTION_OVERRIDABLE_KEYS.items():
         if key in overrides:
             try:
-                execution.POSITION_SIZE_USDT = float(overrides[key])
+                setattr(execution, key, caster(overrides[key]))
                 applied.append(f"execution.{key}")
             except (TypeError, ValueError) as exc:
                 logger.warning("Invalid DB override %s: %s", key, exc)
@@ -213,6 +228,8 @@ def build_config_snapshot(module_globals: dict[str, Any]) -> dict[str, Any]:
     snapshot["trade_plan_dca_adverse_only"] = execution.TRADE_PLAN_DCA_ADVERSE_ONLY
     snapshot["trade_plan_auto_be"] = execution.TRADE_PLAN_AUTO_BE
     snapshot["trade_plan_partial_close_pct"] = execution.TRADE_PLAN_PARTIAL_CLOSE_PCT
+    snapshot["ob_exit_on_opposite"] = execution.OB_EXIT_ON_OPPOSITE
+    snapshot["ob_exit_min_profit_pct"] = execution.OB_EXIT_MIN_PROFIT_PCT
     return snapshot
 
 

@@ -2036,12 +2036,39 @@ def _attempt_signal_entry(
         )
         return
 
-    if effective_plan and effective_plan.get("active"):
-        entry_reasons = reasons
-        if filter_result.notes:
-            entry_reasons = f"{reasons} · {filter_result.notes}".strip(" · ")
+    entry_reasons = reasons
+    if filter_result.notes:
+        entry_reasons = f"{reasons} · {filter_result.notes}".strip(" · ")
+    if boost_info:
+        entry_reasons = f"{entry_reasons} · boost {boost_info.direction}".strip(" · ")
+
+    pos_dir = execution.get_open_position_direction(SYMBOL)
+    if pos_dir and signal != pos_dir:
+        ob_market = _decision_market_snapshot(
+            signal,
+            filter_result.confidence,
+            trend_bias,
+            analysis,
+        )
         if boost_info:
-            entry_reasons = f"{entry_reasons} · boost {boost_info.direction}".strip(" · ")
+            ob_market["trade_boost"] = boost_info.as_dict()
+        handled, triggered = execution.maybe_close_on_opposite_ob(
+            SYMBOL,
+            pos_dir,
+            signal,
+            entry_reasons,
+            ob_market,
+        )
+        if handled:
+            if triggered:
+                log_decision_event(
+                    "ob_signal_close",
+                    outcome="triggered",
+                    market_snapshot=ob_market,
+                )
+            return
+
+    if effective_plan and effective_plan.get("active"):
         record_valid_entry(
             signal,
             entry,

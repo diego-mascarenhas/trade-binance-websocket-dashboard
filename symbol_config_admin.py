@@ -32,6 +32,9 @@ CONFIG_KEY_LABELS: dict[str, str] = {
     "ADX_MIN_TREND": "ADX mínimo",
     "ADX_USE_HTF": "ADX en velas HTF",
     "symbol_trading_enabled": "Trading habilitado (par)",
+    "OB_EXIT_ON_OPPOSITE": "Cerrar en OB contrario",
+    "OB_EXIT_REQUIRE_OB_REASON": "OB exit solo con muro OB",
+    "OB_EXIT_MIN_PROFIT_PCT": "Beneficio mínimo OB exit (%)",
 }
 
 CONFIG_KEY_HELP: dict[str, str] = {
@@ -40,6 +43,9 @@ CONFIG_KEY_HELP: dict[str, str] = {
     "SIGNAL_DEBOUNCE_COUNT": "Ticks OB consecutivos antes de señal estable (0 = inmediato).",
     "ADX_USE_HTF": "Si true, ADX usa velas HTF; si false, usa 1m.",
     "symbol_trading_enabled": "false desactiva entradas en ese par.",
+    "OB_EXIT_ON_OPPOSITE": "Cierra la posición a mercado cuando llega señal OB del lado opuesto.",
+    "OB_EXIT_REQUIRE_OB_REASON": "Solo cierra con OB: near support/resistance (no señales 24h).",
+    "OB_EXIT_MIN_PROFIT_PCT": "0 = cierra siempre; >0 exige ese % de uPnL mínimo.",
 }
 
 # Suggested bounds for /config/ UI (more trades vs fewer/stricter).
@@ -215,6 +221,9 @@ SCALP_AGGRESSIVE_FLEET_VALUES: dict[str, Any] = {
     "ADX_MIN_TREND": 5.0,
     "ADX_USE_HTF": False,
     "symbol_trading_enabled": True,
+    "OB_EXIT_ON_OPPOSITE": True,
+    "OB_EXIT_REQUIRE_OB_REASON": True,
+    "OB_EXIT_MIN_PROFIT_PCT": 0.0,
 }
 
 SCALP_MODERATE_FLEET_VALUES: dict[str, Any] = {
@@ -235,6 +244,9 @@ SCALP_MODERATE_FLEET_VALUES: dict[str, Any] = {
     "ADX_MIN_TREND": 12.0,
     "ADX_USE_HTF": False,
     "symbol_trading_enabled": True,
+    "OB_EXIT_ON_OPPOSITE": True,
+    "OB_EXIT_REQUIRE_OB_REASON": True,
+    "OB_EXIT_MIN_PROFIT_PCT": 0.05,
 }
 
 
@@ -291,10 +303,24 @@ _BOOL_KEYS = frozenset(
         "ADX_FILTER_ENABLED",
         "ADX_USE_HTF",
         "symbol_trading_enabled",
+        "OB_EXIT_ON_OPPOSITE",
+        "OB_EXIT_REQUIRE_OB_REASON",
     }
 )
 
 _INT_KEYS = frozenset({"MIN_CONFIDENCE", "SIGNAL_DEBOUNCE_COUNT", "SIGNAL_COOLDOWN_SEC"})
+
+_FLOAT_KEYS = frozenset(
+    {
+        "MIN_PATTERN_RANGE_PCT",
+        "OB_WALL_RANGE_PCT",
+        "RSI_LONG_MAX",
+        "RSI_SHORT_MIN",
+        "ADX_MIN_TREND",
+        "OB_EXIT_MIN_PROFIT_PCT",
+        "POSITION_SIZE_USDT",
+    }
+)
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -305,11 +331,12 @@ def validate_config_changes(changes: dict[str, Any]) -> tuple[dict[str, Any], st
     if not isinstance(changes, dict) or not changes:
         return {}, "config_changes must be a non-empty object"
 
+    allowed = symbol_config.all_overridable_keys()
     validated: dict[str, Any] = {}
     for key, raw_value in changes.items():
-        if key not in symbol_config.OVERRIDABLE_KEYS:
+        if key not in allowed:
             return {}, f"Key not allowed: {key}"
-        caster = symbol_config.OVERRIDABLE_KEYS[key]
+        caster = allowed[key]
         try:
             validated[key] = caster(raw_value)
         except (TypeError, ValueError):
@@ -336,7 +363,7 @@ def _key_field_type(key: str) -> str:
         return "bool"
     if key in _INT_KEYS:
         return "int"
-    if key in ("MIN_PATTERN_RANGE_PCT", "OB_WALL_RANGE_PCT", "RSI_LONG_MAX", "RSI_SHORT_MIN", "ADX_MIN_TREND"):
+    if key in _FLOAT_KEYS:
         return "float"
     return "string"
 
@@ -354,7 +381,7 @@ def read_env_defaults() -> dict[str, Any]:
             raw[key.strip()] = value.strip().strip('"').strip("'")
 
     defaults: dict[str, Any] = {}
-    for key, caster in symbol_config.OVERRIDABLE_KEYS.items():
+    for key, caster in symbol_config.all_overridable_keys().items():
         if key not in raw:
             if key == "symbol_trading_enabled":
                 defaults[key] = True
@@ -373,7 +400,7 @@ def get_config_editor_state() -> dict[str, Any]:
     fleet_wide = fleet_status.get("fleet_wide") or {}
 
     keys: list[dict[str, Any]] = []
-    for key in symbol_config.OVERRIDABLE_KEYS:
+    for key in symbol_config.all_overridable_keys():
         env_val = env_defaults.get(key)
         effective = fleet_wide.get(key, env_val)
         source = "mysql_fleet" if key in fleet_wide else "env"
@@ -567,7 +594,7 @@ def plan_suggestions_restore(suggestions: list[dict[str, Any]]) -> dict[str, lis
         raw_changes = item.get("config_changes") or {}
         if not isinstance(raw_changes, dict) or not raw_changes:
             continue
-        keys = [key for key in raw_changes if key in symbol_config.OVERRIDABLE_KEYS]
+        keys = [key for key in raw_changes if key in symbol_config.all_overridable_keys()]
         if not keys:
             continue
 
@@ -810,8 +837,9 @@ def restore_config_keys(
         return {"ok": False, "error": "config_keys required"}
 
     allowed_keys: list[str] = []
+    allowed = symbol_config.all_overridable_keys()
     for key in config_keys:
-        if key not in symbol_config.OVERRIDABLE_KEYS:
+        if key not in allowed:
             return {"ok": False, "error": f"Key not allowed: {key}"}
         allowed_keys.append(key)
 
