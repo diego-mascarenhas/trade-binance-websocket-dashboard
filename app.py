@@ -3042,6 +3042,7 @@ def get_candles_df(*, refresh_execution: bool = True) -> pd.DataFrame:
     if refresh_execution:
         trail_anchor = None
         trail_candle_time = None
+        trail_candle_close = None
         if execution._trail_sl_enabled():
             closed_rows = [row for row in candles if row.get("x")]
             offset = max(1, int(execution.TRAIL_SL_CANDLE_OFFSET))
@@ -3049,9 +3050,11 @@ def get_candles_df(*, refresh_execution: bool = True) -> pd.DataFrame:
                 anchor_row = closed_rows[-offset]
                 try:
                     trail_anchor = float(anchor_row["o"])
+                    trail_candle_close = float(anchor_row["c"])
                     trail_candle_time = execution._trail_candle_time_key(anchor_row.get("t"))
                 except (TypeError, ValueError, KeyError):
                     trail_anchor = None
+                    trail_candle_close = None
                     trail_candle_time = None
         maintain_plan = resolved_trade_plan
         if not maintain_plan.get("active") and exposure.get("open"):
@@ -3071,6 +3074,7 @@ def get_candles_df(*, refresh_execution: bool = True) -> pd.DataFrame:
                 market_analysis=snapshot_market_analysis,
                 trail_anchor=trail_anchor,
                 trail_candle_time=trail_candle_time,
+                trail_candle_close=trail_candle_close,
             )
         else:
             execution.run_execution_maintenance(
@@ -3078,6 +3082,7 @@ def get_candles_df(*, refresh_execution: bool = True) -> pd.DataFrame:
                 market_analysis=snapshot_market_analysis,
                 trail_anchor=trail_anchor,
                 trail_candle_time=trail_candle_time,
+                trail_candle_close=trail_candle_close,
             )
     metrics["execution"] = {
         **execution.get_execution_status(),

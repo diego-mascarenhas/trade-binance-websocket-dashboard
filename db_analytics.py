@@ -132,12 +132,16 @@ def _flatten_row(row: dict[str, Any]) -> dict[str, Any]:
         "sl": market.get("sl"),
         "prev_sl": market.get("prev_sl"),
         "candle_open": market.get("candle_open"),
+        "candle_close": market.get("candle_close"),
         "unrealized_pnl_pct": market.get("unrealized_pnl_pct"),
         "trail_target": market.get("target"),
         "trail_current": market.get("current"),
         "trail_min_pct": market.get("min_pct"),
         "pnl_pct": market.get("pnl_pct"),
         "candle_time": market.get("candle_time"),
+        "trail_stage": market.get("stage"),
+        "in_profit": market.get("in_profit"),
+        "profit_gate_pct": market.get("profit_gate_pct"),
         "config_version": row.get("config_version"),
     }
 
@@ -580,7 +584,9 @@ def get_recent_events(
         params.append(symbol.upper())
     group = (event_group or "").strip().lower()
     if group == "trail":
-        where_parts.append("event_type IN ('trail_candle', 'trail_sl', 'trail_sl_skip')")
+        where_parts.append(
+            "event_type IN ('trail_candle', 'trail_sl', 'trail_sl_skip', 'trail_candle_diag')"
+        )
     elif group:
         where_parts.append("event_type = %s")
         params.append(group)

@@ -106,6 +106,7 @@ const EVENT_TYPE_COLORS = {
     trail_candle: "#a78bfa",
     trail_sl: "#22d3ee",
     trail_sl_skip: "#fbbf24",
+    trail_candle_diag: "#c4b5fd",
     ob_signal_close: "#fb7185",
 };
 
@@ -113,6 +114,7 @@ const EVENT_TYPE_LABELS = {
     trail_candle: "Trail vela",
     trail_sl: "Trail SL",
     trail_sl_skip: "Trail skip",
+    trail_candle_diag: "Trail diag",
     ob_signal_close: "OB close",
     valid_entry: "Valid entry",
     valid_entry_blocked: "Entry blocked",
@@ -748,9 +750,22 @@ function renderFilterCell(check) {
 function renderEventCell(row) {
     const type = row.event_type || "";
     const label = formatEventType(type);
-    const trailTypes = new Set(["trail_candle", "trail_sl", "trail_sl_skip"]);
+    const trailTypes = new Set(["trail_candle", "trail_sl", "trail_sl_skip", "trail_candle_diag"]);
     const cls = trailTypes.has(type) ? "event-cell event-trail" : "event-cell";
     return `<td class="${cls}" title="${escapeHtml(type)}">${escapeHtml(label)}</td>`;
+}
+
+function formatSlCandleBits(row) {
+    const open = row.candle_open;
+    const close = row.candle_close;
+    const parts = [];
+    if (close != null) {
+        parts.push(`c ${close}`);
+    }
+    if (open != null) {
+        parts.push(`o ${open}`);
+    }
+    return parts;
 }
 
 function renderTrailCell(row) {
@@ -758,11 +773,32 @@ function renderTrailCell(row) {
     const sl = row.sl;
     const prev = row.prev_sl;
     const open = row.candle_open;
+    const close = row.candle_close;
     const pnl = row.unrealized_pnl_pct ?? row.pnl_pct;
     const target = row.trail_target;
     const current = row.trail_current;
-    const minPct = row.trail_min_pct;
+    const minPct = row.trail_min_pct ?? row.profit_gate_pct;
+    const candleBits = formatSlCandleBits(row);
 
+    if (type === "trail_candle_diag") {
+        const stage = row.trail_stage || "diag";
+        const parts = [...candleBits];
+        if (pnl != null) {
+            parts.push(`${pnl}%`);
+        }
+        if (row.in_profit === true || row.in_profit === 1 || row.in_profit === "true") {
+            parts.push("≥ gate");
+        } else if (row.in_profit === false || row.in_profit === 0 || row.in_profit === "false") {
+            parts.push("< gate");
+        }
+        if (row.block_reason) {
+            parts.push(row.block_reason);
+        } else if (stage !== "eval") {
+            parts.push(stage);
+        }
+        const cls = row.in_profit ? "trail-cell trail-applied" : "trail-cell trail-skip";
+        return `<td class="${cls}" title="${escapeHtml(stage)}">${escapeHtml(parts.join(" · ") || stage)}</td>`;
+    }
     if (type === "trail_sl") {
         const parts = [];
         if (sl) {
@@ -773,40 +809,34 @@ function renderTrailCell(row) {
         if (prev) {
             parts.push(`was ${prev}`);
         }
-        if (open != null) {
-            parts.push(`open ${open}`);
-        }
+        parts.push(...candleBits);
         if (pnl != null) {
             parts.push(`${pnl}%`);
         }
         return `<td class="trail-cell trail-applied" title="SL trailado">${escapeHtml(parts.join(" · "))}</td>`;
     }
     if (type === "trail_candle") {
-        const parts = ["vela cerrada"];
-        if (open != null) {
-            parts.push(`open ${open}`);
-        }
+        const parts = ["vela 1m"];
+        parts.push(...candleBits);
         if (pnl != null) {
             parts.push(`${pnl}%`);
         }
         if (row.signal) {
             parts.push(String(row.signal));
         }
-        return `<td class="trail-cell" title="Evaluación trailing por vela">${escapeHtml(parts.join(" · "))}</td>`;
+        return `<td class="trail-cell" title="Evaluación por cierre de vela">${escapeHtml(parts.join(" · "))}</td>`;
     }
     if (type === "trail_sl_skip") {
         const reason = row.block_reason || "skip";
-        let detail = reason;
+        const parts = [reason, ...candleBits];
         if (reason === "profit_gate" && minPct != null && pnl != null) {
-            detail += ` · pnl ${pnl}% < min ${minPct}%`;
+            parts.push(`pnl ${pnl}% < ${minPct}%`);
         } else if (target != null && current != null) {
-            detail += ` · tgt ${target} · cur ${current}`;
-        } else if (open != null) {
-            detail += ` · open ${open}`;
+            parts.push(`tgt ${target} · cur ${current}`);
         } else if (pnl != null) {
-            detail += ` · pnl ${pnl}%`;
+            parts.push(`${pnl}%`);
         }
-        return `<td class="trail-cell trail-skip" title="${escapeHtml(reason)}">${escapeHtml(detail)}</td>`;
+        return `<td class="trail-cell trail-skip" title="${escapeHtml(reason)}">${escapeHtml(parts.join(" · "))}</td>`;
     }
     if (sl) {
         return `<td class="trail-cell">${escapeHtml(String(sl))}</td>`;

@@ -121,6 +121,7 @@ CLOSE_RSI_REQUIRE_PROFIT = _env_bool("CLOSE_RSI_REQUIRE_PROFIT", "true")
 TRAIL_SL_ENABLED = _env_bool("TRAIL_SL_ENABLED", "false")
 TRAIL_SL_FEE_PCT = float(os.getenv("TRAIL_SL_FEE_PCT", "0.10"))
 TRAIL_SL_CANDLE_OFFSET = max(1, int(os.getenv("TRAIL_SL_CANDLE_OFFSET", "1")))
+TRAIL_CANDLE_DIAG_LOG = _env_bool("TRAIL_CANDLE_DIAG_LOG", "true")
 
 
 def _rsi_close_enabled() -> bool:
@@ -3490,6 +3491,88 @@ def _clear_trail_candle_tracking(symbol: str) -> None:
         _last_trail_candle_time.pop(symbol.upper(), None)
 
 
+def _candle_field_float(candle: dict[str, Any], key: str) -> float | None:
+    try:
+        value = float(candle[key])
+    except (TypeError, ValueError, KeyError):
+        return None
+    return value if value > 0 else None
+
+
+def _candle_log_fields(candle: dict[str, Any]) -> dict[str, Any]:
+    """OHLC + time for trail diagnostics."""
+    fields: dict[str, Any] = {
+        "candle_time": _trail_candle_time_key(candle.get("t")),
+    }
+    for src, dest in (("o", "candle_open"), ("c", "candle_close"), ("h", "candle_high"), ("l", "candle_low")):
+        value = _candle_field_float(candle, src)
+        if value is not None:
+            fields[dest] = value
+    return fields
+
+
+def _log_trail_candle_diag(
+    symbol: str,
+    stage: str,
+    *,
+    reason: str | None = None,
+    snapshot: dict[str, Any] | None = None,
+    **fields: Any,
+) -> None:
+    """Per-candle trail diagnostics when a position is open (orders.log)."""
+    if not TRAIL_CANDLE_DIAG_LOG or not _trail_sl_enabled():
+        return
+
+    symbol = symbol.upper()
+    snap = snapshot
+    if snap is None:
+        snap = get_exchange_exposure(symbol)
+    if not snap.get("open"):
+        return
+
+    payload: dict[str, Any] = {
+        "symbol": symbol,
+        "stage": stage,
+        "trail_enabled": True,
+        "scalper_mode": SCALPER_MODE,
+        "position_open": True,
+    }
+    if reason:
+        payload["reason"] = reason
+    if snap.get("direction"):
+        payload["direction"] = snap.get("direction")
+    if snap.get("entry") is not None:
+        payload["entry"] = snap.get("entry")
+    _attach_unrealized_pnl_pct(snap)
+    pnl_pct = snap.get("unrealized_pnl_pct")
+    if pnl_pct is not None:
+        payload["unrealized_pnl_pct"] = pnl_pct
+        payload["in_profit"] = float(pnl_pct) > TRAIL_SL_FEE_PCT
+        payload["profit_gate_pct"] = TRAIL_SL_FEE_PCT
+    for key, value in fields.items():
+        if value is not None:
+            payload[key] = value
+    _append_orders_log("trail_candle_diag", **payload)
+    if stage in ("eval", "execute_skip", "schedule_skip"):
+        market_snapshot = {
+            "signal": payload.get("direction"),
+            "candle_open": payload.get("candle_open"),
+            "candle_close": payload.get("candle_close"),
+            "candle_time": payload.get("candle_time"),
+            "unrealized_pnl_pct": payload.get("unrealized_pnl_pct"),
+            "stage": stage,
+            "in_profit": payload.get("in_profit"),
+            "profit_gate_pct": payload.get("profit_gate_pct"),
+        }
+        _log_execution_decision(
+            symbol,
+            "trail_candle_diag",
+            outcome="skipped" if reason else "live",
+            block_reason=reason,
+            market_snapshot={k: v for k, v in market_snapshot.items() if v is not None},
+        )
+
+
 def _log_trail_sl_skip(
     symbol: str,
     reason: str,
@@ -3499,11 +3582,12 @@ def _log_trail_sl_skip(
 ) -> None:
     """Throttled diagnostic when trailing does not move the stop."""
     symbol = symbol.upper()
-    key = f"{symbol}:{reason}"
+    candle_time = details.get("candle_time")
+    key = f"{symbol}:{reason}:{candle_time}" if candle_time else f"{symbol}:{reason}"
     now = time.monotonic()
     with _maintenance_lock:
         last = _last_trail_skip_log.get(key, 0.0)
-        throttled = now - last < TRAIL_SKIP_LOG_SEC
+        throttled = False if candle_time else now - last < TRAIL_SKIP_LOG_SEC
         if not throttled:
             _last_trail_skip_log[key] = now
     if not throttled:
@@ -3531,6 +3615,7 @@ def maybe_trail_sl(
     candle_open: float | None,
     *,
     candle_time: str | None = None,
+    candle_close: float | None = None,
 ) -> bool:
     """Ratchet the SL toward the reference candle open once in profit (net of fees).
 
@@ -3541,221 +3626,295 @@ def maybe_trail_sl(
         return False
     if _trail_candle_already_done(symbol, candle_time):
         return True
-    if not EXECUTION_ENABLED or telegram.is_trading_paused() or EXECUTION_MODE != "live":
-        _log_trail_sl_skip(
-            symbol, "execution_off", log_decision=bool(candle_time), mode=EXECUTION_MODE
-        )
-        return False
-    if not _keys_configured() or not REST_PLACE_SL_TP:
-        _log_trail_sl_skip(
-            symbol,
-            "sl_tp_disabled",
-            log_decision=bool(candle_time),
-            rest_place=REST_PLACE_SL_TP,
-        )
-        return False
-    if not snapshot.get("open"):
-        return False
 
-    direction = _primary_position_direction(snapshot.get("direction"))
-    if direction not in ("LONG", "SHORT"):
-        _log_trail_sl_skip(
-            symbol,
-            "no_direction",
-            log_decision=bool(candle_time),
-            direction=snapshot.get("direction"),
-        )
-        return False
+    skip_common = {
+        "candle_time": candle_time,
+        "candle_open": candle_open,
+        "candle_close": candle_close,
+    }
 
-    ctx = _get_trade_context(symbol)
-    entry_raw = snapshot.get("entry") or ctx.get("entry")
     try:
-        entry = float(entry_raw) if entry_raw not in (None, "") else 0.0
-    except (TypeError, ValueError):
-        entry = 0.0
-    if entry <= 0:
-        _log_trail_sl_skip(
-            symbol, "no_entry", log_decision=bool(candle_time), entry=entry_raw
-        )
-        return False
-
-    _attach_unrealized_pnl_pct(snapshot)
-    try:
-        pnl_pct = float(snapshot.get("unrealized_pnl_pct") or 0)
-    except (TypeError, ValueError):
-        pnl_pct = 0.0
-
-    # Not yet profitable after round-trip fees → let BE/structural handle it.
-    if pnl_pct <= TRAIL_SL_FEE_PCT:
-        _log_trail_sl_skip(
-            symbol,
-            "profit_gate",
-            log_decision=bool(candle_time),
-            pnl_pct=pnl_pct,
-            min_pct=TRAIL_SL_FEE_PCT,
-            direction=direction,
-        )
-        return False
-
-    symbol = symbol.upper()
-    if candle_open is None or candle_open <= 0:
-        _log_trail_sl_skip(
-            symbol,
-            "no_candle_anchor",
-            log_decision=bool(candle_time),
-            pnl_pct=pnl_pct,
-            direction=direction,
-        )
-        return False
-
-    # Trailing now owns the SL; mark be_applied so reconcile/static-BE won't fight it.
-    _update_trade_context(symbol, be_applied=True)
-
-    fee = TRAIL_SL_FEE_PCT / 100.0
-    if direction == "LONG":
-        be_floor = entry * (1 + fee)
-        target = max(float(candle_open), be_floor)
-    else:
-        be_floor = entry * (1 - fee)
-        target = min(float(candle_open), be_floor)
-
-    target = _ensure_sl_behind_mark(symbol, direction, target)
-    sl_price = round_price_for_profit_sl(symbol, direction, target)
-    target_f = float(sl_price)
-    if target_f <= 0:
-        return True
-
-    current = _get_sl_trigger_from_orders(symbol, direction)
-    if current and current > 0:
-        if direction == "LONG" and target_f <= current:
+        if not EXECUTION_ENABLED or telegram.is_trading_paused() or EXECUTION_MODE != "live":
             _log_trail_sl_skip(
                 symbol,
-                "ratchet",
+                "execution_off",
                 log_decision=bool(candle_time),
-                direction=direction,
-                target=target_f,
-                current=current,
-                candle_open=candle_open,
+                mode=EXECUTION_MODE,
+                **skip_common,
             )
-            return True
-        if direction == "SHORT" and target_f >= current:
+            return False
+        if not _keys_configured() or not REST_PLACE_SL_TP:
             _log_trail_sl_skip(
                 symbol,
-                "ratchet",
+                "sl_tp_disabled",
                 log_decision=bool(candle_time),
-                direction=direction,
-                target=target_f,
-                current=current,
-                candle_open=candle_open,
+                rest_place=REST_PLACE_SL_TP,
+                **skip_common,
             )
-            return True
-        if abs(target_f - current) / current * 100 < SL_REPRICE_TOLERANCE_PCT:
+            return False
+        if not snapshot.get("open"):
+            return False
+
+        direction = _primary_position_direction(snapshot.get("direction"))
+        if direction not in ("LONG", "SHORT"):
             _log_trail_sl_skip(
                 symbol,
-                "tolerance",
+                "no_direction",
                 log_decision=bool(candle_time),
-                direction=direction,
-                target=target_f,
-                current=current,
-                tolerance_pct=SL_REPRICE_TOLERANCE_PCT,
+                direction=snapshot.get("direction"),
+                **skip_common,
             )
-            return True
+            return False
 
-    qty = _position_qty_string(symbol, direction)
-    if not qty:
-        return True
-
-    # Never cancel the live stop until we know the replacement is placeable.
-    mark = _get_mark_price(symbol)
-    try:
-        sl_val = float(sl_price)
-    except (TypeError, ValueError):
-        sl_val = 0.0
-    if mark is not None and sl_val > 0 and _sl_would_trigger_immediately(direction, sl_val, mark):
-        adjusted = round_price_for_sl(
-            symbol, direction, _ensure_sl_behind_mark(symbol, direction, sl_val)
-        )
+        ctx = _get_trade_context(symbol)
+        entry_raw = snapshot.get("entry") or ctx.get("entry")
         try:
-            sl_val = float(adjusted)
-            sl_price = adjusted
+            entry = float(entry_raw) if entry_raw not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            entry = 0.0
+        if entry <= 0:
+            _log_trail_sl_skip(
+                symbol,
+                "no_entry",
+                log_decision=bool(candle_time),
+                entry=entry_raw,
+                **skip_common,
+            )
+            return False
+
+        _attach_unrealized_pnl_pct(snapshot)
+        try:
+            pnl_pct = float(snapshot.get("unrealized_pnl_pct") or 0)
+        except (TypeError, ValueError):
+            pnl_pct = 0.0
+
+        _log_trail_candle_diag(
+            symbol,
+            "eval",
+            snapshot=snapshot,
+            pnl_pct=pnl_pct,
+            in_profit=pnl_pct > TRAIL_SL_FEE_PCT,
+            profit_gate_pct=TRAIL_SL_FEE_PCT,
+            **skip_common,
+        )
+
+        # Not yet profitable after round-trip fees → let BE/structural handle it.
+        if pnl_pct <= TRAIL_SL_FEE_PCT:
+            _log_trail_sl_skip(
+                symbol,
+                "profit_gate",
+                log_decision=bool(candle_time),
+                pnl_pct=pnl_pct,
+                min_pct=TRAIL_SL_FEE_PCT,
+                direction=direction,
+                **skip_common,
+            )
+            return False
+
+        symbol = symbol.upper()
+        if candle_open is None or candle_open <= 0:
+            _log_trail_sl_skip(
+                symbol,
+                "no_candle_anchor",
+                log_decision=bool(candle_time),
+                pnl_pct=pnl_pct,
+                direction=direction,
+                **skip_common,
+            )
+            return False
+
+        # Trailing now owns the SL; mark be_applied so reconcile/static-BE won't fight it.
+        _update_trade_context(symbol, be_applied=True)
+
+        fee = TRAIL_SL_FEE_PCT / 100.0
+        if direction == "LONG":
+            be_floor = entry * (1 + fee)
+            target = max(float(candle_open), be_floor)
+        else:
+            be_floor = entry * (1 - fee)
+            target = min(float(candle_open), be_floor)
+
+        target = _ensure_sl_behind_mark(symbol, direction, target)
+        sl_price = round_price_for_profit_sl(symbol, direction, target)
+        target_f = float(sl_price)
+        if target_f <= 0:
+            return True
+
+        current = _get_sl_trigger_from_orders(symbol, direction)
+        if current and current > 0:
+            if direction == "LONG" and target_f <= current:
+                _log_trail_sl_skip(
+                    symbol,
+                    "ratchet",
+                    log_decision=bool(candle_time),
+                    direction=direction,
+                    target=target_f,
+                    current=current,
+                    **skip_common,
+                )
+                return True
+            if direction == "SHORT" and target_f >= current:
+                _log_trail_sl_skip(
+                    symbol,
+                    "ratchet",
+                    log_decision=bool(candle_time),
+                    direction=direction,
+                    target=target_f,
+                    current=current,
+                    **skip_common,
+                )
+                return True
+            if abs(target_f - current) / current * 100 < SL_REPRICE_TOLERANCE_PCT:
+                _log_trail_sl_skip(
+                    symbol,
+                    "tolerance",
+                    log_decision=bool(candle_time),
+                    direction=direction,
+                    target=target_f,
+                    current=current,
+                    tolerance_pct=SL_REPRICE_TOLERANCE_PCT,
+                    **skip_common,
+                )
+                return True
+
+        qty = _position_qty_string(symbol, direction)
+        if not qty:
+            return True
+
+        # Never cancel the live stop until we know the replacement is placeable.
+        mark = _get_mark_price(symbol)
+        try:
+            sl_val = float(sl_price)
         except (TypeError, ValueError):
             sl_val = 0.0
-    if mark is not None and sl_val > 0 and _sl_would_trigger_immediately(direction, sl_val, mark):
-        _log_trail_sl_skip(
-            symbol,
-            "immediate_trigger",
-            log_decision=bool(candle_time),
-            direction=direction,
-            sl=sl_price,
-            mark=mark,
-        )
-        return True
+        if mark is not None and sl_val > 0 and _sl_would_trigger_immediately(direction, sl_val, mark):
+            adjusted = round_price_for_sl(
+                symbol, direction, _ensure_sl_behind_mark(symbol, direction, sl_val)
+            )
+            try:
+                sl_val = float(adjusted)
+                sl_price = adjusted
+            except (TypeError, ValueError):
+                sl_val = 0.0
+        if mark is not None and sl_val > 0 and _sl_would_trigger_immediately(direction, sl_val, mark):
+            _log_trail_sl_skip(
+                symbol,
+                "immediate_trigger",
+                log_decision=bool(candle_time),
+                direction=direction,
+                sl=sl_price,
+                mark=mark,
+                **skip_common,
+            )
+            return True
 
-    _cancel_symbol_sl_orders(symbol, direction)
-    placed, skipped = _place_sl_for_position(symbol, direction, sl_price, qty, log_suffix="_trail")
-    if placed:
-        _invalidate_position_cache(symbol)
-        first_takeover = not ctx.get("trail_notified")
-        _append_orders_log(
-            "trail_sl_applied",
-            symbol=symbol,
-            direction=direction,
-            entry=entry,
-            sl=sl_price,
-            candle_open=candle_open,
-            unrealized_pnl_pct=pnl_pct,
-            prev_sl=current,
-            qty=qty,
-            takeover=first_takeover,
-        )
-        _log_execution_decision(
-            symbol,
-            "trail_sl",
-            outcome="live",
-            market_snapshot={
-                "signal": direction,
-                "sl": sl_price,
-                "prev_sl": current,
-                "candle_open": candle_open,
-                "unrealized_pnl_pct": pnl_pct,
-            },
-        )
-        if first_takeover:
-            _update_trade_context(symbol, trail_notified=True)
-            telegram.notify_trail_started(symbol, direction, sl_price, pnl_pct)
-    elif not skipped:
-        logger.warning("%s: trail SL placement failed", symbol)
-    return True
+        _cancel_symbol_sl_orders(symbol, direction)
+        placed, skipped = _place_sl_for_position(symbol, direction, sl_price, qty, log_suffix="_trail")
+        if placed:
+            _invalidate_position_cache(symbol)
+            first_takeover = not ctx.get("trail_notified")
+            _append_orders_log(
+                "trail_sl_applied",
+                symbol=symbol,
+                direction=direction,
+                entry=entry,
+                sl=sl_price,
+                candle_open=candle_open,
+                candle_close=candle_close,
+                unrealized_pnl_pct=pnl_pct,
+                prev_sl=current,
+                qty=qty,
+                takeover=first_takeover,
+            )
+            _log_execution_decision(
+                symbol,
+                "trail_sl",
+                outcome="live",
+                market_snapshot={
+                    "signal": direction,
+                    "sl": sl_price,
+                    "prev_sl": current,
+                    "candle_open": candle_open,
+                    "candle_close": candle_close,
+                    "unrealized_pnl_pct": pnl_pct,
+                },
+            )
+            if first_takeover:
+                _update_trade_context(symbol, trail_notified=True)
+                telegram.notify_trail_started(symbol, direction, sl_price, pnl_pct)
+        elif not skipped:
+            logger.warning("%s: trail SL placement failed", symbol)
+        return True
+    finally:
+        if candle_time:
+            _mark_trail_candle_done(symbol, candle_time)
 
 
 def _execute_trail_on_candle_close(
     symbol: str,
     candle_open: float,
     candle_time: str,
+    candle_close: float | None = None,
 ) -> None:
     """Run trailing SL for one closed LTF candle (open price anchor)."""
     if not _trail_sl_enabled():
         return
     symbol = symbol.upper()
     if _trail_candle_already_done(symbol, candle_time):
+        _log_trail_candle_diag(
+            symbol,
+            "execute_skip",
+            reason="already_done",
+            candle_time=candle_time,
+            candle_open=candle_open,
+            candle_close=candle_close,
+        )
         return
     if not EXECUTION_ENABLED or telegram.is_trading_paused() or EXECUTION_MODE != "live":
+        _log_trail_candle_diag(
+            symbol,
+            "execute_skip",
+            reason="execution_off",
+            candle_time=candle_time,
+            candle_open=candle_open,
+            candle_close=candle_close,
+            mode=EXECUTION_MODE,
+        )
         return
     if not _keys_configured() or not REST_PLACE_SL_TP:
+        _log_trail_candle_diag(
+            symbol,
+            "execute_skip",
+            reason="sl_tp_disabled",
+            candle_time=candle_time,
+            candle_open=candle_open,
+            candle_close=candle_close,
+        )
         return
 
-    _append_orders_log(
-        "trail_candle_close",
-        symbol=symbol,
-        candle_open=candle_open,
-        candle_time=candle_time,
-    )
     snapshot = _fetch_exchange_exposure(symbol)
     if not snapshot.get("open"):
         return
 
     direction = _primary_position_direction(snapshot.get("direction"))
     _attach_unrealized_pnl_pct(snapshot)
+    _append_orders_log(
+        "trail_candle_close",
+        symbol=symbol,
+        candle_open=candle_open,
+        candle_close=candle_close,
+        candle_time=candle_time,
+        unrealized_pnl_pct=snapshot.get("unrealized_pnl_pct"),
+        direction=direction,
+    )
+    _log_trail_candle_diag(
+        symbol,
+        "execute",
+        snapshot=snapshot,
+        candle_time=candle_time,
+        candle_open=candle_open,
+        candle_close=candle_close,
+    )
     _log_execution_decision(
         symbol,
         "trail_candle",
@@ -3763,48 +3922,56 @@ def _execute_trail_on_candle_close(
         market_snapshot={
             "signal": direction,
             "candle_open": candle_open,
+            "candle_close": candle_close,
             "candle_time": candle_time,
             "unrealized_pnl_pct": snapshot.get("unrealized_pnl_pct"),
             "entry": snapshot.get("entry"),
         },
     )
 
-    try:
-        maybe_trail_sl(
-            symbol,
-            snapshot,
-            candle_open,
-            candle_time=candle_time,
-        )
-    finally:
-        _mark_trail_candle_done(symbol, candle_time)
+    maybe_trail_sl(
+        symbol,
+        snapshot,
+        candle_open,
+        candle_time=candle_time,
+        candle_close=candle_close,
+    )
 
 
 def schedule_trail_on_candle_close(symbol: str, candle: dict[str, Any]) -> bool:
     """Enqueue trailing SL on each closed LTF candle (bypasses maintenance throttle)."""
+    metrics = _candle_log_fields(candle)
     if not _trail_sl_enabled():
         return False
     if not candle.get("x"):
         return False
-    candle_time = _trail_candle_time_key(candle.get("t"))
+    candle_time = metrics.get("candle_time") or _trail_candle_time_key(candle.get("t"))
     if _trail_candle_already_done(symbol, candle_time):
+        _log_trail_candle_diag(symbol, "schedule_skip", reason="already_done", **metrics)
         return False
     try:
         candle_open = float(candle["o"])
     except (TypeError, ValueError, KeyError):
-        _log_trail_sl_skip(symbol, "no_candle_anchor", candle=candle.get("t"))
+        _log_trail_sl_skip(symbol, "no_candle_anchor", candle=candle.get("t"), **metrics)
         return False
     if candle_open <= 0:
         return False
+    candle_close = metrics.get("candle_close")
 
-    return _run_execution_thread(
+    scheduled = _run_execution_thread(
         _execute_trail_on_candle_close,
         symbol,
         candle_open,
         candle_time,
+        candle_close,
         bypass_cooldown=True,
         thread_name=f"exec-trail-candle-{symbol.upper()}",
     )
+    if scheduled:
+        _log_trail_candle_diag(symbol, "schedule_enqueued", scheduled=True, **metrics)
+    else:
+        _log_trail_candle_diag(symbol, "schedule_skip", reason="inflight_or_cooldown", **metrics)
+    return scheduled
 
 
 def run_execution_maintenance(
@@ -3816,6 +3983,7 @@ def run_execution_maintenance(
     market_analysis: dict[str, Any] | None = None,
     trail_anchor: float | None = None,
     trail_candle_time: str | None = None,
+    trail_candle_close: float | None = None,
 ) -> None:
     """Periodic: cancel stale entry limits; repair missing SL/TP on open positions."""
     if not EXECUTION_ENABLED or not _keys_configured() or EXECUTION_MODE != "live":
@@ -3840,9 +4008,9 @@ def run_execution_maintenance(
                 snapshot,
                 trail_anchor,
                 candle_time=trail_candle_time,
+                candle_close=trail_candle_close,
             )
-            if trail_candle_time:
-                _mark_trail_candle_done(symbol, trail_candle_time)
+            # Per-candle dedup is owned by maybe_trail_sl (WS schedule path).
             # In scalper trailing mode the candle-trail is the SOLE SL manager: the old
             # break-even/profit-lock path is disabled so they never coexist.
             if not trail_owns and not _trail_sl_enabled():

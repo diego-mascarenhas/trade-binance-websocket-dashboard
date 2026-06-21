@@ -60,6 +60,7 @@
                     <option value="trail_candle">Trail vela (trigger)</option>
                     <option value="trail_sl">Trail SL aplicado</option>
                     <option value="trail_sl_skip">Trail skip</option>
+                    <option value="trail_candle_diag">Trail diag (eval)</option>
                 </select>
             </div>
         </section>
@@ -139,7 +140,7 @@
                             <th>Event</th>
                             <th>Outcome</th>
                             <th>Block</th>
-                            <th title="Trailing SL por vela: SL nuevo, open de vela, skip">Trail SL</th>
+                            <th title="SL por vela: close/open, uPnL, movimiento o motivo de skip">SL</th>
                             <th>Signal</th>
                             <th class="filter-col" title="Confianza vs MIN_CONFIDENCE">Conf</th>
                             <th class="filter-col" title="RSI vs RSI_LONG_MAX / RSI_SHORT_MIN">RSI</th>
@@ -158,8 +159,8 @@
                 gris = filtro off o N/A.
                 Borde ámbar = motivo registrado en <code>Block</code>.
                 Evalúa todos los filtros en la fila (no solo el primero que falló).
-                <strong>Trail por vela</strong>: filtra <code>trail_candle</code> (cierre de vela con posición),
-                <code>trail_sl</code> (SL movido) y <code>trail_sl_skip</code> (no movió: profit_gate, ratchet, etc.).
+                <strong>SL</strong>: close/open de vela 1m, uPnL, SL nuevo o motivo (<code>profit_gate</code>, <code>ratchet</code>, …).
+                Filtro <strong>Trail por vela</strong> incluye <code>trail_candle_diag</code>.
             </p>
         </section>
 
