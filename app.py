@@ -2804,6 +2804,7 @@ async def ws_loop() -> None:
                                         forming_candle = row
                                         if row["x"]:
                                             candles.append(row)
+                                            execution.schedule_trail_on_candle_close(SYMBOL, row)
                                         if orderbook.get("bids") and orderbook.get("asks"):
                                             update_metrics(
                                                 orderbook["bids"],
@@ -3040,14 +3041,18 @@ def get_candles_df(*, refresh_execution: bool = True) -> pd.DataFrame:
     exposure = execution.get_exchange_exposure(SYMBOL)
     if refresh_execution:
         trail_anchor = None
+        trail_candle_time = None
         if execution._trail_sl_enabled():
             closed_rows = [row for row in candles if row.get("x")]
             offset = max(1, int(execution.TRAIL_SL_CANDLE_OFFSET))
             if len(closed_rows) >= offset:
+                anchor_row = closed_rows[-offset]
                 try:
-                    trail_anchor = float(closed_rows[-offset]["o"])
+                    trail_anchor = float(anchor_row["o"])
+                    trail_candle_time = execution._trail_candle_time_key(anchor_row.get("t"))
                 except (TypeError, ValueError, KeyError):
                     trail_anchor = None
+                    trail_candle_time = None
         maintain_plan = resolved_trade_plan
         if not maintain_plan.get("active") and exposure.get("open"):
             maintain_plan = trade_plan_for_position_reconcile(
@@ -3065,12 +3070,14 @@ def get_candles_df(*, refresh_execution: bool = True) -> pd.DataFrame:
                 tp=float(maintain_plan["tp1"]) if maintain_plan.get("tp1") else None,
                 market_analysis=snapshot_market_analysis,
                 trail_anchor=trail_anchor,
+                trail_candle_time=trail_candle_time,
             )
         else:
             execution.run_execution_maintenance(
                 SYMBOL,
                 market_analysis=snapshot_market_analysis,
                 trail_anchor=trail_anchor,
+                trail_candle_time=trail_candle_time,
             )
     metrics["execution"] = {
         **execution.get_execution_status(),

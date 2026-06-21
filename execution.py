@@ -137,6 +137,7 @@ _status_lock = threading.Lock()
 _maintenance_lock = threading.Lock()
 _last_maintenance: dict[str, float] = {}
 _last_trail_skip_log: dict[str, float] = {}
+_last_trail_candle_time: dict[str, str] = {}
 TRAIL_SKIP_LOG_SEC = 300.0
 _fleet_exposure_lock = threading.Lock()
 _fleet_exposure_cache: tuple[float, dict[str, Any]] | None = None
@@ -357,8 +358,11 @@ def dca_legs_placed(symbol: str) -> int:
 
 
 def reset_dca_state(symbol: str) -> None:
+    symbol = symbol.upper()
+    with _maintenance_lock:
+        _last_trail_candle_time.pop(symbol, None)
     _update_trade_context(
-        symbol.upper(),
+        symbol,
         dca_legs_placed=0,
         dca_max_legs=0,
         be_applied=False,
@@ -990,6 +994,7 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
             "%s: position flat but no recent realized fill (was_open stale or already notified)",
             symbol,
         )
+        _clear_trail_candle_tracking(symbol)
         _update_trade_context(
             symbol,
             was_open=False,
@@ -1023,6 +1028,7 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
         ctx=ctx,
     )
 
+    _clear_trail_candle_tracking(symbol)
     _update_trade_context(
         symbol,
         was_open=False,
@@ -3459,6 +3465,31 @@ def _trail_sl_enabled() -> bool:
     return SCALPER_MODE and TRAIL_SL_ENABLED
 
 
+def _trail_candle_time_key(candle_time: Any) -> str:
+    return str(candle_time)
+
+
+def _trail_candle_already_done(symbol: str, candle_time: str | None) -> bool:
+    if not candle_time:
+        return False
+    symbol = symbol.upper()
+    with _maintenance_lock:
+        return _last_trail_candle_time.get(symbol) == candle_time
+
+
+def _mark_trail_candle_done(symbol: str, candle_time: str | None) -> None:
+    if not candle_time:
+        return
+    symbol = symbol.upper()
+    with _maintenance_lock:
+        _last_trail_candle_time[symbol] = candle_time
+
+
+def _clear_trail_candle_tracking(symbol: str) -> None:
+    with _maintenance_lock:
+        _last_trail_candle_time.pop(symbol.upper(), None)
+
+
 def _log_trail_sl_skip(symbol: str, reason: str, **details: Any) -> None:
     """Throttled diagnostic when trailing does not move the stop."""
     symbol = symbol.upper()
@@ -3476,6 +3507,8 @@ def maybe_trail_sl(
     symbol: str,
     snapshot: dict[str, Any],
     candle_open: float | None,
+    *,
+    candle_time: str | None = None,
 ) -> bool:
     """Ratchet the SL toward the reference candle open once in profit (net of fees).
 
@@ -3484,6 +3517,8 @@ def maybe_trail_sl(
     """
     if not _trail_sl_enabled():
         return False
+    if _trail_candle_already_done(symbol, candle_time):
+        return True
     if not EXECUTION_ENABLED or telegram.is_trading_paused() or EXECUTION_MODE != "live":
         _log_trail_sl_skip(symbol, "execution_off", mode=EXECUTION_MODE)
         return False
@@ -3645,6 +3680,70 @@ def maybe_trail_sl(
     return True
 
 
+def _execute_trail_on_candle_close(
+    symbol: str,
+    candle_open: float,
+    candle_time: str,
+) -> None:
+    """Run trailing SL for one closed LTF candle (open price anchor)."""
+    if not _trail_sl_enabled():
+        return
+    symbol = symbol.upper()
+    if _trail_candle_already_done(symbol, candle_time):
+        return
+    if not EXECUTION_ENABLED or telegram.is_trading_paused() or EXECUTION_MODE != "live":
+        return
+    if not _keys_configured() or not REST_PLACE_SL_TP:
+        return
+
+    _append_orders_log(
+        "trail_candle_close",
+        symbol=symbol,
+        candle_open=candle_open,
+        candle_time=candle_time,
+    )
+    snapshot = _fetch_exchange_exposure(symbol)
+    if not snapshot.get("open"):
+        return
+
+    try:
+        maybe_trail_sl(
+            symbol,
+            snapshot,
+            candle_open,
+            candle_time=candle_time,
+        )
+    finally:
+        _mark_trail_candle_done(symbol, candle_time)
+
+
+def schedule_trail_on_candle_close(symbol: str, candle: dict[str, Any]) -> bool:
+    """Enqueue trailing SL on each closed LTF candle (bypasses maintenance throttle)."""
+    if not _trail_sl_enabled():
+        return False
+    if not candle.get("x"):
+        return False
+    candle_time = _trail_candle_time_key(candle.get("t"))
+    if _trail_candle_already_done(symbol, candle_time):
+        return False
+    try:
+        candle_open = float(candle["o"])
+    except (TypeError, ValueError, KeyError):
+        _log_trail_sl_skip(symbol, "no_candle_anchor", candle=candle.get("t"))
+        return False
+    if candle_open <= 0:
+        return False
+
+    return _run_execution_thread(
+        _execute_trail_on_candle_close,
+        symbol,
+        candle_open,
+        candle_time,
+        bypass_cooldown=True,
+        thread_name=f"exec-trail-candle-{symbol.upper()}",
+    )
+
+
 def run_execution_maintenance(
     symbol: str,
     *,
@@ -3653,6 +3752,7 @@ def run_execution_maintenance(
     tp: float | None = None,
     market_analysis: dict[str, Any] | None = None,
     trail_anchor: float | None = None,
+    trail_candle_time: str | None = None,
 ) -> None:
     """Periodic: cancel stale entry limits; repair missing SL/TP on open positions."""
     if not EXECUTION_ENABLED or not _keys_configured() or EXECUTION_MODE != "live":
@@ -3672,7 +3772,14 @@ def run_execution_maintenance(
     if snapshot.get("open"):
         # Trail first so RSI-close attempts cannot block SL ratchet on the same cycle.
         if not _is_execution_inflight(symbol):
-            trail_owns = maybe_trail_sl(symbol, snapshot, trail_anchor)
+            trail_owns = maybe_trail_sl(
+                symbol,
+                snapshot,
+                trail_anchor,
+                candle_time=trail_candle_time,
+            )
+            if trail_candle_time:
+                _mark_trail_candle_done(symbol, trail_candle_time)
             # In scalper trailing mode the candle-trail is the SOLE SL manager: the old
             # break-even/profit-lock path is disabled so they never coexist.
             if not trail_owns and not _trail_sl_enabled():
@@ -5524,6 +5631,7 @@ def _execute_open(
             dca_legs_placed=0 if dca_max_legs else None,
             dca_max_legs=dca_max_legs if dca_max_legs else None,
         )
+        _clear_trail_candle_tracking(symbol)
         _update_trade_context(symbol, be_applied=False, position_peak_qty=None, trail_notified=False)
         if dca_max_legs > 0:
             _sync_dca_leg_count(symbol)
