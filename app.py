@@ -2457,12 +2457,12 @@ async def rest_resync_orderbook(
         and now_mono - last_resync_mono < ORDERBOOK_REST_RESYNC_COOLDOWN_SEC
     ):
         logger.warning(
-            "%s: orderbook REST resync throttled (%.0fs / %.0fs cooldown) — reconnecting WS",
+            "%s: orderbook REST resync throttled (%.0fs / %.0fs cooldown) — skip depth, keep WS",
             SYMBOL.upper(),
             now_mono - last_resync_mono,
             ORDERBOOK_REST_RESYNC_COOLDOWN_SEC,
         )
-        return last_update_id, last_resync_mono, True
+        return last_update_id, last_resync_mono, False
 
     block = execution.fapi_public_blocked_reason()
     if block:
@@ -4830,8 +4830,26 @@ def run_server() -> None:
         logger.info("Shutting down")
 
 
+def execution_maintenance_loop() -> None:
+    """Run SL/TP maintenance on a timer — independent of Dash UI clients."""
+    interval = max(15.0, execution.EXECUTION_MAINTENANCE_SEC)
+    while True:
+        time.sleep(interval)
+        if not execution.EXECUTION_ENABLED or execution.EXECUTION_MODE != "live":
+            continue
+        try:
+            get_candles_df(refresh_execution=True)
+        except Exception as exc:
+            logger.warning("%s: execution maintenance loop failed: %s", SYMBOL.upper(), exc)
+
+
 if __name__ == "__main__":
     Thread(target=start_ws, daemon=True).start()
     if DB_CONFIG_POLL_SEC > 0:
         Thread(target=config_poll_loop, daemon=True, name=f"config-poll-{SYMBOL}").start()
+    Thread(
+        target=execution_maintenance_loop,
+        daemon=True,
+        name=f"exec-maint-{SYMBOL.upper()}",
+    ).start()
     run_server()

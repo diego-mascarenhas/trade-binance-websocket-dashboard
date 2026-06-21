@@ -119,7 +119,7 @@ CLOSE_RSI_SHORT_MAX = float(os.getenv("CLOSE_RSI_SHORT_MAX", "28"))
 CLOSE_RSI_MIN_PROFIT_PCT = float(os.getenv("CLOSE_RSI_MIN_PROFIT_PCT", "0"))
 CLOSE_RSI_REQUIRE_PROFIT = _env_bool("CLOSE_RSI_REQUIRE_PROFIT", "true")
 TRAIL_SL_ENABLED = _env_bool("TRAIL_SL_ENABLED", "false")
-TRAIL_SL_FEE_PCT = float(os.getenv("TRAIL_SL_FEE_PCT", "0.10"))
+TRAIL_SL_FEE_PCT = float(os.getenv("TRAIL_SL_FEE_PCT", "0.15"))
 TRAIL_SL_CANDLE_OFFSET = max(1, int(os.getenv("TRAIL_SL_CANDLE_OFFSET", "1")))
 TRAIL_CANDLE_DIAG_LOG = _env_bool("TRAIL_CANDLE_DIAG_LOG", "true")
 

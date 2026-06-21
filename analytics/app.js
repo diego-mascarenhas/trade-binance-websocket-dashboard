@@ -755,109 +755,70 @@ function renderEventCell(row) {
     return `<td class="${cls}" title="${escapeHtml(type)}">${escapeHtml(label)}</td>`;
 }
 
-function formatSlCandleBits(row) {
-    const open = row.candle_open;
-    const close = row.candle_close;
+function resolveTrailSlPrice(row) {
+    const sl = row.sl;
+    if (sl != null && sl !== "") {
+        return String(sl);
+    }
+    const anchor = row.sl_anchor;
+    if (anchor != null && anchor !== "") {
+        return String(anchor);
+    }
+    const target = row.trail_target;
+    if (target != null && target !== "") {
+        return String(target);
+    }
+    return null;
+}
+
+function buildTrailSlTooltip(row) {
     const parts = [];
-    if (close != null) {
-        parts.push(`c ${close}`);
+    const type = row.event_type || "";
+    if (type) {
+        parts.push(type);
     }
-    if (open != null) {
-        parts.push(`o ${open}`);
+    if (row.trail_stage) {
+        parts.push(row.trail_stage);
     }
-    return parts;
+    if (row.candle_close != null) {
+        parts.push(`cierre ${row.candle_close}`);
+    }
+    if (row.candle_open != null) {
+        parts.push(`apertura ${row.candle_open}`);
+    }
+    if (row.close_profit_pct != null) {
+        parts.push(`cierre ${formatPct(row.close_profit_pct)}%`);
+    }
+    const pnl = row.unrealized_pnl_pct ?? row.pnl_pct;
+    if (pnl != null) {
+        parts.push(`uPnL ${formatPct(pnl)}%`);
+    }
+    if (row.prev_sl) {
+        parts.push(`antes ${row.prev_sl}`);
+    }
+    if (row.block_reason) {
+        parts.push(row.block_reason);
+    }
+    return parts.join(" · ") || "";
 }
 
 function renderTrailCell(row) {
     const type = row.event_type || "";
-    const sl = row.sl;
-    const prev = row.prev_sl;
-    const open = row.candle_open;
-    const close = row.candle_close;
-    const pnl = row.unrealized_pnl_pct ?? row.pnl_pct;
-    const target = row.trail_target;
-    const current = row.trail_current;
-    const minPct = row.trail_min_pct ?? row.profit_gate_pct;
-    const candleBits = formatSlCandleBits(row);
-
-    if (type === "trail_candle_diag") {
-        const stage = row.trail_stage || "diag";
-        const parts = [...candleBits];
-        if (pnl != null) {
-            parts.push(`${pnl}%`);
-        }
-        if (row.in_profit === true || row.in_profit === 1 || row.in_profit === "true") {
-            parts.push(row.gate_source === "candle_close" ? "close ≥ gate" : "≥ gate");
-        } else if (row.in_profit === false || row.in_profit === 0 || row.in_profit === "false") {
-            const closePct = row.close_profit_pct;
-            if (closePct != null) {
-                parts.push(`close ${closePct}%`);
-            }
-            parts.push("< gate");
-        }
-        if (row.block_reason) {
-            parts.push(row.block_reason);
-        } else if (stage !== "eval") {
-            parts.push(stage);
-        }
-        const cls = row.in_profit ? "trail-cell trail-applied" : "trail-cell trail-skip";
-        return `<td class="${cls}" title="${escapeHtml(stage)}">${escapeHtml(parts.join(" · ") || stage)}</td>`;
-    }
+    const slPrice = resolveTrailSlPrice(row);
+    const tooltip = buildTrailSlTooltip(row);
+    let cls = "trail-cell";
     if (type === "trail_sl") {
-        const parts = [];
-        if (sl) {
-            parts.push(`→ ${sl}`);
-        } else {
-            parts.push("SL moved");
-        }
-        if (prev) {
-            parts.push(`was ${prev}`);
-        }
-        parts.push(...candleBits);
-        if (pnl != null) {
-            parts.push(`${pnl}%`);
-        }
-        return `<td class="trail-cell trail-applied" title="SL trailado">${escapeHtml(parts.join(" · "))}</td>`;
+        cls += " trail-applied";
+    } else if (type === "trail_sl_skip" || row.in_profit === false || row.in_profit === 0) {
+        cls += " trail-skip";
+    } else if (row.in_profit === true || row.in_profit === 1 || row.in_profit === "true") {
+        cls += " trail-applied";
     }
-    if (type === "trail_candle") {
-        const parts = ["vela 1m"];
-        parts.push(...candleBits);
-        if (row.close_profit_pct != null) {
-            parts.push(`close ${row.close_profit_pct}%`);
-        } else if (pnl != null) {
-            parts.push(`${pnl}%`);
-        }
-        if (row.sl_anchor != null) {
-            parts.push(`→ ${row.sl_anchor}`);
-        }
-        if (row.signal) {
-            parts.push(String(row.signal));
-        }
-        return `<td class="trail-cell" title="Evaluación por cierre de vela">${escapeHtml(parts.join(" · "))}</td>`;
+    if (!slPrice) {
+        return '<td class="trail-cell trail-na">—</td>';
     }
-    if (type === "trail_sl_skip") {
-        const reason = row.block_reason || "skip";
-        const parts = [reason, ...candleBits];
-        if (reason === "profit_gate" && minPct != null && pnl != null) {
-            const src = row.gate_source;
-            if (src === "candle_close" && row.close_profit_pct != null) {
-                parts.push(`close ${row.close_profit_pct}% < ${minPct}%`);
-            } else {
-                parts.push(`pnl ${pnl}% < ${minPct}%`);
-            }
-        } else if (row.sl_anchor != null) {
-            parts.push(`anchor ${row.sl_anchor}`);
-        } else if (target != null && current != null) {
-            parts.push(`tgt ${target} · cur ${current}`);
-        } else if (pnl != null) {
-            parts.push(`${pnl}%`);
-        }
-        return `<td class="trail-cell trail-skip" title="${escapeHtml(reason)}">${escapeHtml(parts.join(" · "))}</td>`;
-    }
-    if (sl) {
-        return `<td class="trail-cell">${escapeHtml(String(sl))}</td>`;
-    }
-    return '<td class="trail-cell trail-na">—</td>';
+    const title = tooltip ? ` title="${escapeHtml(tooltip)}"` : "";
+    return `<td class="${cls}"${title}>${escapeHtml(slPrice)}</td>`;
 }
 
 function renderRecent(rows) {
