@@ -3040,7 +3040,7 @@ def get_candles_df(*, refresh_execution: bool = True) -> pd.DataFrame:
     exposure = execution.get_exchange_exposure(SYMBOL)
     if refresh_execution:
         trail_anchor = None
-        if execution.SCALPER_MODE and execution.TRAIL_SL_ENABLED:
+        if execution._trail_sl_enabled():
             closed_rows = [row for row in candles if row.get("x")]
             offset = max(1, int(execution.TRAIL_SL_CANDLE_OFFSET))
             if len(closed_rows) >= offset:

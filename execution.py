@@ -136,6 +136,8 @@ SL_REPRICE_TOLERANCE_PCT = float(os.getenv("SL_REPRICE_TOLERANCE_PCT", "0.35"))
 _status_lock = threading.Lock()
 _maintenance_lock = threading.Lock()
 _last_maintenance: dict[str, float] = {}
+_last_trail_skip_log: dict[str, float] = {}
+TRAIL_SKIP_LOG_SEC = 300.0
 _fleet_exposure_lock = threading.Lock()
 _fleet_exposure_cache: tuple[float, dict[str, Any]] | None = None
 _fleet_positions_lock = threading.Lock()
@@ -3457,6 +3459,19 @@ def _trail_sl_enabled() -> bool:
     return SCALPER_MODE and TRAIL_SL_ENABLED
 
 
+def _log_trail_sl_skip(symbol: str, reason: str, **details: Any) -> None:
+    """Throttled diagnostic when trailing does not move the stop."""
+    symbol = symbol.upper()
+    key = f"{symbol}:{reason}"
+    now = time.monotonic()
+    with _maintenance_lock:
+        last = _last_trail_skip_log.get(key, 0.0)
+        if now - last < TRAIL_SKIP_LOG_SEC:
+            return
+        _last_trail_skip_log[key] = now
+    _append_orders_log("trail_sl_skip", symbol=symbol, reason=reason, **details)
+
+
 def maybe_trail_sl(
     symbol: str,
     snapshot: dict[str, Any],
@@ -3470,14 +3485,17 @@ def maybe_trail_sl(
     if not _trail_sl_enabled():
         return False
     if not EXECUTION_ENABLED or telegram.is_trading_paused() or EXECUTION_MODE != "live":
+        _log_trail_sl_skip(symbol, "execution_off", mode=EXECUTION_MODE)
         return False
     if not _keys_configured() or not REST_PLACE_SL_TP:
+        _log_trail_sl_skip(symbol, "sl_tp_disabled", rest_place=REST_PLACE_SL_TP)
         return False
     if not snapshot.get("open"):
         return False
 
     direction = _primary_position_direction(snapshot.get("direction"))
     if direction not in ("LONG", "SHORT"):
+        _log_trail_sl_skip(symbol, "no_direction", direction=snapshot.get("direction"))
         return False
 
     ctx = _get_trade_context(symbol)
@@ -3487,6 +3505,7 @@ def maybe_trail_sl(
     except (TypeError, ValueError):
         entry = 0.0
     if entry <= 0:
+        _log_trail_sl_skip(symbol, "no_entry", entry=entry_raw)
         return False
 
     _attach_unrealized_pnl_pct(snapshot)
@@ -3497,14 +3516,27 @@ def maybe_trail_sl(
 
     # Not yet profitable after round-trip fees → let BE/structural handle it.
     if pnl_pct <= TRAIL_SL_FEE_PCT:
+        _log_trail_sl_skip(
+            symbol,
+            "profit_gate",
+            pnl_pct=pnl_pct,
+            min_pct=TRAIL_SL_FEE_PCT,
+            direction=direction,
+        )
         return False
 
     symbol = symbol.upper()
+    if candle_open is None or candle_open <= 0:
+        _log_trail_sl_skip(
+            symbol,
+            "no_candle_anchor",
+            pnl_pct=pnl_pct,
+            direction=direction,
+        )
+        return False
+
     # Trailing now owns the SL; mark be_applied so reconcile/static-BE won't fight it.
     _update_trade_context(symbol, be_applied=True)
-
-    if candle_open is None or candle_open <= 0:
-        return True
 
     fee = TRAIL_SL_FEE_PCT / 100.0
     if direction == "LONG":
@@ -3523,10 +3555,34 @@ def maybe_trail_sl(
     current = _get_sl_trigger_from_orders(symbol, direction)
     if current and current > 0:
         if direction == "LONG" and target_f <= current:
+            _log_trail_sl_skip(
+                symbol,
+                "ratchet",
+                direction=direction,
+                target=target_f,
+                current=current,
+                candle_open=candle_open,
+            )
             return True
         if direction == "SHORT" and target_f >= current:
+            _log_trail_sl_skip(
+                symbol,
+                "ratchet",
+                direction=direction,
+                target=target_f,
+                current=current,
+                candle_open=candle_open,
+            )
             return True
         if abs(target_f - current) / current * 100 < SL_REPRICE_TOLERANCE_PCT:
+            _log_trail_sl_skip(
+                symbol,
+                "tolerance",
+                direction=direction,
+                target=target_f,
+                current=current,
+                tolerance_pct=SL_REPRICE_TOLERANCE_PCT,
+            )
             return True
 
     qty = _position_qty_string(symbol, direction)
@@ -3549,6 +3605,13 @@ def maybe_trail_sl(
         except (TypeError, ValueError):
             sl_val = 0.0
     if mark is not None and sl_val > 0 and _sl_would_trigger_immediately(direction, sl_val, mark):
+        _log_trail_sl_skip(
+            symbol,
+            "immediate_trigger",
+            direction=direction,
+            sl=sl_price,
+            mark=mark,
+        )
         return True
 
     _cancel_symbol_sl_orders(symbol, direction)
@@ -3607,15 +3670,14 @@ def run_execution_maintenance(
     _sync_dca_leg_count(symbol)
     snapshot = _fetch_exchange_exposure(symbol)
     if snapshot.get("open"):
-        # RSI close runs async; keep maintaining SL/TP even when a close is attempted.
+        # Trail first so RSI-close attempts cannot block SL ratchet on the same cycle.
+        if not _is_execution_inflight(symbol):
+            trail_owns = maybe_trail_sl(symbol, snapshot, trail_anchor)
+            # In scalper trailing mode the candle-trail is the SOLE SL manager: the old
+            # break-even/profit-lock path is disabled so they never coexist.
+            if not trail_owns and not _trail_sl_enabled():
+                _maybe_apply_breakeven_sl(symbol, snapshot, market_analysis)
         maybe_close_on_rsi(symbol, snapshot, market_analysis)
-        if _is_execution_inflight(symbol):
-            return
-        trail_owns = maybe_trail_sl(symbol, snapshot, trail_anchor)
-        # In scalper trailing mode the candle-trail is the SOLE SL manager: the old
-        # break-even/profit-lock path is disabled so they never coexist.
-        if not trail_owns and not _trail_sl_enabled():
-            _maybe_apply_breakeven_sl(symbol, snapshot, market_analysis)
     reconcile_position_protection(symbol, direction=direction, sl=sl, tp=tp)
 
 
