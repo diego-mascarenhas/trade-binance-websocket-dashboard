@@ -361,6 +361,7 @@ def reset_dca_state(symbol: str) -> None:
         dca_max_legs=0,
         be_applied=False,
         position_peak_qty=None,
+        trail_notified=False,
     )
 
 
@@ -995,6 +996,7 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
             dca_max_legs=0,
             be_applied=False,
             position_peak_qty=None,
+            trail_notified=False,
         )
         return
 
@@ -1028,6 +1030,7 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
         dca_max_legs=0,
         be_applied=False,
         position_peak_qty=None,
+        trail_notified=False,
         pending_entry_market_snapshot=None,
         pending_entry_at=None,
     )
@@ -1082,8 +1085,12 @@ def _notify_order_failed(symbol: str, direction: str, exc: Exception) -> None:
     telegram.notify_order_failed(symbol, direction, str(exc))
 
 
-def _reserve_execution_attempt(symbol: str) -> bool:
-    """One live order attempt at a time; cooldown starts when attempt is reserved."""
+def _reserve_execution_attempt(symbol: str, *, bypass_cooldown: bool = False) -> bool:
+    """One live order attempt at a time; cooldown starts when attempt is reserved.
+
+    Protective exits (signal closes) pass bypass_cooldown=True so the entry throttle
+    never blocks closing a position; the inflight lock is still respected.
+    """
     global _last_execution_monotonic, _execution_inflight_symbol
 
     symbol = symbol.upper()
@@ -1092,7 +1099,8 @@ def _reserve_execution_attempt(symbol: str) -> bool:
         if _execution_inflight_symbol:
             return False
         if (
-            _last_execution_monotonic is not None
+            not bypass_cooldown
+            and _last_execution_monotonic is not None
             and now - _last_execution_monotonic < EXECUTION_ORDER_COOLDOWN
         ):
             return False
@@ -1110,11 +1118,19 @@ def _release_execution_attempt(symbol: str) -> None:
             _execution_inflight_symbol = None
 
 
-def _run_execution_thread(target, *args, **kwargs) -> None:
+def _is_execution_inflight(symbol: str) -> bool:
+    symbol = symbol.upper()
+    with _execution_inflight_lock:
+        return _execution_inflight_symbol == symbol
+
+
+def _run_execution_thread(target, *args, **kwargs) -> bool:
+    """Start a one-shot execution thread. Returns True only if the attempt was reserved."""
     symbol = (args[0] if args else kwargs.get("symbol", "")).upper()
     thread_name = kwargs.pop("thread_name", f"exec-{symbol}")
+    bypass_cooldown = kwargs.pop("bypass_cooldown", False)
 
-    if not _reserve_execution_attempt(symbol):
+    if not _reserve_execution_attempt(symbol, bypass_cooldown=bypass_cooldown):
         _append_orders_log(
             "skip_inflight_or_cooldown",
             symbol=symbol,
@@ -1126,7 +1142,7 @@ def _run_execution_thread(target, *args, **kwargs) -> None:
             block_reason="execution_inflight_or_cooldown",
             market_snapshot={"signal": kwargs.get("direction") or (args[1] if len(args) > 1 else None)},
         )
-        return
+        return False
 
     def runner() -> None:
         try:
@@ -1136,6 +1152,7 @@ def _run_execution_thread(target, *args, **kwargs) -> None:
 
     thread = threading.Thread(target=runner, daemon=True, name=thread_name)
     thread.start()
+    return True
 
 
 def get_execution_status() -> dict[str, Any]:
@@ -2879,8 +2896,10 @@ def _perform_market_close(
     _attach_unrealized_pnl_pct(snapshot)
     pnl_pct = snapshot.get("unrealized_pnl_pct")
     pnl_usdt = snapshot.get("unrealized_pnl")
-    cancelled_limits = _cancel_all_entry_limits(symbol)
-    _cancel_symbol_protection_orders(symbol, position_direction)
+    # Cancel pending DCA entry limits first (so none fills and re-opens during close).
+    # Protection (SL/TP) is cancelled AFTER a confirmed close so the position is never
+    # left unprotected if the market close fails.
+    cancelled_limits = _cancel_all_entry_limits(symbol) if EXECUTION_MODE != "dry" else 0
 
     payload = {
         "symbol": symbol,
@@ -2922,6 +2941,8 @@ def _perform_market_close(
     try:
         response = _place_market_close(symbol, position_direction, qty)
         order_id = response.get("orderId")
+        # Position is now flat — safe to cancel leftover SL/TP protection orders.
+        _cancel_symbol_protection_orders(symbol, position_direction)
         _append_orders_log(f"live_{trigger}_signal_close", orderId=order_id, **payload)
         reset_dca_state(symbol)
         _update_trade_context(
@@ -3034,6 +3055,27 @@ def _rsi_close_reason(direction: str, market_analysis: dict[str, Any] | None) ->
     return None
 
 
+def _rsi_close_profit_ok(snapshot: dict[str, Any]) -> bool:
+    """True when the position satisfies the RSI-close profit gate."""
+    if not (CLOSE_RSI_REQUIRE_PROFIT or CLOSE_RSI_MIN_PROFIT_PCT > 0):
+        return True
+    _attach_unrealized_pnl_pct(snapshot)
+    pnl_usdt = snapshot.get("unrealized_pnl")
+    try:
+        pnl_pct = float(snapshot.get("unrealized_pnl_pct") or 0)
+    except (TypeError, ValueError):
+        pnl_pct = 0.0
+    if CLOSE_RSI_REQUIRE_PROFIT:
+        try:
+            if pnl_usdt is None or float(pnl_usdt) <= 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+    if CLOSE_RSI_MIN_PROFIT_PCT > 0 and pnl_pct < CLOSE_RSI_MIN_PROFIT_PCT:
+        return False
+    return True
+
+
 def _execute_rsi_signal_close(
     symbol: str,
     position_direction: str,
@@ -3048,6 +3090,16 @@ def _execute_rsi_signal_close(
         return
     pos_dir = get_open_position_direction(symbol)
     if not pos_dir or pos_dir != position_direction:
+        return
+    # Re-validate the profit gate: price may have moved since the trigger fired.
+    snapshot = _fetch_exchange_exposure(symbol)
+    if not _rsi_close_profit_ok(snapshot):
+        _append_orders_log(
+            "rsi_close_skip",
+            symbol=symbol,
+            direction=position_direction,
+            reason="profit_gate",
+        )
         return
     _perform_market_close(
         symbol,
@@ -3080,21 +3132,8 @@ def maybe_close_on_rsi(
         return False
 
     # Only close in profit (never turn a winner-by-RSI into a realized loss).
-    if CLOSE_RSI_REQUIRE_PROFIT or CLOSE_RSI_MIN_PROFIT_PCT > 0:
-        _attach_unrealized_pnl_pct(snapshot)
-        pnl_usdt = snapshot.get("unrealized_pnl")
-        try:
-            pnl_pct = float(snapshot.get("unrealized_pnl_pct") or 0)
-        except (TypeError, ValueError):
-            pnl_pct = 0.0
-        if CLOSE_RSI_REQUIRE_PROFIT:
-            try:
-                if pnl_usdt is None or float(pnl_usdt) <= 0:
-                    return False
-            except (TypeError, ValueError):
-                return False
-        if CLOSE_RSI_MIN_PROFIT_PCT > 0 and pnl_pct < CLOSE_RSI_MIN_PROFIT_PCT:
-            return False
+    if not _rsi_close_profit_ok(snapshot):
+        return False
 
     market_snapshot = {
         "signal": direction,
@@ -3104,15 +3143,16 @@ def maybe_close_on_rsi(
         "macd_hist": (market_analysis or {}).get("macd_hist"),
         "trend": (market_analysis or {}).get("htf_bias"),
     }
-    _run_execution_thread(
+    # Protective exit: bypass the entry cooldown (still gated by the inflight lock).
+    return _run_execution_thread(
         _execute_rsi_signal_close,
         symbol,
         direction,
         reason,
         market_snapshot,
+        bypass_cooldown=True,
         thread_name=f"exec-rsi-close-{symbol.upper()}",
     )
-    return True
 
 
 def maybe_close_on_opposite_ob(
@@ -3145,16 +3185,18 @@ def maybe_close_on_opposite_ob(
         reasons,
     )
     if allowed:
-        _run_execution_thread(
+        # Protective exit: bypass the entry cooldown (still gated by the inflight lock).
+        started = _run_execution_thread(
             _execute_ob_signal_close,
             symbol,
             position_direction,
             signal,
             reasons,
             market_snapshot,
+            bypass_cooldown=True,
             thread_name=f"exec-ob-close-{symbol.upper()}",
         )
-        return True, True
+        return True, started
 
     if block_reason == "not_ob_reason":
         return False, False
@@ -3491,10 +3533,29 @@ def maybe_trail_sl(
     if not qty:
         return True
 
+    # Never cancel the live stop until we know the replacement is placeable.
+    mark = _get_mark_price(symbol)
+    try:
+        sl_val = float(sl_price)
+    except (TypeError, ValueError):
+        sl_val = 0.0
+    if mark is not None and sl_val > 0 and _sl_would_trigger_immediately(direction, sl_val, mark):
+        adjusted = round_price_for_sl(
+            symbol, direction, _ensure_sl_behind_mark(symbol, direction, sl_val)
+        )
+        try:
+            sl_val = float(adjusted)
+            sl_price = adjusted
+        except (TypeError, ValueError):
+            sl_val = 0.0
+    if mark is not None and sl_val > 0 and _sl_would_trigger_immediately(direction, sl_val, mark):
+        return True
+
     _cancel_symbol_sl_orders(symbol, direction)
     placed, skipped = _place_sl_for_position(symbol, direction, sl_price, qty, log_suffix="_trail")
     if placed:
         _invalidate_position_cache(symbol)
+        first_takeover = not ctx.get("trail_notified")
         _append_orders_log(
             "trail_sl_applied",
             symbol=symbol,
@@ -3505,6 +3566,7 @@ def maybe_trail_sl(
             unrealized_pnl_pct=pnl_pct,
             prev_sl=current,
             qty=qty,
+            takeover=first_takeover,
         )
         _log_execution_decision(
             symbol,
@@ -3512,6 +3574,9 @@ def maybe_trail_sl(
             outcome="live",
             market_snapshot={"signal": direction, "sl": sl_price, "candle_open": candle_open},
         )
+        if first_takeover:
+            _update_trade_context(symbol, trail_notified=True)
+            telegram.notify_trail_started(symbol, direction, sl_price, pnl_pct)
     elif not skipped:
         logger.warning("%s: trail SL placement failed", symbol)
     return True
@@ -3542,7 +3607,9 @@ def run_execution_maintenance(
     _sync_dca_leg_count(symbol)
     snapshot = _fetch_exchange_exposure(symbol)
     if snapshot.get("open"):
-        if maybe_close_on_rsi(symbol, snapshot, market_analysis):
+        # RSI close runs async; keep maintaining SL/TP even when a close is attempted.
+        maybe_close_on_rsi(symbol, snapshot, market_analysis)
+        if _is_execution_inflight(symbol):
             return
         trail_owns = maybe_trail_sl(symbol, snapshot, trail_anchor)
         # In scalper trailing mode the candle-trail is the SOLE SL manager: the old
@@ -5395,7 +5462,7 @@ def _execute_open(
             dca_legs_placed=0 if dca_max_legs else None,
             dca_max_legs=dca_max_legs if dca_max_legs else None,
         )
-        _update_trade_context(symbol, be_applied=False, position_peak_qty=None)
+        _update_trade_context(symbol, be_applied=False, position_peak_qty=None, trail_notified=False)
         if dca_max_legs > 0:
             _sync_dca_leg_count(symbol)
         _log_execution_decision(

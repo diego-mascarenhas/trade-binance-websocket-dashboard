@@ -342,6 +342,19 @@ def notify_be_sl_applied(
     )
 
 
+def notify_trail_started(
+    symbol: str,
+    direction: str,
+    sl_price: str,
+    profit_pct: float | None = None,
+) -> None:
+    pct = f"{profit_pct:+.2f}%" if profit_pct is not None else "—"
+    send_shield(
+        f"{symbol.upper()} futures\n"
+        f"TRAILING ON {direction.upper()} · SL {sl_price} · protegiendo {pct}"
+    )
+
+
 def notify_position_closed(symbol: str, message: str) -> None:
     send_bot(f"{symbol.upper()} futures\n{message}")
 
