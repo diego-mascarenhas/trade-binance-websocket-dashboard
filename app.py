@@ -2738,7 +2738,14 @@ async def ws_loop() -> None:
                         )
 
                         with state_lock:
-                            sync_orderbook_state(bid_map, ask_map)
+                            sync_orderbook_maps(bid_map, ask_map)
+                            metrics_snapshot = (
+                                orderbook["bids"],
+                                orderbook["asks"],
+                                analysis_orderbook["bids"],
+                                analysis_orderbook["asks"],
+                            )
+                        update_metrics(*metrics_snapshot)
 
                         ws_status = "live"
                         reconnect_attempt = 0
@@ -2790,6 +2797,8 @@ async def ws_loop() -> None:
                                 k = data["k"]
                                 row = kline_row(k)
                                 interval = k.get("i", current_ltf)
+                                ltf_closed_row = None
+                                metrics_args: tuple | None = None
 
                                 with state_lock:
                                     if interval == current_htf:
@@ -2804,27 +2813,35 @@ async def ws_loop() -> None:
                                         forming_candle = row
                                         if row["x"]:
                                             candles.append(row)
-                                            execution.schedule_trail_on_candle_close(SYMBOL, row)
+                                            ltf_closed_row = row
                                         if orderbook.get("bids") and orderbook.get("asks"):
-                                            update_metrics(
+                                            metrics_args = (
                                                 orderbook["bids"],
                                                 orderbook["asks"],
                                                 analysis_orderbook.get("bids"),
                                                 analysis_orderbook.get("asks"),
                                             )
 
+                                if ltf_closed_row is not None:
+                                    execution.schedule_trail_on_candle_close(SYMBOL, ltf_closed_row)
+                                if metrics_args is not None:
+                                    update_metrics(*metrics_args)
+
                             elif data.get("e") == "24hrMiniTicker" or msg.get("stream", "").endswith("@miniTicker"):
                                 pct = _parse_mini_ticker_change_pct(data)
                                 if pct is not None:
+                                    mini_metrics_args: tuple | None = None
                                     with state_lock:
                                         change_24h = pct
                                         if orderbook.get("bids") and orderbook.get("asks"):
-                                            update_metrics(
+                                            mini_metrics_args = (
                                                 orderbook["bids"],
                                                 orderbook["asks"],
                                                 analysis_orderbook.get("bids"),
                                                 analysis_orderbook.get("asks"),
                                             )
+                                    if mini_metrics_args is not None:
+                                        update_metrics(*mini_metrics_args)
                                 else:
                                     logger.debug("miniTicker without 24h pct: %s", data)
 
@@ -2900,6 +2917,7 @@ async def ws_loop() -> None:
                                 last_update_id = final_id
 
                                 now_mono = time.monotonic()
+                                depth_metrics_args: tuple | None = None
                                 with state_lock:
                                     sync_orderbook_maps(bid_map, ask_map)
                                     if (
@@ -2907,12 +2925,14 @@ async def ws_loop() -> None:
                                         >= DEPTH_METRICS_INTERVAL_SEC
                                     ):
                                         last_depth_metrics_mono = now_mono
-                                        update_metrics(
+                                        depth_metrics_args = (
                                             orderbook["bids"],
                                             orderbook["asks"],
                                             analysis_orderbook["bids"],
                                             analysis_orderbook["asks"],
                                         )
+                                if depth_metrics_args is not None:
+                                    update_metrics(*depth_metrics_args)
                     finally:
                         flush_feed_summary(reason=disconnect_reason, ws_status_val=ws_status)
 

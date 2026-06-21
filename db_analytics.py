@@ -142,6 +142,9 @@ def _flatten_row(row: dict[str, Any]) -> dict[str, Any]:
         "trail_stage": market.get("stage"),
         "in_profit": market.get("in_profit"),
         "profit_gate_pct": market.get("profit_gate_pct"),
+        "close_profit_pct": market.get("close_profit_pct"),
+        "sl_anchor": market.get("sl_anchor"),
+        "gate_source": market.get("gate_source") or market.get("profit_gate_source"),
         "config_version": row.get("config_version"),
     }
 

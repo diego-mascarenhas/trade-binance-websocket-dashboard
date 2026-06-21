@@ -963,9 +963,12 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
         open_fields: dict[str, Any] = {
             "was_open": True,
             "direction": snapshot.get("direction") or ctx.get("direction"),
-            "exit_notified": False,
-            "last_exit_trade_id": None,
         }
+        # Only start a new exit-notify cycle when transitioning flat → open.
+        # Resetting every poll cleared last_exit_trade_id and re-fired #CLOSED spam.
+        if not ctx.get("was_open"):
+            open_fields["exit_notified"] = False
+            open_fields["last_exit_trade_id"] = None
         if not ctx.get("entry_opened_at"):
             open_fields["entry_opened_at"] = time.strftime(
                 "%Y-%m-%d %H:%M:%S UTC",
@@ -2963,12 +2966,7 @@ def _perform_market_close(
         )
         _invalidate_position_cache(symbol)
         _last_execution_monotonic = time.monotonic()
-        pnl_label = _format_realized_pnl(float(pnl_usdt or 0))
-        telegram.notify_position_closed(
-            symbol,
-            f"{label} CLOSE {position_direction} @ market ({trigger_detail})"
-            f" · order {order_id} · uPnL {pnl_label}",
-        )
+        # Exit Telegram is sent once by _maybe_notify_position_exit (realized fill from userTrades).
         _set_status(
             message=f"{label} close {position_direction} {symbol} · {order_id}",
             last_event=f"live_{trigger}_close",
@@ -3547,7 +3545,6 @@ def _log_trail_candle_diag(
     pnl_pct = snap.get("unrealized_pnl_pct")
     if pnl_pct is not None:
         payload["unrealized_pnl_pct"] = pnl_pct
-        payload["in_profit"] = float(pnl_pct) > TRAIL_SL_FEE_PCT
         payload["profit_gate_pct"] = TRAIL_SL_FEE_PCT
     for key, value in fields.items():
         if value is not None:
@@ -3560,6 +3557,9 @@ def _log_trail_candle_diag(
             "candle_close": payload.get("candle_close"),
             "candle_time": payload.get("candle_time"),
             "unrealized_pnl_pct": payload.get("unrealized_pnl_pct"),
+            "close_profit_pct": payload.get("close_profit_pct"),
+            "sl_anchor": payload.get("sl_anchor"),
+            "gate_source": payload.get("profit_gate_source") or payload.get("gate_source"),
             "stage": stage,
             "in_profit": payload.get("in_profit"),
             "profit_gate_pct": payload.get("profit_gate_pct"),
@@ -3609,6 +3609,56 @@ def _log_trail_sl_skip(
         )
 
 
+def _candle_close_profit_pct(entry: float, direction: str, candle_close: float) -> float:
+    """Price move % at candle close vs entry (LONG: close above entry)."""
+    direction = direction.upper()
+    if entry <= 0 or candle_close <= 0:
+        return 0.0
+    if direction == "LONG":
+        return (candle_close - entry) / entry * 100.0
+    if direction == "SHORT":
+        return (entry - candle_close) / entry * 100.0
+    return 0.0
+
+
+def _trail_profit_gate_pct(
+    entry: float,
+    direction: str,
+    *,
+    candle_close: float | None,
+    unrealized_pnl_pct: float,
+) -> tuple[bool, float, str]:
+    """Pass when candle close (preferred) or uPnL clears TRAIL_SL_FEE_PCT."""
+    min_pct = TRAIL_SL_FEE_PCT
+    if candle_close is not None and candle_close > 0 and entry > 0:
+        close_pct = _candle_close_profit_pct(entry, direction, candle_close)
+        if close_pct >= min_pct:
+            return True, close_pct, "candle_close"
+    if unrealized_pnl_pct >= min_pct:
+        return True, unrealized_pnl_pct, "unrealized"
+    if candle_close is not None and candle_close > 0 and entry > 0:
+        return False, _candle_close_profit_pct(entry, direction, candle_close), "candle_close"
+    return False, unrealized_pnl_pct, "unrealized"
+
+
+def _trail_sl_anchor(
+    direction: str,
+    candle_open: float | None,
+    candle_close: float | None,
+) -> float | None:
+    """Pullback candle → anchor at close; otherwise at open (last closed LTF candle)."""
+    if candle_open is None or candle_open <= 0:
+        return None
+    if candle_close is None or candle_close <= 0:
+        return float(candle_open)
+    direction = direction.upper()
+    if direction == "LONG" and candle_close < candle_open:
+        return float(candle_close)
+    if direction == "SHORT" and candle_close > candle_open:
+        return float(candle_close)
+    return float(candle_open)
+
+
 def maybe_trail_sl(
     symbol: str,
     snapshot: dict[str, Any],
@@ -3617,10 +3667,10 @@ def maybe_trail_sl(
     candle_time: str | None = None,
     candle_close: float | None = None,
 ) -> bool:
-    """Ratchet the SL toward the reference candle open once in profit (net of fees).
+    """Ratchet SL once candle close (or uPnL) clears the fee gate.
 
-    Scalper-only. Returns True when trailing 'owns' the SL (engaged), so the caller
-    skips the static break-even path. Only moves the stop in the favorable direction.
+    Pullback candle (red on LONG): anchor SL at candle close when close is in profit.
+    Otherwise anchor at candle open. Scalper-only.
     """
     if not _trail_sl_enabled():
         return False
@@ -3688,36 +3738,51 @@ def maybe_trail_sl(
         except (TypeError, ValueError):
             pnl_pct = 0.0
 
+        gate_ok, gate_pct, gate_source = _trail_profit_gate_pct(
+            entry,
+            direction,
+            candle_close=candle_close,
+            unrealized_pnl_pct=pnl_pct,
+        )
+        anchor = _trail_sl_anchor(direction, candle_open, candle_close)
+
         _log_trail_candle_diag(
             symbol,
             "eval",
             snapshot=snapshot,
             pnl_pct=pnl_pct,
-            in_profit=pnl_pct > TRAIL_SL_FEE_PCT,
+            close_profit_pct=(
+                _candle_close_profit_pct(entry, direction, candle_close)
+                if candle_close and candle_close > 0
+                else None
+            ),
+            in_profit=gate_ok,
             profit_gate_pct=TRAIL_SL_FEE_PCT,
+            profit_gate_source=gate_source,
+            sl_anchor=anchor,
             **skip_common,
         )
 
-        # Not yet profitable after round-trip fees → let BE/structural handle it.
-        if pnl_pct <= TRAIL_SL_FEE_PCT:
+        if not gate_ok:
             _log_trail_sl_skip(
                 symbol,
                 "profit_gate",
                 log_decision=bool(candle_time),
-                pnl_pct=pnl_pct,
+                pnl_pct=gate_pct,
                 min_pct=TRAIL_SL_FEE_PCT,
                 direction=direction,
+                gate_source=gate_source,
                 **skip_common,
             )
             return False
 
         symbol = symbol.upper()
-        if candle_open is None or candle_open <= 0:
+        if anchor is None or anchor <= 0:
             _log_trail_sl_skip(
                 symbol,
                 "no_candle_anchor",
                 log_decision=bool(candle_time),
-                pnl_pct=pnl_pct,
+                pnl_pct=gate_pct,
                 direction=direction,
                 **skip_common,
             )
@@ -3729,10 +3794,10 @@ def maybe_trail_sl(
         fee = TRAIL_SL_FEE_PCT / 100.0
         if direction == "LONG":
             be_floor = entry * (1 + fee)
-            target = max(float(candle_open), be_floor)
+            target = max(float(anchor), be_floor)
         else:
             be_floor = entry * (1 - fee)
-            target = min(float(candle_open), be_floor)
+            target = min(float(anchor), be_floor)
 
         target = _ensure_sl_behind_mark(symbol, direction, target)
         sl_price = round_price_for_profit_sl(symbol, direction, target)
@@ -3821,7 +3886,9 @@ def maybe_trail_sl(
                 sl=sl_price,
                 candle_open=candle_open,
                 candle_close=candle_close,
+                sl_anchor=anchor,
                 unrealized_pnl_pct=pnl_pct,
+                close_profit_pct=gate_pct if gate_source == "candle_close" else None,
                 prev_sl=current,
                 qty=qty,
                 takeover=first_takeover,
@@ -3836,7 +3903,9 @@ def maybe_trail_sl(
                     "prev_sl": current,
                     "candle_open": candle_open,
                     "candle_close": candle_close,
+                    "sl_anchor": anchor,
                     "unrealized_pnl_pct": pnl_pct,
+                    "close_profit_pct": gate_pct if gate_source == "candle_close" else None,
                 },
             )
             if first_takeover:
@@ -3941,7 +4010,8 @@ def _execute_trail_on_candle_close(
 def schedule_trail_on_candle_close(symbol: str, candle: dict[str, Any]) -> bool:
     """Enqueue trailing SL on each closed LTF candle (bypasses maintenance throttle)."""
     metrics = _candle_log_fields(candle)
-    if not _trail_sl_enabled():
+    trail_on = _trail_sl_enabled()
+    if not trail_on:
         return False
     if not candle.get("x"):
         return False
