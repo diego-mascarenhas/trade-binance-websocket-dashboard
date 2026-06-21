@@ -111,7 +111,7 @@ BE_LOCK_CURRENT_PROFIT = _env_bool("BE_LOCK_CURRENT_PROFIT", "true")
 TP_REPRICE_TOLERANCE_PCT = float(os.getenv("TP_REPRICE_TOLERANCE_PCT", "0.5"))
 OB_EXIT_ON_OPPOSITE = _env_bool("OB_EXIT_ON_OPPOSITE", "false")
 OB_EXIT_REQUIRE_OB_REASON = _env_bool("OB_EXIT_REQUIRE_OB_REASON", "true")
-OB_EXIT_MIN_PROFIT_PCT = float(os.getenv("OB_EXIT_MIN_PROFIT_PCT", "0"))
+OB_EXIT_MIN_PROFIT_PCT = float(os.getenv("OB_EXIT_MIN_PROFIT_PCT", "0.10"))
 SCALPER_MODE = _env_bool("SCALPER_MODE", "false")
 CLOSE_ON_RSI = _env_bool("CLOSE_ON_RSI", "false")
 CLOSE_RSI_LONG_MIN = float(os.getenv("CLOSE_RSI_LONG_MIN", "72"))
@@ -3490,17 +3490,39 @@ def _clear_trail_candle_tracking(symbol: str) -> None:
         _last_trail_candle_time.pop(symbol.upper(), None)
 
 
-def _log_trail_sl_skip(symbol: str, reason: str, **details: Any) -> None:
+def _log_trail_sl_skip(
+    symbol: str,
+    reason: str,
+    *,
+    log_decision: bool = False,
+    **details: Any,
+) -> None:
     """Throttled diagnostic when trailing does not move the stop."""
     symbol = symbol.upper()
     key = f"{symbol}:{reason}"
     now = time.monotonic()
     with _maintenance_lock:
         last = _last_trail_skip_log.get(key, 0.0)
-        if now - last < TRAIL_SKIP_LOG_SEC:
-            return
-        _last_trail_skip_log[key] = now
-    _append_orders_log("trail_sl_skip", symbol=symbol, reason=reason, **details)
+        throttled = now - last < TRAIL_SKIP_LOG_SEC
+        if not throttled:
+            _last_trail_skip_log[key] = now
+    if not throttled:
+        _append_orders_log("trail_sl_skip", symbol=symbol, reason=reason, **details)
+    if log_decision:
+        snap = {k: v for k, v in details.items() if v is not None}
+        if "direction" in snap and "signal" not in snap:
+            snap["signal"] = snap["direction"]
+        if "pnl_pct" in snap and "unrealized_pnl_pct" not in snap:
+            snap["unrealized_pnl_pct"] = snap["pnl_pct"]
+        if "min_pct" in snap and "trail_min_pct" not in snap:
+            snap["trail_min_pct"] = snap["min_pct"]
+        _log_execution_decision(
+            symbol,
+            "trail_sl_skip",
+            outcome="skipped",
+            block_reason=reason,
+            market_snapshot=snap or None,
+        )
 
 
 def maybe_trail_sl(
@@ -3520,17 +3542,29 @@ def maybe_trail_sl(
     if _trail_candle_already_done(symbol, candle_time):
         return True
     if not EXECUTION_ENABLED or telegram.is_trading_paused() or EXECUTION_MODE != "live":
-        _log_trail_sl_skip(symbol, "execution_off", mode=EXECUTION_MODE)
+        _log_trail_sl_skip(
+            symbol, "execution_off", log_decision=bool(candle_time), mode=EXECUTION_MODE
+        )
         return False
     if not _keys_configured() or not REST_PLACE_SL_TP:
-        _log_trail_sl_skip(symbol, "sl_tp_disabled", rest_place=REST_PLACE_SL_TP)
+        _log_trail_sl_skip(
+            symbol,
+            "sl_tp_disabled",
+            log_decision=bool(candle_time),
+            rest_place=REST_PLACE_SL_TP,
+        )
         return False
     if not snapshot.get("open"):
         return False
 
     direction = _primary_position_direction(snapshot.get("direction"))
     if direction not in ("LONG", "SHORT"):
-        _log_trail_sl_skip(symbol, "no_direction", direction=snapshot.get("direction"))
+        _log_trail_sl_skip(
+            symbol,
+            "no_direction",
+            log_decision=bool(candle_time),
+            direction=snapshot.get("direction"),
+        )
         return False
 
     ctx = _get_trade_context(symbol)
@@ -3540,7 +3574,9 @@ def maybe_trail_sl(
     except (TypeError, ValueError):
         entry = 0.0
     if entry <= 0:
-        _log_trail_sl_skip(symbol, "no_entry", entry=entry_raw)
+        _log_trail_sl_skip(
+            symbol, "no_entry", log_decision=bool(candle_time), entry=entry_raw
+        )
         return False
 
     _attach_unrealized_pnl_pct(snapshot)
@@ -3554,6 +3590,7 @@ def maybe_trail_sl(
         _log_trail_sl_skip(
             symbol,
             "profit_gate",
+            log_decision=bool(candle_time),
             pnl_pct=pnl_pct,
             min_pct=TRAIL_SL_FEE_PCT,
             direction=direction,
@@ -3565,6 +3602,7 @@ def maybe_trail_sl(
         _log_trail_sl_skip(
             symbol,
             "no_candle_anchor",
+            log_decision=bool(candle_time),
             pnl_pct=pnl_pct,
             direction=direction,
         )
@@ -3593,6 +3631,7 @@ def maybe_trail_sl(
             _log_trail_sl_skip(
                 symbol,
                 "ratchet",
+                log_decision=bool(candle_time),
                 direction=direction,
                 target=target_f,
                 current=current,
@@ -3603,6 +3642,7 @@ def maybe_trail_sl(
             _log_trail_sl_skip(
                 symbol,
                 "ratchet",
+                log_decision=bool(candle_time),
                 direction=direction,
                 target=target_f,
                 current=current,
@@ -3613,6 +3653,7 @@ def maybe_trail_sl(
             _log_trail_sl_skip(
                 symbol,
                 "tolerance",
+                log_decision=bool(candle_time),
                 direction=direction,
                 target=target_f,
                 current=current,
@@ -3643,6 +3684,7 @@ def maybe_trail_sl(
         _log_trail_sl_skip(
             symbol,
             "immediate_trigger",
+            log_decision=bool(candle_time),
             direction=direction,
             sl=sl_price,
             mark=mark,
@@ -3670,7 +3712,13 @@ def maybe_trail_sl(
             symbol,
             "trail_sl",
             outcome="live",
-            market_snapshot={"signal": direction, "sl": sl_price, "candle_open": candle_open},
+            market_snapshot={
+                "signal": direction,
+                "sl": sl_price,
+                "prev_sl": current,
+                "candle_open": candle_open,
+                "unrealized_pnl_pct": pnl_pct,
+            },
         )
         if first_takeover:
             _update_trade_context(symbol, trail_notified=True)
@@ -3705,6 +3753,21 @@ def _execute_trail_on_candle_close(
     snapshot = _fetch_exchange_exposure(symbol)
     if not snapshot.get("open"):
         return
+
+    direction = _primary_position_direction(snapshot.get("direction"))
+    _attach_unrealized_pnl_pct(snapshot)
+    _log_execution_decision(
+        symbol,
+        "trail_candle",
+        outcome="live",
+        market_snapshot={
+            "signal": direction,
+            "candle_open": candle_open,
+            "candle_time": candle_time,
+            "unrealized_pnl_pct": snapshot.get("unrealized_pnl_pct"),
+            "entry": snapshot.get("entry"),
+        },
+    )
 
     try:
         maybe_trail_sl(

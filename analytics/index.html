@@ -52,6 +52,16 @@
                     <option value="daily">Daily</option>
                 </select>
             </div>
+            <div class="field">
+                <label for="event-filter">Recent events</label>
+                <select id="event-filter">
+                    <option value="all">All events</option>
+                    <option value="trail">Trail por vela</option>
+                    <option value="trail_candle">Trail vela (trigger)</option>
+                    <option value="trail_sl">Trail SL aplicado</option>
+                    <option value="trail_sl_skip">Trail skip</option>
+                </select>
+            </div>
         </section>
 
         <section class="panel panel-wide account-panel" id="account-panel">
@@ -129,6 +139,7 @@
                             <th>Event</th>
                             <th>Outcome</th>
                             <th>Block</th>
+                            <th title="Trailing SL por vela: SL nuevo, open de vela, skip">Trail SL</th>
                             <th>Signal</th>
                             <th class="filter-col" title="Confianza vs MIN_CONFIDENCE">Conf</th>
                             <th class="filter-col" title="RSI vs RSI_LONG_MAX / RSI_SHORT_MIN">RSI</th>
@@ -147,6 +158,8 @@
                 gris = filtro off o N/A.
                 Borde ámbar = motivo registrado en <code>Block</code>.
                 Evalúa todos los filtros en la fila (no solo el primero que falló).
+                <strong>Trail por vela</strong>: filtra <code>trail_candle</code> (cierre de vela con posición),
+                <code>trail_sl</code> (SL movido) y <code>trail_sl_skip</code> (no movió: profit_gate, ratchet, etc.).
             </p>
         </section>
 

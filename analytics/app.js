@@ -6,6 +6,7 @@ if (hubLink) {
 const daysEl = document.getElementById("days");
 const symbolEl = document.getElementById("symbol");
 const granularityEl = document.getElementById("granularity");
+const eventFilterEl = document.getElementById("event-filter");
 const statusNote = document.getElementById("status-note");
 const kpiGrid = document.getElementById("kpi-grid");
 const footer = document.getElementById("footer");
@@ -102,7 +103,32 @@ const EVENT_TYPE_COLORS = {
     order_skip: "#a855f7",
     order_dry_run: "#38bdf8",
     order_live_open: "#3b82f6",
+    trail_candle: "#a78bfa",
+    trail_sl: "#22d3ee",
+    trail_sl_skip: "#fbbf24",
+    ob_signal_close: "#fb7185",
 };
+
+const EVENT_TYPE_LABELS = {
+    trail_candle: "Trail vela",
+    trail_sl: "Trail SL",
+    trail_sl_skip: "Trail skip",
+    ob_signal_close: "OB close",
+    valid_entry: "Valid entry",
+    valid_entry_blocked: "Entry blocked",
+    indicator_blocked: "Indicator block",
+    order_skip: "Order skip",
+    order_dry_run: "Dry run",
+    order_live_open: "Live open",
+};
+
+function formatEventType(eventType) {
+    const key = String(eventType || "").trim();
+    if (!key) {
+        return "—";
+    }
+    return EVENT_TYPE_LABELS[key] || key;
+}
 
 function colorForEventType(eventType) {
     if (EVENT_TYPE_COLORS[eventType]) {
@@ -131,6 +157,20 @@ async function fetchJson(path) {
     const response = await fetch(`${path}?${queryParams().toString()}`);
     if (!response.ok) {
         throw new Error(`${path} failed (${response.status})`);
+    }
+    return response.json();
+}
+
+async function fetchRecentEvents() {
+    const params = queryParams();
+    const eventGroup = eventFilterEl?.value || "all";
+    if (eventGroup && eventGroup !== "all") {
+        params.set("event_group", eventGroup);
+    }
+    params.set("limit", eventGroup === "trail" ? "100" : "50");
+    const response = await fetch(`/api/recent?${params.toString()}`);
+    if (!response.ok) {
+        throw new Error(`/api/recent failed (${response.status})`);
     }
     return response.json();
 }
@@ -705,10 +745,79 @@ function renderFilterCell(check) {
     return `<td class="${cls}" title="${escapeHtml(check.title || "")}">${escapeHtml(check.text)}</td>`;
 }
 
+function renderEventCell(row) {
+    const type = row.event_type || "";
+    const label = formatEventType(type);
+    const trailTypes = new Set(["trail_candle", "trail_sl", "trail_sl_skip"]);
+    const cls = trailTypes.has(type) ? "event-cell event-trail" : "event-cell";
+    return `<td class="${cls}" title="${escapeHtml(type)}">${escapeHtml(label)}</td>`;
+}
+
+function renderTrailCell(row) {
+    const type = row.event_type || "";
+    const sl = row.sl;
+    const prev = row.prev_sl;
+    const open = row.candle_open;
+    const pnl = row.unrealized_pnl_pct ?? row.pnl_pct;
+    const target = row.trail_target;
+    const current = row.trail_current;
+    const minPct = row.trail_min_pct;
+
+    if (type === "trail_sl") {
+        const parts = [];
+        if (sl) {
+            parts.push(`→ ${sl}`);
+        } else {
+            parts.push("SL moved");
+        }
+        if (prev) {
+            parts.push(`was ${prev}`);
+        }
+        if (open != null) {
+            parts.push(`open ${open}`);
+        }
+        if (pnl != null) {
+            parts.push(`${pnl}%`);
+        }
+        return `<td class="trail-cell trail-applied" title="SL trailado">${escapeHtml(parts.join(" · "))}</td>`;
+    }
+    if (type === "trail_candle") {
+        const parts = ["vela cerrada"];
+        if (open != null) {
+            parts.push(`open ${open}`);
+        }
+        if (pnl != null) {
+            parts.push(`${pnl}%`);
+        }
+        if (row.signal) {
+            parts.push(String(row.signal));
+        }
+        return `<td class="trail-cell" title="Evaluación trailing por vela">${escapeHtml(parts.join(" · "))}</td>`;
+    }
+    if (type === "trail_sl_skip") {
+        const reason = row.block_reason || "skip";
+        let detail = reason;
+        if (reason === "profit_gate" && minPct != null && pnl != null) {
+            detail += ` · pnl ${pnl}% < min ${minPct}%`;
+        } else if (target != null && current != null) {
+            detail += ` · tgt ${target} · cur ${current}`;
+        } else if (open != null) {
+            detail += ` · open ${open}`;
+        } else if (pnl != null) {
+            detail += ` · pnl ${pnl}%`;
+        }
+        return `<td class="trail-cell trail-skip" title="${escapeHtml(reason)}">${escapeHtml(detail)}</td>`;
+    }
+    if (sl) {
+        return `<td class="trail-cell">${escapeHtml(String(sl))}</td>`;
+    }
+    return '<td class="trail-cell trail-na">—</td>';
+}
+
 function renderRecent(rows) {
     const body = document.getElementById("recent-body");
     if (!rows.length) {
-        body.innerHTML = `<tr><td colspan="11">No events yet.</td></tr>`;
+        body.innerHTML = `<tr><td colspan="12">No events yet.</td></tr>`;
         return;
     }
     body.innerHTML = rows
@@ -718,9 +827,10 @@ function renderRecent(rows) {
                 <tr>
                     <td>${row.created_at || "—"}</td>
                     <td>${renderSymbolLink(row.symbol)}</td>
-                    <td>${row.event_type || "—"}</td>
+                    ${renderEventCell(row)}
                     <td>${row.outcome || "—"}</td>
                     <td>${row.block_reason || "—"}</td>
+                    ${renderTrailCell(row)}
                     <td>${row.signal || "—"}</td>
                     ${renderFilterCell(filters.conf)}
                     ${renderFilterCell(filters.rsi)}
@@ -1310,7 +1420,7 @@ async function refresh() {
             fetchJson("/api/breakdown/block_reason"),
             fetchJson("/api/block-summary"),
             fetchJson("/api/breakdown/symbol"),
-            fetchJson("/api/recent"),
+            fetchRecentEvents(),
             fetchJson("/api/features"),
         ]);
 
@@ -1387,6 +1497,9 @@ suggestionsContent.addEventListener("click", (event) => {
 daysEl.addEventListener("change", refresh);
 symbolEl.addEventListener("change", refresh);
 granularityEl.addEventListener("change", refresh);
+if (eventFilterEl) {
+    eventFilterEl.addEventListener("change", refresh);
+}
 
 applySymbolFromQuery();
 loadSymbolPorts().then(() => {

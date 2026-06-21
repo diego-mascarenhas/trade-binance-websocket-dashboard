@@ -129,6 +129,15 @@ def _flatten_row(row: dict[str, Any]) -> dict[str, Any]:
         "execution_mode": config.get("execution_mode"),
         "execution_enabled": config.get("execution_enabled"),
         "execute_on_valid_entry": config.get("execute_on_valid_entry"),
+        "sl": market.get("sl"),
+        "prev_sl": market.get("prev_sl"),
+        "candle_open": market.get("candle_open"),
+        "unrealized_pnl_pct": market.get("unrealized_pnl_pct"),
+        "trail_target": market.get("target"),
+        "trail_current": market.get("current"),
+        "trail_min_pct": market.get("min_pct"),
+        "pnl_pct": market.get("pnl_pct"),
+        "candle_time": market.get("candle_time"),
         "config_version": row.get("config_version"),
     }
 
@@ -549,17 +558,34 @@ def get_breakdown(
     return [{"label": row["label"], "count": int(row["count"])} for row in rows]
 
 
-def get_recent_events(limit: int = 50, symbol: str | None = None) -> list[dict[str, Any]]:
+def get_recent_events(
+    limit: int = 50,
+    symbol: str | None = None,
+    *,
+    days: int | None = None,
+    event_group: str | None = None,
+) -> list[dict[str, Any]]:
     if not db_store.is_enabled():
         return []
 
     limit = max(1, min(limit, 500))
+    where_parts: list[str] = []
     params: list[Any] = []
-    where_sql = "1=1"
+    where_extra, day_params = _days_clause(days)
+    if where_extra:
+        where_parts.append(where_extra.lstrip(" AND "))
+        params.extend(day_params)
     if symbol:
-        where_sql = "symbol = %s"
+        where_parts.append("symbol = %s")
         params.append(symbol.upper())
+    group = (event_group or "").strip().lower()
+    if group == "trail":
+        where_parts.append("event_type IN ('trail_candle', 'trail_sl', 'trail_sl_skip')")
+    elif group:
+        where_parts.append("event_type = %s")
+        params.append(group)
 
+    where_sql = " AND ".join(where_parts) if where_parts else "1=1"
     params.append(limit)
 
     try:

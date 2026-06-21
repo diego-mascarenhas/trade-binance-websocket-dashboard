@@ -754,3 +754,33 @@ th {
     font-size: 0.85rem;
     white-space: nowrap;
 }
+
+.trail-cell {
+    font-size: 0.85rem;
+    white-space: nowrap;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.trail-applied {
+    color: #86efac;
+}
+
+.trail-skip {
+    color: #fcd34d;
+}
+
+.trail-na {
+    color: #6b7280;
+}
+
+.event-cell {
+    font-size: 0.9rem;
+    white-space: nowrap;
+}
+
+.event-trail {
+    color: #a78bfa;
+    font-weight: 600;
+}

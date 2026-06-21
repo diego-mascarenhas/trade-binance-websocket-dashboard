@@ -256,7 +256,24 @@ def block_summary():
 @app.route("/api/recent")
 def recent():
     limit = _int_arg("limit", 50, minimum=1, maximum=500)
-    return _cors(jsonify(db_analytics.get_recent_events(limit, _optional_symbol())))
+    try:
+        days = int(request.args.get("days", 7))
+    except (TypeError, ValueError):
+        days = 7
+    days_filter = None if days <= 0 else max(1, min(days, 365))
+    event_group = (request.args.get("event_group") or "").strip().lower() or None
+    if event_group in ("all", ""):
+        event_group = None
+    return _cors(
+        jsonify(
+            db_analytics.get_recent_events(
+                limit,
+                _optional_symbol(),
+                days=days_filter,
+                event_group=event_group,
+            )
+        )
+    )
 
 
 @app.route("/api/features")
