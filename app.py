@@ -3039,6 +3039,15 @@ def get_candles_df(*, refresh_execution: bool = True) -> pd.DataFrame:
 
     exposure = execution.get_exchange_exposure(SYMBOL)
     if refresh_execution:
+        trail_anchor = None
+        if execution.SCALPER_MODE and execution.TRAIL_SL_ENABLED:
+            closed_rows = [row for row in candles if row.get("x")]
+            offset = max(1, int(execution.TRAIL_SL_CANDLE_OFFSET))
+            if len(closed_rows) >= offset:
+                try:
+                    trail_anchor = float(closed_rows[-offset]["o"])
+                except (TypeError, ValueError, KeyError):
+                    trail_anchor = None
         maintain_plan = resolved_trade_plan
         if not maintain_plan.get("active") and exposure.get("open"):
             maintain_plan = trade_plan_for_position_reconcile(
@@ -3055,9 +3064,14 @@ def get_candles_df(*, refresh_execution: bool = True) -> pd.DataFrame:
                 sl=float(maintain_plan["sl"]) if maintain_plan.get("sl") else None,
                 tp=float(maintain_plan["tp1"]) if maintain_plan.get("tp1") else None,
                 market_analysis=snapshot_market_analysis,
+                trail_anchor=trail_anchor,
             )
         else:
-            execution.run_execution_maintenance(SYMBOL, market_analysis=snapshot_market_analysis)
+            execution.run_execution_maintenance(
+                SYMBOL,
+                market_analysis=snapshot_market_analysis,
+                trail_anchor=trail_anchor,
+            )
     metrics["execution"] = {
         **execution.get_execution_status(),
         "position": exposure,

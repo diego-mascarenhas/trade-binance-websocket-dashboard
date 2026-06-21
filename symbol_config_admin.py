@@ -41,6 +41,9 @@ CONFIG_KEY_LABELS: dict[str, str] = {
     "CLOSE_RSI_SHORT_MAX": "RSI cierre SHORT (sobreventa)",
     "CLOSE_RSI_MIN_PROFIT_PCT": "Beneficio mínimo RSI exit (%)",
     "CLOSE_RSI_REQUIRE_PROFIT": "RSI exit solo en ganancia",
+    "TRAIL_SL_ENABLED": "Trailing SL por apertura de vela",
+    "TRAIL_SL_FEE_PCT": "Comisión round-trip (%)",
+    "TRAIL_SL_CANDLE_OFFSET": "Velas atrás para el ancla",
 }
 
 CONFIG_KEY_HELP: dict[str, str] = {
@@ -58,6 +61,9 @@ CONFIG_KEY_HELP: dict[str, str] = {
     "CLOSE_RSI_SHORT_MAX": "SHORT: cierra cuando RSI ≤ este valor (sobreventa, p.ej. 28).",
     "CLOSE_RSI_MIN_PROFIT_PCT": "0 = sin umbral %; >0 exige ese % de uPnL mínimo.",
     "CLOSE_RSI_REQUIRE_PROFIT": "true = solo cierra si la posición está en ganancia (uPnL > 0).",
+    "TRAIL_SL_ENABLED": "Sube el SL pegado a la apertura de la última vela cerrada una vez en ganancia (solo scalper).",
+    "TRAIL_SL_FEE_PCT": "Comisión ida+vuelta a cubrir antes de trailar y suelo de break-even (default 0.10%).",
+    "TRAIL_SL_CANDLE_OFFSET": "1 = última vela cerrada; 2 = dos atrás (más colchón).",
 }
 
 # Suggested bounds for /config/ UI (more trades vs fewer/stricter).
@@ -242,6 +248,9 @@ SCALP_AGGRESSIVE_FLEET_VALUES: dict[str, Any] = {
     "CLOSE_RSI_SHORT_MAX": 28.0,
     "CLOSE_RSI_MIN_PROFIT_PCT": 0.0,
     "CLOSE_RSI_REQUIRE_PROFIT": True,
+    "TRAIL_SL_ENABLED": True,
+    "TRAIL_SL_FEE_PCT": 0.10,
+    "TRAIL_SL_CANDLE_OFFSET": 1,
 }
 
 SCALP_MODERATE_FLEET_VALUES: dict[str, Any] = {
@@ -271,6 +280,9 @@ SCALP_MODERATE_FLEET_VALUES: dict[str, Any] = {
     "CLOSE_RSI_SHORT_MAX": 26.0,
     "CLOSE_RSI_MIN_PROFIT_PCT": 0.05,
     "CLOSE_RSI_REQUIRE_PROFIT": True,
+    "TRAIL_SL_ENABLED": True,
+    "TRAIL_SL_FEE_PCT": 0.10,
+    "TRAIL_SL_CANDLE_OFFSET": 2,
 }
 
 
@@ -332,10 +344,13 @@ _BOOL_KEYS = frozenset(
         "SCALPER_MODE",
         "CLOSE_ON_RSI",
         "CLOSE_RSI_REQUIRE_PROFIT",
+        "TRAIL_SL_ENABLED",
     }
 )
 
-_INT_KEYS = frozenset({"MIN_CONFIDENCE", "SIGNAL_DEBOUNCE_COUNT", "SIGNAL_COOLDOWN_SEC"})
+_INT_KEYS = frozenset(
+    {"MIN_CONFIDENCE", "SIGNAL_DEBOUNCE_COUNT", "SIGNAL_COOLDOWN_SEC", "TRAIL_SL_CANDLE_OFFSET"}
+)
 
 _FLOAT_KEYS = frozenset(
     {
@@ -348,6 +363,7 @@ _FLOAT_KEYS = frozenset(
         "CLOSE_RSI_LONG_MIN",
         "CLOSE_RSI_SHORT_MAX",
         "CLOSE_RSI_MIN_PROFIT_PCT",
+        "TRAIL_SL_FEE_PCT",
         "POSITION_SIZE_USDT",
     }
 )

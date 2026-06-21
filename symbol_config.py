@@ -42,6 +42,9 @@ EXECUTION_OVERRIDABLE_KEYS: dict[str, Callable[[Any], Any]] = {
     "CLOSE_RSI_SHORT_MAX": float,
     "CLOSE_RSI_MIN_PROFIT_PCT": float,
     "CLOSE_RSI_REQUIRE_PROFIT": _EXEC_BOOL,
+    "TRAIL_SL_ENABLED": _EXEC_BOOL,
+    "TRAIL_SL_FEE_PCT": float,
+    "TRAIL_SL_CANDLE_OFFSET": int,
 }
 
 
@@ -241,6 +244,9 @@ def build_config_snapshot(module_globals: dict[str, Any]) -> dict[str, Any]:
     snapshot["close_rsi_long_min"] = execution.CLOSE_RSI_LONG_MIN
     snapshot["close_rsi_short_max"] = execution.CLOSE_RSI_SHORT_MAX
     snapshot["close_rsi_require_profit"] = execution.CLOSE_RSI_REQUIRE_PROFIT
+    snapshot["trail_sl_enabled"] = execution.TRAIL_SL_ENABLED
+    snapshot["trail_sl_fee_pct"] = execution.TRAIL_SL_FEE_PCT
+    snapshot["trail_sl_candle_offset"] = execution.TRAIL_SL_CANDLE_OFFSET
     return snapshot
 
 

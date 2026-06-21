@@ -118,6 +118,9 @@ CLOSE_RSI_LONG_MIN = float(os.getenv("CLOSE_RSI_LONG_MIN", "72"))
 CLOSE_RSI_SHORT_MAX = float(os.getenv("CLOSE_RSI_SHORT_MAX", "28"))
 CLOSE_RSI_MIN_PROFIT_PCT = float(os.getenv("CLOSE_RSI_MIN_PROFIT_PCT", "0"))
 CLOSE_RSI_REQUIRE_PROFIT = _env_bool("CLOSE_RSI_REQUIRE_PROFIT", "true")
+TRAIL_SL_ENABLED = _env_bool("TRAIL_SL_ENABLED", "false")
+TRAIL_SL_FEE_PCT = float(os.getenv("TRAIL_SL_FEE_PCT", "0.10"))
+TRAIL_SL_CANDLE_OFFSET = max(1, int(os.getenv("TRAIL_SL_CANDLE_OFFSET", "1")))
 
 
 def _rsi_close_enabled() -> bool:
@@ -3408,6 +3411,112 @@ def reconcile_position_protection(
     return summary
 
 
+def _trail_sl_enabled() -> bool:
+    return SCALPER_MODE and TRAIL_SL_ENABLED
+
+
+def maybe_trail_sl(
+    symbol: str,
+    snapshot: dict[str, Any],
+    candle_open: float | None,
+) -> bool:
+    """Ratchet the SL toward the reference candle open once in profit (net of fees).
+
+    Scalper-only. Returns True when trailing 'owns' the SL (engaged), so the caller
+    skips the static break-even path. Only moves the stop in the favorable direction.
+    """
+    if not _trail_sl_enabled():
+        return False
+    if not EXECUTION_ENABLED or telegram.is_trading_paused() or EXECUTION_MODE != "live":
+        return False
+    if not _keys_configured() or not REST_PLACE_SL_TP:
+        return False
+    if not snapshot.get("open"):
+        return False
+
+    direction = _primary_position_direction(snapshot.get("direction"))
+    if direction not in ("LONG", "SHORT"):
+        return False
+
+    ctx = _get_trade_context(symbol)
+    entry_raw = snapshot.get("entry") or ctx.get("entry")
+    try:
+        entry = float(entry_raw) if entry_raw not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        entry = 0.0
+    if entry <= 0:
+        return False
+
+    _attach_unrealized_pnl_pct(snapshot)
+    try:
+        pnl_pct = float(snapshot.get("unrealized_pnl_pct") or 0)
+    except (TypeError, ValueError):
+        pnl_pct = 0.0
+
+    # Not yet profitable after round-trip fees → let BE/structural handle it.
+    if pnl_pct <= TRAIL_SL_FEE_PCT:
+        return False
+
+    symbol = symbol.upper()
+    # Trailing now owns the SL; mark be_applied so reconcile/static-BE won't fight it.
+    _update_trade_context(symbol, be_applied=True)
+
+    if candle_open is None or candle_open <= 0:
+        return True
+
+    fee = TRAIL_SL_FEE_PCT / 100.0
+    if direction == "LONG":
+        be_floor = entry * (1 + fee)
+        target = max(float(candle_open), be_floor)
+    else:
+        be_floor = entry * (1 - fee)
+        target = min(float(candle_open), be_floor)
+
+    target = _ensure_sl_behind_mark(symbol, direction, target)
+    sl_price = round_price_for_profit_sl(symbol, direction, target)
+    target_f = float(sl_price)
+    if target_f <= 0:
+        return True
+
+    current = _get_sl_trigger_from_orders(symbol, direction)
+    if current and current > 0:
+        if direction == "LONG" and target_f <= current:
+            return True
+        if direction == "SHORT" and target_f >= current:
+            return True
+        if abs(target_f - current) / current * 100 < SL_REPRICE_TOLERANCE_PCT:
+            return True
+
+    qty = _position_qty_string(symbol, direction)
+    if not qty:
+        return True
+
+    _cancel_symbol_sl_orders(symbol, direction)
+    placed, skipped = _place_sl_for_position(symbol, direction, sl_price, qty, log_suffix="_trail")
+    if placed:
+        _invalidate_position_cache(symbol)
+        _append_orders_log(
+            "trail_sl_applied",
+            symbol=symbol,
+            direction=direction,
+            entry=entry,
+            sl=sl_price,
+            candle_open=candle_open,
+            unrealized_pnl_pct=pnl_pct,
+            prev_sl=current,
+            qty=qty,
+        )
+        _log_execution_decision(
+            symbol,
+            "trail_sl",
+            outcome="live",
+            market_snapshot={"signal": direction, "sl": sl_price, "candle_open": candle_open},
+        )
+    elif not skipped:
+        logger.warning("%s: trail SL placement failed", symbol)
+    return True
+
+
 def run_execution_maintenance(
     symbol: str,
     *,
@@ -3415,6 +3524,7 @@ def run_execution_maintenance(
     sl: float | None = None,
     tp: float | None = None,
     market_analysis: dict[str, Any] | None = None,
+    trail_anchor: float | None = None,
 ) -> None:
     """Periodic: cancel stale entry limits; repair missing SL/TP on open positions."""
     if not EXECUTION_ENABLED or not _keys_configured() or EXECUTION_MODE != "live":
@@ -3434,7 +3544,11 @@ def run_execution_maintenance(
     if snapshot.get("open"):
         if maybe_close_on_rsi(symbol, snapshot, market_analysis):
             return
-        _maybe_apply_breakeven_sl(symbol, snapshot, market_analysis)
+        trail_owns = maybe_trail_sl(symbol, snapshot, trail_anchor)
+        # In scalper trailing mode the candle-trail is the SOLE SL manager: the old
+        # break-even/profit-lock path is disabled so they never coexist.
+        if not trail_owns and not _trail_sl_enabled():
+            _maybe_apply_breakeven_sl(symbol, snapshot, market_analysis)
     reconcile_position_protection(symbol, direction=direction, sl=sl, tp=tp)
 
 
