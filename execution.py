@@ -112,6 +112,22 @@ TP_REPRICE_TOLERANCE_PCT = float(os.getenv("TP_REPRICE_TOLERANCE_PCT", "0.5"))
 OB_EXIT_ON_OPPOSITE = _env_bool("OB_EXIT_ON_OPPOSITE", "false")
 OB_EXIT_REQUIRE_OB_REASON = _env_bool("OB_EXIT_REQUIRE_OB_REASON", "true")
 OB_EXIT_MIN_PROFIT_PCT = float(os.getenv("OB_EXIT_MIN_PROFIT_PCT", "0"))
+SCALPER_MODE = _env_bool("SCALPER_MODE", "false")
+CLOSE_ON_RSI = _env_bool("CLOSE_ON_RSI", "false")
+CLOSE_RSI_LONG_MIN = float(os.getenv("CLOSE_RSI_LONG_MIN", "72"))
+CLOSE_RSI_SHORT_MAX = float(os.getenv("CLOSE_RSI_SHORT_MAX", "28"))
+CLOSE_RSI_MIN_PROFIT_PCT = float(os.getenv("CLOSE_RSI_MIN_PROFIT_PCT", "0"))
+CLOSE_RSI_REQUIRE_PROFIT = _env_bool("CLOSE_RSI_REQUIRE_PROFIT", "true")
+
+
+def _rsi_close_enabled() -> bool:
+    """Scalper mode always closes by RSI; otherwise honor the standalone flag."""
+    return SCALPER_MODE or CLOSE_ON_RSI
+
+
+def _ob_close_enabled() -> bool:
+    """Scalper mode always closes on opposite OB; otherwise honor the standalone flag."""
+    return SCALPER_MODE or OB_EXIT_ON_OPPOSITE
 SL_REPRICE_TOLERANCE_PCT = float(os.getenv("SL_REPRICE_TOLERANCE_PCT", "0.35"))
 
 _status_lock = threading.Lock()
@@ -222,6 +238,15 @@ def stage_valid_entry_snapshot(symbol: str, market_snapshot: dict[str, Any]) -> 
         pending_entry_market_snapshot=dict(market_snapshot),
         pending_entry_at=time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
     )
+
+
+def _dca_event_snapshot(symbol: str, **overrides: Any) -> dict[str, Any]:
+    """Build a DCA decision snapshot carrying the entry's indicator features (RSI/ADX/etc.)."""
+    ctx = _get_trade_context(symbol)
+    base = ctx.get("entry_market_snapshot") or ctx.get("pending_entry_market_snapshot")
+    snapshot = dict(base) if isinstance(base, dict) and base else {}
+    snapshot.update({k: v for k, v in overrides.items() if v is not None})
+    return snapshot
 
 
 def _resolve_entry_link(symbol: str, ctx: dict[str, Any]) -> tuple[dict[str, Any] | None, int | None]:
@@ -2766,7 +2791,7 @@ def can_close_on_opposite_ob(
     position_direction = position_direction.upper()
     signal = signal.upper()
 
-    if not OB_EXIT_ON_OPPOSITE:
+    if not _ob_close_enabled():
         return False, "ob_exit_disabled"
     if signal not in ("LONG", "SHORT") or position_direction not in ("LONG", "SHORT"):
         return False, "invalid_signal"
@@ -2810,6 +2835,141 @@ def _place_market_close(symbol: str, direction: str, quantity: str) -> dict[str,
     return _fapi_request("POST", "/fapi/v1/order", params)
 
 
+def _perform_market_close(
+    symbol: str,
+    position_direction: str,
+    *,
+    trigger: str,
+    trigger_detail: str,
+    market_snapshot: dict[str, Any] | None = None,
+) -> bool:
+    """Cancel limits/protection and close the open position at market.
+
+    Shared core for signal-driven exits (OB opposite, RSI extreme, ...).
+    `trigger` is a short tag used in log/event names ("ob", "rsi").
+    """
+    global _last_execution_monotonic
+
+    symbol = symbol.upper()
+    position_direction = position_direction.upper()
+    label = trigger.upper()
+    event_tag = f"{trigger}_signal_close"
+
+    qty = _position_qty_string(symbol, position_direction)
+    if not qty:
+        _append_orders_log(
+            f"{trigger}_close_skip",
+            symbol=symbol,
+            direction=position_direction,
+            trigger_detail=trigger_detail,
+            reason="no_qty",
+        )
+        _log_execution_decision(
+            symbol,
+            f"{event_tag}_skip",
+            block_reason="no_qty",
+            market_snapshot=market_snapshot,
+        )
+        return False
+
+    snapshot = _fetch_exchange_exposure(symbol)
+    _attach_unrealized_pnl_pct(snapshot)
+    pnl_pct = snapshot.get("unrealized_pnl_pct")
+    pnl_usdt = snapshot.get("unrealized_pnl")
+    cancelled_limits = _cancel_all_entry_limits(symbol)
+    _cancel_symbol_protection_orders(symbol, position_direction)
+
+    payload = {
+        "symbol": symbol,
+        "direction": position_direction,
+        "trigger": trigger,
+        "trigger_detail": trigger_detail,
+        "qty": qty,
+        "unrealized_pnl_pct": pnl_pct,
+        "unrealized_pnl": pnl_usdt,
+        "cancelled_limits": cancelled_limits,
+        "mode": EXECUTION_MODE,
+    }
+
+    if EXECUTION_MODE == "dry":
+        _append_orders_log(f"dry_run_{trigger}_close", **payload)
+        _set_status(
+            message=f"DRY-RUN {label} close {position_direction} {symbol} qty {qty}",
+            last_event=f"dry_run_{trigger}_close",
+            last_symbol=symbol,
+            last_direction=position_direction,
+        )
+        _last_execution_monotonic = time.monotonic()
+        telegram.notify_position_closed(
+            symbol,
+            f"DRY-RUN {label} close {position_direction} ({trigger_detail}) · qty {qty}",
+        )
+        _log_execution_decision(
+            symbol,
+            event_tag,
+            outcome="dry_run",
+            market_snapshot=market_snapshot,
+        )
+        return True
+
+    if not _keys_configured():
+        _set_status(message=f"Live {label} close requires API keys", last_event="error")
+        return False
+
+    try:
+        response = _place_market_close(symbol, position_direction, qty)
+        order_id = response.get("orderId")
+        _append_orders_log(f"live_{trigger}_signal_close", orderId=order_id, **payload)
+        reset_dca_state(symbol)
+        _update_trade_context(
+            symbol,
+            exit_notified=False,
+            was_open=True,
+            be_applied=False,
+            position_peak_qty=None,
+        )
+        _invalidate_position_cache(symbol)
+        _last_execution_monotonic = time.monotonic()
+        pnl_label = _format_realized_pnl(float(pnl_usdt or 0))
+        telegram.notify_position_closed(
+            symbol,
+            f"{label} CLOSE {position_direction} @ market ({trigger_detail})"
+            f" · order {order_id} · uPnL {pnl_label}",
+        )
+        _set_status(
+            message=f"{label} close {position_direction} {symbol} · {order_id}",
+            last_event=f"live_{trigger}_close",
+            last_symbol=symbol,
+            last_direction=position_direction,
+            last_order_id=order_id,
+        )
+        _log_execution_decision(
+            symbol,
+            event_tag,
+            outcome="live",
+            market_snapshot={
+                **(market_snapshot or {}),
+                "position_direction": position_direction,
+                "trigger_detail": trigger_detail,
+                "orderId": order_id,
+            },
+        )
+        return True
+    except RuntimeError as exc:
+        logger.error("%s close failed for %s: %s", label, symbol, exc)
+        _append_orders_log(
+            f"live_{trigger}_close_failed",
+            symbol=symbol,
+            direction=position_direction,
+            trigger_detail=trigger_detail,
+            error=str(exc),
+            **payload,
+        )
+        _set_status(message=f"{label} close failed: {exc}", last_event="error")
+        _notify_order_failed(symbol, position_direction, exc)
+        return False
+
+
 def _execute_ob_signal_close(
     symbol: str,
     position_direction: str,
@@ -2817,8 +2977,6 @@ def _execute_ob_signal_close(
     reasons: str,
     market_snapshot: dict[str, Any] | None = None,
 ) -> None:
-    global _last_execution_monotonic
-
     symbol = symbol.upper()
     position_direction = position_direction.upper()
     opposite_signal = opposite_signal.upper()
@@ -2845,116 +3003,113 @@ def _execute_ob_signal_close(
         )
         return
 
-    qty = _position_qty_string(symbol, position_direction)
-    if not qty:
-        _append_orders_log(
-            "ob_close_skip",
-            symbol=symbol,
-            direction=position_direction,
-            reason="no_qty",
-        )
-        _log_execution_decision(
-            symbol,
-            "ob_signal_close_skip",
-            block_reason="no_qty",
-            market_snapshot=market_snapshot,
-        )
-        return
+    _perform_market_close(
+        symbol,
+        position_direction,
+        trigger="ob",
+        trigger_detail=f"signal {opposite_signal}",
+        market_snapshot={**(market_snapshot or {}), "opposite_signal": opposite_signal},
+    )
 
-    snapshot = _fetch_exchange_exposure(symbol)
-    _attach_unrealized_pnl_pct(snapshot)
-    pnl_pct = snapshot.get("unrealized_pnl_pct")
-    pnl_usdt = snapshot.get("unrealized_pnl")
-    cancelled_limits = _cancel_all_entry_limits(symbol)
-    _cancel_symbol_protection_orders(symbol, position_direction)
 
-    payload = {
-        "symbol": symbol,
-        "direction": position_direction,
-        "opposite_signal": opposite_signal,
-        "qty": qty,
-        "reasons": reasons,
-        "unrealized_pnl_pct": pnl_pct,
-        "unrealized_pnl": pnl_usdt,
-        "cancelled_limits": cancelled_limits,
-        "mode": EXECUTION_MODE,
-    }
-
-    if EXECUTION_MODE == "dry":
-        _append_orders_log("dry_run_ob_close", **payload)
-        _set_status(
-            message=f"DRY-RUN OB close {position_direction} {symbol} qty {qty}",
-            last_event="dry_run_ob_close",
-            last_symbol=symbol,
-            last_direction=position_direction,
-        )
-        _last_execution_monotonic = time.monotonic()
-        telegram.notify_position_closed(
-            symbol,
-            f"DRY-RUN OB close {position_direction} (signal {opposite_signal}) · qty {qty}",
-        )
-        _log_execution_decision(
-            symbol,
-            "ob_signal_close",
-            outcome="dry_run",
-            market_snapshot=market_snapshot,
-        )
-        return
-
-    if not _keys_configured():
-        _set_status(message="Live OB close requires API keys", last_event="error")
-        return
-
+def _rsi_close_reason(direction: str, market_analysis: dict[str, Any] | None) -> str | None:
+    """RSI extreme that warrants closing in profit (LONG overbought / SHORT oversold)."""
+    if not _rsi_close_enabled() or not market_analysis:
+        return None
+    rsi = market_analysis.get("rsi")
+    if rsi is None:
+        return None
     try:
-        response = _place_market_close(symbol, position_direction, qty)
-        order_id = response.get("orderId")
-        _append_orders_log("live_ob_signal_close", orderId=order_id, **payload)
-        reset_dca_state(symbol)
-        _update_trade_context(
-            symbol,
-            exit_notified=False,
-            was_open=True,
-            be_applied=False,
-            position_peak_qty=None,
-        )
-        _invalidate_position_cache(symbol)
-        _last_execution_monotonic = time.monotonic()
-        pnl_label = _format_realized_pnl(float(pnl_usdt or 0))
-        telegram.notify_position_closed(
-            symbol,
-            f"OB CLOSE {position_direction} @ market (signal {opposite_signal})"
-            f" · order {order_id} · uPnL {pnl_label}",
-        )
-        _set_status(
-            message=f"OB close {position_direction} {symbol} · {order_id}",
-            last_event="live_ob_close",
-            last_symbol=symbol,
-            last_direction=position_direction,
-            last_order_id=order_id,
-        )
-        _log_execution_decision(
-            symbol,
-            "ob_signal_close",
-            outcome="live",
-            market_snapshot={
-                **(market_snapshot or {}),
-                "position_direction": position_direction,
-                "opposite_signal": opposite_signal,
-                "orderId": order_id,
-            },
-        )
-    except RuntimeError as exc:
-        logger.error("OB signal close failed for %s: %s", symbol, exc)
-        _append_orders_log(
-            "live_ob_close_failed",
-            symbol=symbol,
-            direction=position_direction,
-            opposite_signal=opposite_signal,
-            error=str(exc),
-            **payload,
-        )
-        _set_status(message=f"OB close failed: {exc}", last_event="error")
-        _notify_order_failed(symbol, position_direction, exc)
+        rsi_v = float(rsi)
+    except (TypeError, ValueError):
+        return None
+    direction = direction.upper()
+    if direction == "LONG" and rsi_v >= CLOSE_RSI_LONG_MIN:
+        return f"rsi_{rsi_v:.0f}"
+    if direction == "SHORT" and rsi_v <= CLOSE_RSI_SHORT_MAX:
+        return f"rsi_{rsi_v:.0f}"
+    return None
+
+
+def _execute_rsi_signal_close(
+    symbol: str,
+    position_direction: str,
+    reason: str,
+    market_snapshot: dict[str, Any] | None = None,
+) -> None:
+    if not _rsi_close_enabled():
+        return
+    symbol = symbol.upper()
+    position_direction = position_direction.upper()
+    if not has_open_position(symbol):
+        return
+    pos_dir = get_open_position_direction(symbol)
+    if not pos_dir or pos_dir != position_direction:
+        return
+    _perform_market_close(
+        symbol,
+        position_direction,
+        trigger="rsi",
+        trigger_detail=reason,
+        market_snapshot=market_snapshot,
+    )
+
+
+def maybe_close_on_rsi(
+    symbol: str,
+    snapshot: dict[str, Any],
+    market_analysis: dict[str, Any] | None,
+) -> bool:
+    """Close at market when RSI hits an extreme against the open position. Returns True if a close was started."""
+    if not _rsi_close_enabled():
+        return False
+    if not EXECUTION_ENABLED or telegram.is_trading_paused():
+        return False
+    if not snapshot.get("open"):
+        return False
+
+    direction = _primary_position_direction(snapshot.get("direction"))
+    if direction not in ("LONG", "SHORT"):
+        return False
+
+    reason = _rsi_close_reason(direction, market_analysis)
+    if not reason:
+        return False
+
+    # Only close in profit (never turn a winner-by-RSI into a realized loss).
+    if CLOSE_RSI_REQUIRE_PROFIT or CLOSE_RSI_MIN_PROFIT_PCT > 0:
+        _attach_unrealized_pnl_pct(snapshot)
+        pnl_usdt = snapshot.get("unrealized_pnl")
+        try:
+            pnl_pct = float(snapshot.get("unrealized_pnl_pct") or 0)
+        except (TypeError, ValueError):
+            pnl_pct = 0.0
+        if CLOSE_RSI_REQUIRE_PROFIT:
+            try:
+                if pnl_usdt is None or float(pnl_usdt) <= 0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if CLOSE_RSI_MIN_PROFIT_PCT > 0 and pnl_pct < CLOSE_RSI_MIN_PROFIT_PCT:
+            return False
+
+    market_snapshot = {
+        "signal": direction,
+        "rsi": (market_analysis or {}).get("rsi"),
+        "adx": (market_analysis or {}).get("adx"),
+        "htf_adx": (market_analysis or {}).get("htf_adx"),
+        "macd_hist": (market_analysis or {}).get("macd_hist"),
+        "trend": (market_analysis or {}).get("htf_bias"),
+    }
+    _run_execution_thread(
+        _execute_rsi_signal_close,
+        symbol,
+        direction,
+        reason,
+        market_snapshot,
+        thread_name=f"exec-rsi-close-{symbol.upper()}",
+    )
+    return True
 
 
 def maybe_close_on_opposite_ob(
@@ -2970,7 +3125,7 @@ def maybe_close_on_opposite_ob(
     Returns (handled, triggered): handled=True stops the entry path; triggered=True
     means a close thread was started.
     """
-    if not OB_EXIT_ON_OPPOSITE:
+    if not _ob_close_enabled():
         return False, False
     if not EXECUTION_ENABLED or telegram.is_trading_paused():
         return False, False
@@ -3277,6 +3432,8 @@ def run_execution_maintenance(
     _sync_dca_leg_count(symbol)
     snapshot = _fetch_exchange_exposure(symbol)
     if snapshot.get("open"):
+        if maybe_close_on_rsi(symbol, snapshot, market_analysis):
+            return
         _maybe_apply_breakeven_sl(symbol, snapshot, market_analysis)
     reconcile_position_protection(symbol, direction=direction, sl=sl, tp=tp)
 
@@ -5236,7 +5393,9 @@ def _execute_signal_dca_add(
             symbol,
             "order_dry_run_dca_add",
             outcome="dry_run",
-            market_snapshot={"signal": direction, "leg": leg_index, "entry": price_str},
+            market_snapshot=_dca_event_snapshot(
+                symbol, signal=direction, leg=leg_index, entry=price_str
+            ),
         )
         return
 
@@ -5289,7 +5448,9 @@ def _execute_signal_dca_add(
             symbol,
             "order_live_dca_add",
             outcome="live",
-            market_snapshot={"signal": direction, "leg": leg_index, "orderId": order_id},
+            market_snapshot=_dca_event_snapshot(
+                symbol, signal=direction, leg=leg_index, orderId=order_id
+            ),
         )
         reconcile_position_protection(symbol, direction=direction, sl=sl, tp=tp)
     except RuntimeError as exc:

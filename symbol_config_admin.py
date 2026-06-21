@@ -35,6 +35,12 @@ CONFIG_KEY_LABELS: dict[str, str] = {
     "OB_EXIT_ON_OPPOSITE": "Cerrar en OB contrario",
     "OB_EXIT_REQUIRE_OB_REASON": "OB exit solo con muro OB",
     "OB_EXIT_MIN_PROFIT_PCT": "Beneficio mínimo OB exit (%)",
+    "SCALPER_MODE": "Modo scalper (gate de cierres)",
+    "CLOSE_ON_RSI": "Cerrar por RSI extremo",
+    "CLOSE_RSI_LONG_MIN": "RSI cierre LONG (sobrecompra)",
+    "CLOSE_RSI_SHORT_MAX": "RSI cierre SHORT (sobreventa)",
+    "CLOSE_RSI_MIN_PROFIT_PCT": "Beneficio mínimo RSI exit (%)",
+    "CLOSE_RSI_REQUIRE_PROFIT": "RSI exit solo en ganancia",
 }
 
 CONFIG_KEY_HELP: dict[str, str] = {
@@ -43,9 +49,15 @@ CONFIG_KEY_HELP: dict[str, str] = {
     "SIGNAL_DEBOUNCE_COUNT": "Ticks OB consecutivos antes de señal estable (0 = inmediato).",
     "ADX_USE_HTF": "Si true, ADX usa velas HTF; si false, usa 1m.",
     "symbol_trading_enabled": "false desactiva entradas en ese par.",
-    "OB_EXIT_ON_OPPOSITE": "Cierra la posición a mercado cuando llega señal OB del lado opuesto.",
+    "OB_EXIT_ON_OPPOSITE": "Cierra en OB contrario. Forzado a ON con SCALPER_MODE; si no, gobierna este flag.",
     "OB_EXIT_REQUIRE_OB_REASON": "Solo cierra con OB: near support/resistance (no señales 24h).",
     "OB_EXIT_MIN_PROFIT_PCT": "0 = cierra siempre; >0 exige ese % de uPnL mínimo.",
+    "SCALPER_MODE": "Interruptor maestro: si true, SIEMPRE cierra por RSI y por OB contrario.",
+    "CLOSE_ON_RSI": "Cierra por RSI extremo. Forzado a ON con SCALPER_MODE; si no, gobierna este flag.",
+    "CLOSE_RSI_LONG_MIN": "LONG: cierra cuando RSI ≥ este valor (sobrecompra, p.ej. 72).",
+    "CLOSE_RSI_SHORT_MAX": "SHORT: cierra cuando RSI ≤ este valor (sobreventa, p.ej. 28).",
+    "CLOSE_RSI_MIN_PROFIT_PCT": "0 = sin umbral %; >0 exige ese % de uPnL mínimo.",
+    "CLOSE_RSI_REQUIRE_PROFIT": "true = solo cierra si la posición está en ganancia (uPnL > 0).",
 }
 
 # Suggested bounds for /config/ UI (more trades vs fewer/stricter).
@@ -224,6 +236,12 @@ SCALP_AGGRESSIVE_FLEET_VALUES: dict[str, Any] = {
     "OB_EXIT_ON_OPPOSITE": True,
     "OB_EXIT_REQUIRE_OB_REASON": True,
     "OB_EXIT_MIN_PROFIT_PCT": 0.0,
+    "SCALPER_MODE": True,
+    "CLOSE_ON_RSI": True,
+    "CLOSE_RSI_LONG_MIN": 72.0,
+    "CLOSE_RSI_SHORT_MAX": 28.0,
+    "CLOSE_RSI_MIN_PROFIT_PCT": 0.0,
+    "CLOSE_RSI_REQUIRE_PROFIT": True,
 }
 
 SCALP_MODERATE_FLEET_VALUES: dict[str, Any] = {
@@ -247,6 +265,12 @@ SCALP_MODERATE_FLEET_VALUES: dict[str, Any] = {
     "OB_EXIT_ON_OPPOSITE": True,
     "OB_EXIT_REQUIRE_OB_REASON": True,
     "OB_EXIT_MIN_PROFIT_PCT": 0.05,
+    "SCALPER_MODE": True,
+    "CLOSE_ON_RSI": True,
+    "CLOSE_RSI_LONG_MIN": 74.0,
+    "CLOSE_RSI_SHORT_MAX": 26.0,
+    "CLOSE_RSI_MIN_PROFIT_PCT": 0.05,
+    "CLOSE_RSI_REQUIRE_PROFIT": True,
 }
 
 
@@ -305,6 +329,9 @@ _BOOL_KEYS = frozenset(
         "symbol_trading_enabled",
         "OB_EXIT_ON_OPPOSITE",
         "OB_EXIT_REQUIRE_OB_REASON",
+        "SCALPER_MODE",
+        "CLOSE_ON_RSI",
+        "CLOSE_RSI_REQUIRE_PROFIT",
     }
 )
 
@@ -318,9 +345,13 @@ _FLOAT_KEYS = frozenset(
         "RSI_SHORT_MIN",
         "ADX_MIN_TREND",
         "OB_EXIT_MIN_PROFIT_PCT",
+        "CLOSE_RSI_LONG_MIN",
+        "CLOSE_RSI_SHORT_MAX",
+        "CLOSE_RSI_MIN_PROFIT_PCT",
         "POSITION_SIZE_USDT",
     }
 )
+# (bool keys handled separately in _BOOL_KEYS)
 
 
 def _normalize_symbol(symbol: str) -> str:

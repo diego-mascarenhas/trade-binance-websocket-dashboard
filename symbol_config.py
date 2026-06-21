@@ -36,6 +36,12 @@ EXECUTION_OVERRIDABLE_KEYS: dict[str, Callable[[Any], Any]] = {
     "OB_EXIT_ON_OPPOSITE": _EXEC_BOOL,
     "OB_EXIT_REQUIRE_OB_REASON": _EXEC_BOOL,
     "OB_EXIT_MIN_PROFIT_PCT": float,
+    "SCALPER_MODE": _EXEC_BOOL,
+    "CLOSE_ON_RSI": _EXEC_BOOL,
+    "CLOSE_RSI_LONG_MIN": float,
+    "CLOSE_RSI_SHORT_MAX": float,
+    "CLOSE_RSI_MIN_PROFIT_PCT": float,
+    "CLOSE_RSI_REQUIRE_PROFIT": _EXEC_BOOL,
 }
 
 
@@ -230,6 +236,11 @@ def build_config_snapshot(module_globals: dict[str, Any]) -> dict[str, Any]:
     snapshot["trade_plan_partial_close_pct"] = execution.TRADE_PLAN_PARTIAL_CLOSE_PCT
     snapshot["ob_exit_on_opposite"] = execution.OB_EXIT_ON_OPPOSITE
     snapshot["ob_exit_min_profit_pct"] = execution.OB_EXIT_MIN_PROFIT_PCT
+    snapshot["scalper_mode"] = execution.SCALPER_MODE
+    snapshot["close_on_rsi"] = execution.CLOSE_ON_RSI
+    snapshot["close_rsi_long_min"] = execution.CLOSE_RSI_LONG_MIN
+    snapshot["close_rsi_short_max"] = execution.CLOSE_RSI_SHORT_MAX
+    snapshot["close_rsi_require_profit"] = execution.CLOSE_RSI_REQUIRE_PROFIT
     return snapshot
 
 
