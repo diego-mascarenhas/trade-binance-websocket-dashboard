@@ -116,6 +116,8 @@ HTF_INTERVAL = os.getenv("HTF_INTERVAL", "15m")
 HTF_CANDLES = int(os.getenv("HTF_CANDLES", "120"))
 REQUIRE_TREND_ALIGN = os.getenv("REQUIRE_TREND_ALIGN", "true").lower() in ("1", "true", "yes")
 SIGNAL_COOLDOWN_SEC = int(os.getenv("SIGNAL_COOLDOWN_SEC", "180"))
+OB_DCA_GATE_ENABLED = os.getenv("OB_DCA_GATE_ENABLED", "true").lower() in ("1", "true", "yes")
+OB_SAME_LEVEL_TOL_PCT = float(os.getenv("OB_SAME_LEVEL_TOL_PCT", "0.15"))
 DECISION_LOG_DEDUP_SEC = max(0, int(os.getenv("DECISION_LOG_DEDUP_SEC", "0")))
 _NOISY_DECISION_EVENTS = frozenset({"indicator_blocked", "valid_entry_blocked"})
 _last_decision_log_mono: dict[tuple[str, str, str], float] = {}
@@ -217,6 +219,7 @@ htf_candles: deque = deque(maxlen=HTF_CANDLES)
 forming_candle: dict | None = None
 htf_forming_candle: dict | None = None
 last_valid_entry_monotonic: float | None = None
+last_recorded_entry_ob: dict | None = None
 orderbook: dict = {"bids": [], "asks": []}
 analysis_orderbook: dict = {"bids": [], "asks": []}
 latest_pattern = "None"
@@ -1633,6 +1636,101 @@ def resolve_entry_candle_time(
     return None
 
 
+def _ob_walls_match(
+    support_a: float | None,
+    resistance_a: float | None,
+    support_b: float | None,
+    resistance_b: float | None,
+    tol_pct: float,
+) -> bool:
+    if not support_a or not resistance_a or not support_b or not resistance_b:
+        return False
+    if support_a <= 0 or resistance_a <= 0 or support_b <= 0 or resistance_b <= 0:
+        return False
+    tol = max(tol_pct, 0.0) / 100.0
+    return (
+        abs(support_a - support_b) / support_a <= tol
+        and abs(resistance_a - resistance_b) / resistance_a <= tol
+    )
+
+
+def _next_dca_leg_price_ready(
+    signal: str,
+    trade_plan: dict | None,
+    leg_index: int,
+    ref_price: float | None,
+) -> bool:
+    """True when price has reached the planned DCA leg (next OB band)."""
+    if leg_index <= 0 or not trade_plan or ref_price is None or ref_price <= 0:
+        return True
+    legs = trade_plan.get("legs") or []
+    if leg_index >= len(legs):
+        return False
+    try:
+        leg_price = float(legs[leg_index].get("price") or 0)
+    except (TypeError, ValueError):
+        return False
+    if leg_price <= 0:
+        return False
+    tol = max(OB_SAME_LEVEL_TOL_PCT, 0.0) / 100.0
+    if signal == "LONG":
+        return ref_price <= leg_price * (1 + tol)
+    if signal == "SHORT":
+        return ref_price >= leg_price * (1 - tol)
+    return False
+
+
+def _ob_entry_block_reason(
+    signal: str,
+    entry: float | None,
+    trade_plan: dict | None,
+) -> str | None:
+    """
+    Block repeat valid entries on the same OB snapshot.
+    With an open position, allow the next leg only when price reaches the next DCA level
+    or the OB walls shift (next structural OB).
+    """
+    global last_recorded_entry_ob
+
+    if not OB_DCA_GATE_ENABLED:
+        return None
+
+    if (
+        not execution.has_open_position(SYMBOL)
+        and execution.dca_legs_placed(SYMBOL) == 0
+        and not execution.has_open_limit_same_side(SYMBOL, signal)
+    ):
+        if last_recorded_entry_ob and last_recorded_entry_ob.get("signal") != signal:
+            last_recorded_entry_ob = None
+
+    if not last_recorded_entry_ob or last_recorded_entry_ob.get("signal") != signal:
+        return None
+
+    pos_dir = execution.get_open_position_direction(SYMBOL)
+    same_walls = _ob_walls_match(
+        last_recorded_entry_ob.get("support"),
+        last_recorded_entry_ob.get("resistance"),
+        support,
+        resistance,
+        OB_SAME_LEVEL_TOL_PCT,
+    )
+    ref_price = latest_price if latest_price and latest_price > 0 else entry
+    placed = execution.dca_legs_placed(SYMBOL)
+
+    if pos_dir == signal:
+        if not same_walls:
+            return None
+        if not _next_dca_leg_price_ready(signal, trade_plan, placed, ref_price):
+            return "ob_dca_not_ready"
+        if last_recorded_entry_ob.get("leg_index") == placed:
+            return "same_ob_level"
+        return None
+
+    if same_walls:
+        return "same_ob_level"
+    return None
+
+
 def record_valid_entry(
     signal: str,
     entry: float | None,
@@ -1643,7 +1741,7 @@ def record_valid_entry(
     trade_plan: dict | None = None,
     market_analysis: dict | None = None,
 ) -> None:
-    global last_valid_entry_monotonic
+    global last_valid_entry_monotonic, last_recorded_entry_ob
 
     market = _decision_market_snapshot(signal, confidence, trend_bias, market_analysis)
 
@@ -1686,9 +1784,22 @@ def record_valid_entry(
         )
         return
 
+    ob_block = _ob_entry_block_reason(signal, entry, trade_plan)
+    if ob_block:
+        log_decision_event(
+            "valid_entry_blocked",
+            outcome="blocked",
+            block_reason=ob_block,
+            market_snapshot=market,
+        )
+        return
+
     now = time.monotonic()
+    pos_dir = execution.get_open_position_direction(SYMBOL)
+    skip_time_cooldown = OB_DCA_GATE_ENABLED and pos_dir == signal
     if (
-        not trade_boost.skips_signal_cooldown(SYMBOL, signal)
+        not skip_time_cooldown
+        and not trade_boost.skips_signal_cooldown(SYMBOL, signal)
         and last_valid_entry_monotonic is not None
         and now - last_valid_entry_monotonic < SIGNAL_COOLDOWN_SEC
     ):
@@ -1718,6 +1829,15 @@ def record_valid_entry(
         }
     )
     last_valid_entry_monotonic = now
+    leg_index = execution.dca_legs_placed(SYMBOL) if execution.has_open_position(SYMBOL) else 0
+    last_recorded_entry_ob = {
+        "signal": signal,
+        "support": support,
+        "resistance": resistance,
+        "zone_pct": zone_position_pct,
+        "entry": entry,
+        "leg_index": leg_index,
+    }
     append_event_log(
         "trades",
         "valid_entry",

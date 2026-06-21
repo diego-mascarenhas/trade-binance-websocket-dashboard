@@ -765,6 +765,12 @@ def _synthesize_block_reason(
         cooldown = config.get("SIGNAL_COOLDOWN_SEC")
         return f"Entrada repetida antes del cooldown ({cooldown or '?'}s)"
 
+    if reason == "same_ob_level":
+        return "Mismo OB que la última entrada — espera el siguiente nivel o cierre"
+
+    if reason == "ob_dca_not_ready":
+        return "Posición abierta: el precio aún no llegó al siguiente nivel DCA del OB"
+
     if reason == "rsi_overbought":
         max_rsi = config.get("RSI_LONG_MAX")
         return f"RSI medio {fmt_num(avg_rsi)} > máx LONG {max_rsi or '?'}"

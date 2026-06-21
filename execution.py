@@ -414,12 +414,34 @@ def breakeven_sl_price(
     )
 
 
+def _tick_decimal_places(tick: Decimal) -> int:
+    """Decimal places required in Binance price strings for this tick size."""
+    if tick <= 0:
+        return 8
+    exponent = tick.normalize().as_tuple().exponent
+    return max(0, -exponent) if isinstance(exponent, int) else 0
+
+
+def _format_binance_price(quantized: Decimal, tick: Decimal) -> str:
+    """Format a tick-quantized price for Binance REST (fixed precision, no exponent)."""
+    decimals = _tick_decimal_places(tick)
+    return f"{quantized:.{decimals}f}"
+
+
+def _round_to_tick(
+    value: float,
+    tick: Decimal,
+    *,
+    rounding=ROUND_DOWN,
+) -> str:
+    quantized = Decimal(str(value)).quantize(tick, rounding=rounding)
+    return _format_binance_price(quantized, tick)
+
+
 def round_price_for_profit_sl(symbol: str, direction: str, value: float) -> str:
     """Round protective stop — favor locking more profit (DOWN)."""
     filt = _load_symbol_filters(symbol)
-    tick = filt["tick_size"]
-    quantized = Decimal(str(value)).quantize(tick, rounding=ROUND_DOWN)
-    return format(quantized, "f")
+    return _round_to_tick(value, filt["tick_size"], rounding=ROUND_DOWN)
 
 
 def _position_qty_decimal(snapshot: dict[str, Any]) -> Decimal:
@@ -2979,7 +3001,7 @@ def has_limit_at_price(symbol: str, direction: str, entry: float) -> bool:
     direction = direction.upper()
     side = "BUY" if direction == "LONG" else "SELL"
     want_ps = direction if is_hedge_mode() else None
-    entry_str = round_price(symbol, entry)
+    entry_str = round_price_for_entry(symbol, direction, entry)
     for order in _get_open_orders(symbol):
         if not _is_entry_limit_order(order):
             continue
@@ -2989,7 +3011,7 @@ def has_limit_at_price(symbol: str, direction: str, entry: float) -> bool:
             pos_side = (order.get("positionSide") or "").upper()
             if pos_side and pos_side not in (want_ps, "BOTH"):
                 continue
-        price_str = round_price(symbol, float(order.get("price", 0)))
+        price_str = round_price_for_entry(symbol, direction, float(order.get("price", 0)))
         if price_str == entry_str:
             return True
     return False
@@ -3434,7 +3456,7 @@ def can_place_dca_bundle(
             return False, "invalid_dca_leg"
         if price <= 0:
             return False, "invalid_dca_leg"
-        price_key = round_price(symbol, price)
+        price_key = round_price_for_entry(symbol, direction, price)
         if price_key in seen_prices:
             return False, "duplicate_dca_price"
         seen_prices.add(price_key)
@@ -3663,9 +3685,14 @@ def _load_symbol_filters(symbol: str) -> dict[str, Decimal]:
 
 def round_price(symbol: str, value: float) -> str:
     filt = _load_symbol_filters(symbol)
-    tick = filt["tick_size"]
-    quantized = Decimal(str(value)).quantize(tick, rounding=ROUND_DOWN)
-    return format(quantized, "f")
+    return _round_to_tick(value, filt["tick_size"], rounding=ROUND_DOWN)
+
+
+def round_price_for_entry(symbol: str, direction: str, value: float) -> str:
+    """Round entry LIMIT prices (LONG → down, SHORT → up) with tick precision."""
+    filt = _load_symbol_filters(symbol)
+    rounding = ROUND_DOWN if direction.upper() == "LONG" else ROUND_UP
+    return _round_to_tick(value, filt["tick_size"], rounding=rounding)
 
 
 def round_price_for_sl(symbol: str, direction: str, value: float) -> str:
@@ -3673,8 +3700,7 @@ def round_price_for_sl(symbol: str, direction: str, value: float) -> str:
     filt = _load_symbol_filters(symbol)
     tick = filt["tick_size"]
     rounding = ROUND_UP if direction.upper() == "SHORT" else ROUND_DOWN
-    quantized = Decimal(str(value)).quantize(tick, rounding=rounding)
-    return format(quantized, "f")
+    return _round_to_tick(value, tick, rounding=rounding)
 
 
 def _get_mark_price(symbol: str) -> float | None:
@@ -4637,7 +4663,11 @@ def _execute_open(
 
     use_market = _use_market_for_first_leg(leg_index)
     qty_entry = _entry_price_for_quantity(symbol, entry, use_market=use_market)
-    price_str = round_price(symbol, entry)
+    price_str = (
+        round_price(symbol, entry)
+        if use_market
+        else round_price_for_entry(symbol, direction, entry)
+    )
     try:
         qty = resolve_leg_order_quantity(
             symbol,
@@ -4845,11 +4875,11 @@ def _execute_signal_dca_add(
         _set_status(message=f"DCA add blocked: {block_reason}", last_event=block_reason)
         return
 
-    price_str = round_price(symbol, entry)
+    price_str = round_price_for_entry(symbol, direction, entry)
     try:
         qty = resolve_leg_order_quantity(
             symbol,
-            entry,
+            float(price_str),
             size_pct=size_pct,
             size_usdt=size_usdt,
         )
@@ -4858,7 +4888,7 @@ def _execute_signal_dca_add(
         _append_orders_log("error", symbol=symbol, error=str(exc), leg=leg_index)
         return
 
-    sl_price = round_price(symbol, sl)
+    sl_price = round_price_for_sl(symbol, direction, sl)
     tp_price = round_price(symbol, tp)
 
     if EXECUTION_MODE == "dry":
@@ -4950,8 +4980,20 @@ def _execute_signal_dca_add(
         )
         reconcile_position_protection(symbol, direction=direction, sl=sl, tp=tp)
     except RuntimeError as exc:
-        logger.error("DCA add failed for %s leg %s: %s", symbol, leg_index, exc)
-        _append_orders_log("live_dca_add_failed", symbol=symbol, leg=leg_index, error=str(exc))
+        logger.error(
+            "DCA add failed for %s leg %s @ %s: %s",
+            symbol,
+            leg_index,
+            price_str,
+            exc,
+        )
+        _append_orders_log(
+            "live_dca_add_failed",
+            symbol=symbol,
+            leg=leg_index,
+            entry=price_str,
+            error=str(exc),
+        )
         _set_status(message=f"DCA add failed: {exc}", last_event="error")
         _notify_order_failed(symbol, direction, exc)
 
@@ -4971,7 +5013,7 @@ def _execute_open_dca(
 
     symbol = symbol.upper()
     direction = direction.upper()
-    sl_price = round_price(symbol, sl)
+    sl_price = round_price_for_sl(symbol, direction, sl)
     tp_price = round_price(symbol, tp)
 
     if EXECUTION_MODE == "dry":
@@ -4979,9 +5021,9 @@ def _execute_open_dca(
         for index, leg in enumerate(legs):
             price = float(leg["price"])
             size_pct = float(leg["size_pct"])
-            price_str = round_price(symbol, price)
+            price_str = round_price_for_entry(symbol, direction, price)
             try:
-                qty = _calculate_quantity(symbol, price, size_pct)
+                qty = _calculate_quantity(symbol, float(price_str), size_pct)
             except ValueError as exc:
                 _set_status(message=str(exc), last_event="error")
                 _append_orders_log("error", symbol=symbol, error=str(exc))
@@ -5067,12 +5109,16 @@ def _execute_open_dca(
         size_pct = float(leg["size_pct"])
         use_market = _use_market_for_first_leg(index)
         qty_price = _entry_price_for_quantity(symbol, price, use_market=use_market)
-        price_str = round_price(symbol, price)
+        price_str = (
+            round_price(symbol, price)
+            if use_market
+            else round_price_for_entry(symbol, direction, price)
+        )
         leg_usdt = leg.get("size_usdt")
         try:
             qty = resolve_leg_order_quantity(
                 symbol,
-                qty_price,
+                qty_price if use_market else float(price_str),
                 size_pct=size_pct,
                 size_usdt=float(leg_usdt) if leg_usdt is not None else None,
             )
