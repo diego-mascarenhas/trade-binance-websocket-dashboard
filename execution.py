@@ -62,6 +62,13 @@ REST_SL_TP_POLL_INTERVAL = float(os.getenv("REST_SL_TP_POLL_INTERVAL", "2"))
 TP_ORDER_TYPE = os.getenv("TP_ORDER_TYPE", "trailing").lower()
 TP_TRAILING_CALLBACK_RATE = float(os.getenv("TP_TRAILING_CALLBACK_RATE", "0.2"))
 TP_TRAILING_ACTIVATION_PCT = float(os.getenv("TP_TRAILING_ACTIVATION_PCT", "0.3"))
+TP_TRAILING_DB_ADAPTIVE = _env_bool("TP_TRAILING_DB_ADAPTIVE", "true")
+TP_TRAILING_DB_LOOKBACK_DAYS = max(1, int(os.getenv("TP_TRAILING_DB_LOOKBACK_DAYS", "14")))
+TP_TRAILING_DB_MIN_TRADES = max(3, int(os.getenv("TP_TRAILING_DB_MIN_TRADES", "12")))
+TP_TRAILING_DB_REFRESH_SEC = max(60.0, float(os.getenv("TP_TRAILING_DB_REFRESH_SEC", "900")))
+TP_TRAILING_DB_QUANTILE = min(0.95, max(0.05, float(os.getenv("TP_TRAILING_DB_QUANTILE", "0.35"))))
+TP_TRAILING_DB_MAX_PCT = max(0.1, float(os.getenv("TP_TRAILING_DB_MAX_PCT", "1.2")))
+TP_TRAILING_DB_GLOBAL_FALLBACK = _env_bool("TP_TRAILING_DB_GLOBAL_FALLBACK", "true")
 EXECUTION_ORDER_COOLDOWN = int(os.getenv("EXECUTION_ORDER_COOLDOWN", "180"))
 EXECUTION_MAINTENANCE_SEC = float(os.getenv("EXECUTION_MAINTENANCE_SEC", "60"))
 ENTRY_LIMIT_TTL_SEC = int(os.getenv("ENTRY_LIMIT_TTL_SEC", "600"))
@@ -142,6 +149,7 @@ _maintenance_lock = threading.Lock()
 _last_maintenance: dict[str, float] = {}
 _last_trail_skip_log: dict[str, float] = {}
 _last_trail_candle_time: dict[str, str] = {}
+_tp_db_margin_cache: dict[str, dict[str, Any]] = {}
 TRAIL_SKIP_LOG_SEC = 300.0
 _fleet_exposure_lock = threading.Lock()
 _fleet_exposure_cache: tuple[float, dict[str, Any]] | None = None
@@ -5138,7 +5146,118 @@ def recalculate_tp1_from_position(direction: str, entry: float, sl: float) -> fl
     return None
 
 
-def recalculate_trailing_tp_activation_from_position(direction: str, entry: float) -> float | None:
+def _percentile(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    idx = (len(values) - 1) * q
+    lo = int(idx)
+    hi = min(lo + 1, len(values) - 1)
+    if lo == hi:
+        return values[lo]
+    weight = idx - lo
+    return values[lo] * (1 - weight) + values[hi] * weight
+
+
+def _fetch_trailing_tp_win_pct_series(symbol: str | None) -> list[float]:
+    if not db_store.is_enabled():
+        return []
+    params: list[Any] = [TP_TRAILING_DB_LOOKBACK_DAYS]
+    symbol_clause = ""
+    if symbol:
+        symbol_clause = " AND symbol = %s"
+        params.append(symbol.upper())
+    try:
+        conn = db_store.connect()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT direction, entry_price, exit_price, pnl_pct
+                    FROM trade_outcomes
+                    WHERE created_at >= NOW() - INTERVAL %s DAY
+                      AND tp_type = 'trailing'
+                      AND exit_type = 'trailing_tp'
+                      AND outcome = 'win'
+                      {symbol_clause}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 600
+                    """,
+                    params,
+                )
+                rows = cursor.fetchall() or []
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("DB trailing series unavailable (%s): %s", symbol or "GLOBAL", exc)
+        return []
+
+    series: list[float] = []
+    for row in rows:
+        value: float | None = None
+        try:
+            pnl_pct = row.get("pnl_pct")
+            if pnl_pct is not None:
+                value = float(pnl_pct)
+        except (TypeError, ValueError):
+            value = None
+        if value is None:
+            try:
+                entry = float(row.get("entry_price") or 0)
+                exit_price = float(row.get("exit_price") or 0)
+            except (TypeError, ValueError):
+                entry = 0.0
+                exit_price = 0.0
+            if entry > 0 and exit_price > 0:
+                side = str(row.get("direction") or "").upper()
+                if side == "LONG":
+                    value = (exit_price - entry) / entry * 100
+                elif side == "SHORT":
+                    value = (entry - exit_price) / entry * 100
+        if value is not None and value > 0:
+            series.append(float(value))
+    return series
+
+
+def _compute_db_trailing_activation_margin_pct(symbol: str | None) -> float | None:
+    target_symbol = (symbol or "").upper() or None
+    series = _fetch_trailing_tp_win_pct_series(target_symbol)
+    if len(series) < TP_TRAILING_DB_MIN_TRADES and TP_TRAILING_DB_GLOBAL_FALLBACK:
+        series = _fetch_trailing_tp_win_pct_series(None)
+    if len(series) < TP_TRAILING_DB_MIN_TRADES:
+        return None
+    series.sort()
+    target_net_pct = _percentile(series, TP_TRAILING_DB_QUANTILE)
+    if target_net_pct is None:
+        return None
+    activation_pct = target_net_pct + max(0.0, TP_TRAILING_CALLBACK_RATE) + max(
+        0.0, TRADE_PLAN_BE_BUFFER_PCT
+    )
+    return min(max(activation_pct, 0.0), TP_TRAILING_DB_MAX_PCT)
+
+
+def _db_trailing_activation_margin_pct(symbol: str | None) -> float | None:
+    if not TP_TRAILING_DB_ADAPTIVE or not db_store.is_enabled():
+        return None
+    key = (symbol or "").upper() or "*"
+    now = time.monotonic()
+    with _maintenance_lock:
+        cached = _tp_db_margin_cache.get(key)
+        if cached and now - float(cached.get("at") or 0) < TP_TRAILING_DB_REFRESH_SEC:
+            return cached.get("margin_pct")
+    margin_pct = _compute_db_trailing_activation_margin_pct(symbol)
+    with _maintenance_lock:
+        _tp_db_margin_cache[key] = {"margin_pct": margin_pct, "at": now}
+    return margin_pct
+
+
+def recalculate_trailing_tp_activation_from_position(
+    direction: str,
+    entry: float,
+    *,
+    symbol: str | None = None,
+) -> float | None:
     """
     Trailing TP activatePrice from entry.
 
@@ -5157,7 +5276,8 @@ def recalculate_trailing_tp_activation_from_position(direction: str, entry: floa
     fee_floor_pct = _round_trip_fee_pct() + max(0.0, float(TP_TRAILING_CALLBACK_RATE)) + max(
         0.0, float(TRADE_PLAN_BE_BUFFER_PCT)
     )
-    effective_margin_pct = max(configured_margin_pct, fee_floor_pct)
+    db_margin_pct = _db_trailing_activation_margin_pct(symbol)
+    effective_margin_pct = max(configured_margin_pct, fee_floor_pct, float(db_margin_pct or 0.0))
     margin = effective_margin_pct / 100.0
     if direction == "LONG":
         return entry_f * (1 + margin)
@@ -5194,7 +5314,11 @@ def _resolve_tp_for_open_position(
     if position_entry is None or position_entry <= 0:
         return tp_val, False
     if TP_ORDER_TYPE == "trailing":
-        recalc = recalculate_trailing_tp_activation_from_position(direction, position_entry)
+        recalc = recalculate_trailing_tp_activation_from_position(
+            direction,
+            position_entry,
+            symbol=symbol,
+        )
     else:
         if sl_val is None or sl_val <= 0:
             return tp_val, False
