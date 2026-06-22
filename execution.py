@@ -60,7 +60,8 @@ REST_PLACE_SL_TP = _env_bool("REST_PLACE_SL_TP", "true")
 REST_SL_TP_FILL_WAIT = int(os.getenv("REST_SL_TP_FILL_WAIT", "90"))
 REST_SL_TP_POLL_INTERVAL = float(os.getenv("REST_SL_TP_POLL_INTERVAL", "2"))
 TP_ORDER_TYPE = os.getenv("TP_ORDER_TYPE", "trailing").lower()
-TP_TRAILING_CALLBACK_RATE = float(os.getenv("TP_TRAILING_CALLBACK_RATE", "0.5"))
+TP_TRAILING_CALLBACK_RATE = float(os.getenv("TP_TRAILING_CALLBACK_RATE", "0.2"))
+TP_TRAILING_ACTIVATION_PCT = float(os.getenv("TP_TRAILING_ACTIVATION_PCT", "0.3"))
 EXECUTION_ORDER_COOLDOWN = int(os.getenv("EXECUTION_ORDER_COOLDOWN", "180"))
 EXECUTION_MAINTENANCE_SEC = float(os.getenv("EXECUTION_MAINTENANCE_SEC", "60"))
 ENTRY_LIMIT_TTL_SEC = int(os.getenv("ENTRY_LIMIT_TTL_SEC", "600"))
@@ -344,6 +345,7 @@ def record_trade_context(
         "tp_type": (tp_type or TP_ORDER_TYPE).lower(),
         "was_open": False,
         "exit_notified": False,
+        "trailing_tp_notified": False,
     }
     if dca_legs_placed is not None:
         fields["dca_legs_placed"] = int(dca_legs_placed)
@@ -374,6 +376,7 @@ def reset_dca_state(symbol: str) -> None:
         be_applied=False,
         position_peak_qty=None,
         trail_notified=False,
+        trailing_tp_notified=False,
     )
 
 
@@ -975,6 +978,7 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
         if not ctx.get("was_open"):
             open_fields["exit_notified"] = False
             open_fields["last_exit_trade_id"] = None
+            open_fields["trailing_tp_notified"] = False
         if not ctx.get("entry_opened_at"):
             open_fields["entry_opened_at"] = time.strftime(
                 "%Y-%m-%d %H:%M:%S UTC",
@@ -1014,6 +1018,7 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
             be_applied=False,
             position_peak_qty=None,
             trail_notified=False,
+            trailing_tp_notified=False,
         )
         return
 
@@ -1049,6 +1054,7 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
         be_applied=False,
         position_peak_qty=None,
         trail_notified=False,
+        trailing_tp_notified=False,
         pending_entry_market_snapshot=None,
         pending_entry_at=None,
     )
@@ -1077,16 +1083,17 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
 
     if pnl > 0:
         if tp_type == "trailing":
-            msg = (
-                f"TRAILING_TP @ {exit_price} (activate {tp}, trail {TP_TRAILING_CALLBACK_RATE}%)"
-                f" | PnL: {pnl_label}"
-            )
-            telegram.notify_tp_exit(symbol, msg, trailing=True)
+            msg = f"TAKE_PROFIT #TP @ {exit_price} | PnL: {pnl_label}"
+            if tp:
+                msg = (
+                    f"TAKE_PROFIT #TP @ {exit_price} "
+                    f"(trail {TP_TRAILING_CALLBACK_RATE}%) | PnL: {pnl_label}"
+                )
         else:
             msg = f"TAKE_PROFIT #TP @ {exit_price} | PnL: {pnl_label}"
             if tp:
                 msg = f"TAKE_PROFIT #TP @ {exit_price} (TP {tp}) | PnL: {pnl_label}"
-            telegram.notify_tp_exit(symbol, msg)
+        telegram.notify_tp_exit(symbol, msg)
         return
 
     if pnl < 0:
@@ -1097,6 +1104,88 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
         return
 
     telegram.notify_position_closed(symbol, f"#CLOSED {direction} @ {exit_price} | PnL: {pnl_label}")
+
+
+def _get_trailing_tp_activate_price(symbol: str, direction: str | None) -> float | None:
+    """Read activatePrice from the open TRAILING_STOP_MARKET algo order."""
+    primary = _primary_position_direction(direction)
+    if not primary:
+        return None
+    want_ps = primary if is_hedge_mode() else None
+    for order in _get_open_algo_orders(symbol):
+        if want_ps:
+            pos_side = str(order.get("positionSide") or "").upper()
+            if pos_side and pos_side not in (want_ps, "BOTH"):
+                continue
+        if _algo_order_role(order, primary) != "tp":
+            continue
+        order_type = str(order.get("orderType") or order.get("type") or "").upper()
+        if order_type != "TRAILING_STOP_MARKET":
+            continue
+        raw = order.get("activatePrice") or order.get("triggerPrice")
+        try:
+            price = float(raw or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price > 0:
+            return price
+    return None
+
+
+def _maybe_notify_trailing_tp_activated(symbol: str, snapshot: dict[str, Any]) -> None:
+    """Telegram when Binance arms the trailing TP (activation price touched), not on fill."""
+    if not telegram.is_configured() or not snapshot.get("open"):
+        return
+    if not snapshot.get("trailing_active"):
+        return
+
+    ctx = _get_trade_context(symbol)
+    if ctx.get("trailing_tp_notified"):
+        return
+
+    direction = _primary_position_direction(snapshot.get("direction") or ctx.get("direction"))
+    activate_raw = ctx.get("tp")
+    activate_price: float | None = None
+    try:
+        if activate_raw not in (None, ""):
+            activate_price = float(activate_raw)
+    except (TypeError, ValueError):
+        activate_price = None
+    if activate_price is None or activate_price <= 0:
+        activate_price = _get_trailing_tp_activate_price(symbol, direction)
+    if activate_price is None or activate_price <= 0:
+        return
+
+    mark = snapshot.get("mark_price")
+    try:
+        mark_f = float(mark) if mark not in (None, "") else None
+    except (TypeError, ValueError):
+        mark_f = None
+
+    upnl = snapshot.get("unrealized_pnl")
+    pnl_label: str | None = None
+    try:
+        if upnl not in (None, ""):
+            pnl_label = _format_realized_pnl(float(upnl))
+    except (TypeError, ValueError):
+        pnl_label = None
+
+    _update_trade_context(symbol, trailing_tp_notified=True)
+    _append_orders_log(
+        "trailing_tp_activated",
+        symbol=symbol,
+        direction=direction,
+        activate_price=activate_price,
+        mark=mark_f,
+        unrealized_pnl=upnl,
+    )
+    telegram.notify_trailing_tp_activated(
+        symbol,
+        mark_price=mark_f,
+        activate_price=round_price(symbol, activate_price),
+        callback_rate=TP_TRAILING_CALLBACK_RATE,
+        pnl_label=pnl_label,
+    )
 
 
 def _notify_order_failed(symbol: str, direction: str, exc: Exception) -> None:
@@ -2543,6 +2632,7 @@ def get_exchange_exposure(symbol: str) -> dict[str, Any]:
     primary_dir = _primary_position_direction(snapshot.get("direction"))
     if snapshot.get("open") and primary_dir:
         snapshot.update(get_position_protection(symbol, primary_dir))
+        _maybe_notify_trailing_tp_activated(symbol, snapshot)
     else:
         snapshot["has_sl"] = False
         snapshot["has_tp"] = False
@@ -5015,7 +5105,7 @@ def recalculate_tp1_from_position(direction: str, entry: float, sl: float) -> fl
 
 
 def recalculate_trailing_tp_activation_from_position(direction: str, entry: float) -> float | None:
-    """Trailing TP activatePrice: minimal profit covering round-trip fees (TRAIL_SL_FEE_PCT)."""
+    """Trailing TP activatePrice: entry ± TP_TRAILING_ACTIVATION_PCT (margin before arming trail)."""
     direction = direction.upper()
     try:
         entry_f = float(entry)
@@ -5023,11 +5113,11 @@ def recalculate_trailing_tp_activation_from_position(direction: str, entry: floa
         return None
     if entry_f <= 0:
         return None
-    fee = TRAIL_SL_FEE_PCT / 100.0
+    margin = TP_TRAILING_ACTIVATION_PCT / 100.0
     if direction == "LONG":
-        return entry_f * (1 + fee)
+        return entry_f * (1 + margin)
     if direction == "SHORT":
-        return entry_f * (1 - fee)
+        return entry_f * (1 - margin)
     return None
 
 
@@ -6141,7 +6231,7 @@ def _execute_open(
             dca_max_legs=dca_max_legs if dca_max_legs else None,
         )
         _clear_trail_candle_tracking(symbol)
-        _update_trade_context(symbol, be_applied=False, position_peak_qty=None, trail_notified=False)
+        _update_trade_context(symbol, be_applied=False, position_peak_qty=None, trail_notified=False, trailing_tp_notified=False)
         if dca_max_legs > 0:
             _sync_dca_leg_count(symbol)
         _log_execution_decision(

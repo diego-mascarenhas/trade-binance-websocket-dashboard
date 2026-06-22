@@ -296,6 +296,24 @@ def notify_tp_exit(symbol: str, message: str, *, trailing: bool = False) -> None
         send_tp(body)
 
 
+def notify_trailing_tp_activated(
+    symbol: str,
+    *,
+    mark_price: float | None,
+    activate_price: str,
+    callback_rate: float,
+    pnl_label: str | None = None,
+) -> None:
+    """Trailing TP armed on exchange (activation price reached) — not the final fill."""
+    mark_label = f"{mark_price:.8g}" if mark_price is not None and mark_price > 0 else "—"
+    pnl_suffix = f" | PnL: {pnl_label}" if pnl_label else ""
+    send_trailing(
+        f"{symbol.upper()} futures\n"
+        f"TRAILING_TP @ {mark_label} (activate {activate_price}, trail {callback_rate}%)"
+        f"{pnl_suffix}"
+    )
+
+
 def notify_sl_exit(symbol: str, message: str) -> None:
     send_sl(f"{symbol.upper()} futures\n{message}")
 

@@ -274,7 +274,7 @@
                 <ul>
                     <li><code>TRADE_PLAN_AUTO_BE=true</code>: mueve SL a entrada tras parcial o por señales (<code>BE_TRIGGER_PARTIAL</code>, <code>BE_TRIGGER_SIGNAL</code>).</li>
                     <li>Triggers de señal: HTF neutral/contra, SMC ranging, RSI extremo (<code>BE_ON_*</code>).</li>
-                    <li>TP tipo trailing: <code>TP_ORDER_TYPE=trailing</code>, activación en entry ± <code>TRAIL_SL_FEE_PCT</code> (comisiones), callback <code>TP_TRAILING_CALLBACK_RATE</code> (0.5%).</li>
+                    <li>TP tipo trailing: <code>TP_ORDER_TYPE=trailing</code>, activación entry ± <code>TP_TRAILING_ACTIVATION_PCT</code> (0.3%), callback <code>TP_TRAILING_CALLBACK_RATE</code> (0.2%).</li>
                     <li>Reprice SL/TP si drift &gt; <code>SL_REPRICE_TOLERANCE_PCT</code> / <code>TP_REPRICE_TOLERANCE_PCT</code>.</li>
                 </ul>
             </section>
@@ -505,8 +505,9 @@
                             <tr><td><code>TRADE_PLAN_BE_BUFFER_PCT</code></td><td>0.05</td><td>Buffer BE sobre entrada</td></tr>
                             <tr><td><code>BE_TRIGGER_*</code></td><td>varios true</td><td>Disparadores BE (señal, parcial, HTF, RSI…)</td></tr>
                             <tr><td><code>TP_ORDER_TYPE</code></td><td>trailing</td><td>Tipo TP (<code>trailing</code> u otro)</td></tr>
-                            <tr><td><code>TRAIL_SL_FEE_PCT</code></td><td>0.15</td><td>Activación trailing TP + BE por vela (% round-trip)</td></tr>
-                            <tr><td><code>TP_TRAILING_CALLBACK_RATE</code></td><td>0.5</td><td>Callback trailing (%)</td></tr>
+                            <tr><td><code>TP_TRAILING_ACTIVATION_PCT</code></td><td>0.3</td><td>Armar trailing TP (entry ± %)</td></tr>
+                            <tr><td><code>TP_TRAILING_CALLBACK_RATE</code></td><td>0.2</td><td>Retroceso trailing (%)</td></tr>
+                            <tr><td><code>TRAIL_SL_FEE_PCT</code></td><td>0.15</td><td>BE por vela / profit-lock (% round-trip)</td></tr>
                         </tbody>
                     </table>
                 </div>

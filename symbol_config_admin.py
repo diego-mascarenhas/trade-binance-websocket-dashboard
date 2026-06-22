@@ -62,7 +62,7 @@ CONFIG_KEY_HELP: dict[str, str] = {
     "CLOSE_RSI_MIN_PROFIT_PCT": "0 = sin umbral %; >0 exige ese % de uPnL mínimo.",
     "CLOSE_RSI_REQUIRE_PROFIT": "true = solo cierra si la posición está en ganancia (uPnL > 0).",
     "TRAIL_SL_ENABLED": "Sube el SL pegado a la apertura de la última vela cerrada una vez en ganancia (solo scalper).",
-    "TRAIL_SL_FEE_PCT": "Comisión ida+vuelta: activación del trailing TP, suelo BE por vela y profit-lock (default 0.15%).",
+    "TRAIL_SL_FEE_PCT": "Comisión ida+vuelta: suelo BE por vela y profit-lock (default 0.15%). Trailing TP usa TP_TRAILING_ACTIVATION_PCT.",
     "TRAIL_SL_CANDLE_OFFSET": "1 = última vela cerrada; 2 = dos atrás (más colchón).",
 }
 
