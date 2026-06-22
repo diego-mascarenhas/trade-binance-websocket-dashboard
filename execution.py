@@ -38,7 +38,7 @@ EXECUTE_ON_VALID_ENTRY = _env_bool("EXECUTE_ON_VALID_ENTRY")
 EXECUTION_MODE = os.getenv("EXECUTION_MODE", "dry").lower()
 FAPI_BASE = os.getenv("FAPI_BASE", "https://fapi.binance.com").rstrip("/")
 POSITION_SIZE_USDT = float(os.getenv("POSITION_SIZE_USDT", "25"))
-POSITION_WALLET_PCT = float(os.getenv("POSITION_WALLET_PCT", "0"))
+POSITION_WALLET_PCT = float(os.getenv("POSITION_WALLET_PCT", "10"))
 def _parse_leverage_env() -> tuple[str, int]:
     mode = os.getenv("LEVERAGE_MODE", "").strip().lower()
     raw = os.getenv("LEVERAGE", "4").strip().lower()

@@ -296,6 +296,54 @@ function renderFleetPresets(presets) {
     updatePresetHint();
 }
 
+function buildEffectiveConfigMap(state) {
+    const effective = {};
+    for (const field of state?.keys || []) {
+        effective[field.key] = field.effective ?? field.env_default;
+    }
+    return effective;
+}
+
+function detectCurrentPresetId(state, presets) {
+    const overrides = state?.overrides || {};
+    if (!overrides.active) {
+        return "env";
+    }
+
+    const effective = buildEffectiveConfigMap(state);
+    let bestId = null;
+    let bestScore = -1;
+
+    for (const preset of presets || []) {
+        if (!preset || preset.restore_only) {
+            continue;
+        }
+        const values = preset.values || {};
+        const keys = Object.keys(values);
+        if (!keys.length) {
+            continue;
+        }
+        let matches = true;
+        for (const key of keys) {
+            if (!(key in effective)) {
+                continue;
+            }
+            if (!valuesEqual(values[key], effective[key])) {
+                matches = false;
+                break;
+            }
+        }
+        if (!matches) {
+            continue;
+        }
+        if (keys.length > bestScore) {
+            bestScore = keys.length;
+            bestId = preset.id;
+        }
+    }
+    return bestId;
+}
+
 function setFieldValue(field, value) {
     const input = document.getElementById(`cfg-${field.key}`);
     const wrap = configForm.querySelector(`[data-key="${field.key}"]`);
@@ -363,21 +411,7 @@ async function applySelectedPreset() {
     }
 
     const manualChanges = collectChanges();
-    const useManual = Object.keys(manualChanges).length > 0;
-
-    if (preset.restore_only && useManual) {
-        setFeedback("«Default (.env)» no admite ajustes manuales. Carga el preset de nuevo o elige otro.", "error");
-        return;
-    }
-
-    const confirmText = preset.restore_only
-        ? `¿Aplicar «${preset.label}»? Se eliminarán los overrides MySQL y volverás al .env.`
-        : useManual
-          ? `¿Aplicar ${Object.keys(manualChanges).length} cambio(s) manual(es) a toda la flota?`
-          : `¿Aplicar preset «${preset.label}» a toda la flota (${editorState?.fleet_size || "?"} pares)?`;
-    if (!window.confirm(confirmText)) {
-        return;
-    }
+    const useManual = Object.keys(manualChanges).length > 0 && !preset.restore_only;
 
     applyPresetBtn.disabled = true;
     applyPresetBtn.textContent = "Aplicando…";
@@ -425,6 +459,11 @@ async function loadEditor() {
     setPresetControlsEnabled(true);
     statusNote.textContent = `Flota: ${state.fleet_size} par(es). ${state.fleet_symbols?.join(", ") || ""}`;
     renderFleetPresets(state.fleet_presets);
+    const currentPresetId = detectCurrentPresetId(state, state.fleet_presets);
+    if (currentPresetId && fleetPresetSelect) {
+        fleetPresetSelect.value = currentPresetId;
+    }
+    updatePresetHint();
     renderForm(state);
     renderOverridesSummary(state.overrides);
     renderPerSymbol(state.overrides);

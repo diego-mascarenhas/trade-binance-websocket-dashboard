@@ -202,11 +202,11 @@ FLEET_PRESET_META: dict[str, dict[str, Any]] = {
 }
 
 BALANCED_FLEET_VALUES: dict[str, Any] = {
-    "MIN_CONFIDENCE": 50,
+    "MIN_CONFIDENCE": 60,
     "HTF_INTERVAL": "15m",
     "INTERVAL": "1m",
     "REQUIRE_TREND_ALIGN": True,
-    "SIGNAL_DEBOUNCE_COUNT": 5,
+    "SIGNAL_DEBOUNCE_COUNT": 2,
     "SIGNAL_COOLDOWN_SEC": 180,
     "MIN_PATTERN_RANGE_PCT": 0.02,
     "OB_WALL_RANGE_PCT": 0.6,
@@ -216,7 +216,7 @@ BALANCED_FLEET_VALUES: dict[str, Any] = {
     "RSI_SHORT_MIN": 30.0,
     "MACD_FILTER_ENABLED": False,
     "ADX_FILTER_ENABLED": True,
-    "ADX_MIN_TREND": 25.0,
+    "ADX_MIN_TREND": 12.0,
     "ADX_USE_HTF": True,
     "symbol_trading_enabled": True,
 }
