@@ -399,9 +399,30 @@ def _spread_offset(spread_abs: float | None) -> float:
     return 0.0
 
 
+def _round_trip_fee_pct() -> float:
+    """Round-trip fee cushion used for fee-aware break-even logic."""
+    return max(0.0, float(TRAIL_SL_FEE_PCT))
+
+
+def _fee_adjusted_breakeven_price(direction: str | None, entry: float) -> float:
+    """
+    Entry price adjusted to cover round-trip fees.
+    LONG exits above entry, SHORT exits below entry.
+    """
+    if entry <= 0:
+        return entry
+    fee = _round_trip_fee_pct() / 100.0
+    side = str(direction or "").upper()
+    if side == "LONG":
+        return entry * (1 + fee)
+    if side == "SHORT":
+        return entry * (1 - fee)
+    return entry
+
+
 def _resolve_lock_profit_pct(snapshot: dict[str, Any]) -> float:
-    """% gain to lock when moving SL (min floor + optional full unrealized)."""
-    lock = max(0.0, BE_MIN_PROFIT_PCT)
+    """% gain to lock when moving SL (min BE floor + fee floor + optional full unrealized)."""
+    lock = max(0.0, BE_MIN_PROFIT_PCT, _round_trip_fee_pct())
     try:
         unrealized_pct = float(snapshot.get("unrealized_pnl_pct") or 0)
     except (TypeError, ValueError):
@@ -877,10 +898,22 @@ def _fetch_last_realized_trade(
     return None
 
 
-def _is_breakeven_exit(entry: float | None, exit_price: float, pnl: float) -> bool:
+def _is_breakeven_exit(
+    entry: float | None,
+    exit_price: float,
+    pnl: float,
+    *,
+    direction: str | None = None,
+) -> bool:
     if entry is None or entry <= 0:
         return False
-    price_ok = abs(exit_price - entry) / entry * 100 <= BE_EXIT_PRICE_PCT
+    target = _fee_adjusted_breakeven_price(direction, entry)
+    side = str(direction or "").upper()
+    if side == "LONG" and exit_price < target:
+        return False
+    if side == "SHORT" and exit_price > target:
+        return False
+    price_ok = abs(exit_price - target) / entry * 100 <= BE_EXIT_PRICE_PCT
     pnl_ok = abs(pnl) <= BE_EXIT_PNL_MAX_USDT
     return price_ok and pnl_ok
 
@@ -890,8 +923,9 @@ def _classify_closed_trade(
     exit_price: float,
     pnl: float,
     tp_type: str,
+    direction: str | None,
 ) -> tuple[str, str]:
-    if _is_breakeven_exit(entry, exit_price, pnl):
+    if _is_breakeven_exit(entry, exit_price, pnl, direction=direction):
         return "breakeven", "breakeven"
     if pnl > 0:
         if tp_type == "trailing":
@@ -1026,7 +1060,7 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
     pnl = float(trade["realized_pnl"])
     exit_qty = trade.get("qty")
     pnl_label = _format_realized_pnl(pnl)
-    exit_type, outcome = _classify_closed_trade(entry, exit_price, pnl, tp_type)
+    exit_type, outcome = _classify_closed_trade(entry, exit_price, pnl, tp_type, direction)
 
     _persist_closed_trade_outcome(
         symbol,
@@ -1074,7 +1108,7 @@ def _maybe_notify_position_exit(symbol: str, snapshot: dict[str, Any]) -> None:
     if not telegram.is_configured():
         return
 
-    if _is_breakeven_exit(entry, exit_price, pnl):
+    if _is_breakeven_exit(entry, exit_price, pnl, direction=direction):
         msg = f"BREAK_EVEN #BE @ {exit_price} | PnL: {pnl_label}"
         if entry is not None:
             msg = f"BREAK_EVEN #BE @ {exit_price} (entry {entry}) | PnL: {pnl_label}"
@@ -5105,7 +5139,13 @@ def recalculate_tp1_from_position(direction: str, entry: float, sl: float) -> fl
 
 
 def recalculate_trailing_tp_activation_from_position(direction: str, entry: float) -> float | None:
-    """Trailing TP activatePrice: entry ± TP_TRAILING_ACTIVATION_PCT (margin before arming trail)."""
+    """
+    Trailing TP activatePrice from entry.
+
+    The effective activation margin is never below:
+    round-trip fee + trailing callback + BE safety buffer.
+    This avoids tiny trailing wins that turn net-negative after fees.
+    """
     direction = direction.upper()
     try:
         entry_f = float(entry)
@@ -5113,7 +5153,12 @@ def recalculate_trailing_tp_activation_from_position(direction: str, entry: floa
         return None
     if entry_f <= 0:
         return None
-    margin = TP_TRAILING_ACTIVATION_PCT / 100.0
+    configured_margin_pct = max(0.0, float(TP_TRAILING_ACTIVATION_PCT))
+    fee_floor_pct = _round_trip_fee_pct() + max(0.0, float(TP_TRAILING_CALLBACK_RATE)) + max(
+        0.0, float(TRADE_PLAN_BE_BUFFER_PCT)
+    )
+    effective_margin_pct = max(configured_margin_pct, fee_floor_pct)
+    margin = effective_margin_pct / 100.0
     if direction == "LONG":
         return entry_f * (1 + margin)
     if direction == "SHORT":
