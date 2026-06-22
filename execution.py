@@ -5014,6 +5014,23 @@ def recalculate_tp1_from_position(direction: str, entry: float, sl: float) -> fl
     return None
 
 
+def recalculate_trailing_tp_activation_from_position(direction: str, entry: float) -> float | None:
+    """Trailing TP activatePrice: minimal profit covering round-trip fees (TRAIL_SL_FEE_PCT)."""
+    direction = direction.upper()
+    try:
+        entry_f = float(entry)
+    except (TypeError, ValueError):
+        return None
+    if entry_f <= 0:
+        return None
+    fee = TRAIL_SL_FEE_PCT / 100.0
+    if direction == "LONG":
+        return entry_f * (1 + fee)
+    if direction == "SHORT":
+        return entry_f * (1 - fee)
+    return None
+
+
 def _ensure_tp_ahead_of_mark(symbol: str, direction: str, tp: float) -> float:
     """Nudge TP so Binance will accept it (mark not already through the target)."""
     mark = _get_mark_price(symbol)
@@ -5041,9 +5058,12 @@ def _resolve_tp_for_open_position(
     """Return (tp price, True if recalculated from position entry)."""
     if position_entry is None or position_entry <= 0:
         return tp_val, False
-    if sl_val is None or sl_val <= 0:
-        return tp_val, False
-    recalc = recalculate_tp1_from_position(direction, position_entry, sl_val)
+    if TP_ORDER_TYPE == "trailing":
+        recalc = recalculate_trailing_tp_activation_from_position(direction, position_entry)
+    else:
+        if sl_val is None or sl_val <= 0:
+            return tp_val, False
+        recalc = recalculate_tp1_from_position(direction, position_entry, sl_val)
     if recalc is None or recalc <= 0:
         return tp_val, False
     adjusted = _ensure_tp_ahead_of_mark(symbol, direction, recalc)
@@ -5873,9 +5893,15 @@ def _place_sl_tp_after_fill(
         if sl_resolved and sl_resolved > 0:
             sl = float(sl_resolved)
             sl_price = round_price_for_sl(symbol, direction, sl)
-        recalc = recalculate_tp1_from_position(direction, fill_entry, sl)
-        if recalc and recalc > 0:
-            tp_use = _ensure_tp_ahead_of_mark(symbol, direction, recalc)
+        tp_resolved, _ = _resolve_tp_for_open_position(
+            symbol,
+            direction,
+            position_entry=fill_entry,
+            sl_val=sl,
+            tp_val=tp,
+        )
+        if tp_resolved and tp_resolved > 0:
+            tp_use = tp_resolved
             _persist_recalculated_protection(
                 symbol,
                 direction,
