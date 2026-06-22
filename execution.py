@@ -6697,6 +6697,7 @@ def _execute_open_dca(
         return
 
     placed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     for index, leg in enumerate(legs):
         price = float(leg["price"])
         size_pct = float(leg["size_pct"])
@@ -6716,9 +6717,23 @@ def _execute_open_dca(
                 size_usdt=float(leg_usdt) if leg_usdt is not None else None,
             )
         except ValueError as exc:
-            _set_status(message=str(exc), last_event="error")
-            _append_orders_log("error", symbol=symbol, error=str(exc), leg=index)
-            return
+            _append_orders_log(
+                "live_dca_leg_skipped",
+                symbol=symbol,
+                direction=direction,
+                leg=index,
+                price=price_str,
+                size_pct=size_pct,
+                size_usdt=leg_usdt,
+                reason=str(exc),
+            )
+            skipped.append({"leg": index, "reason": str(exc)})
+            if index == 0:
+                _set_status(message=str(exc), last_event="error")
+                _append_orders_log("error", symbol=symbol, error=str(exc), leg=index)
+                return
+            logger.warning("DCA leg %s skipped for %s: %s", index, symbol, exc)
+            continue
         try:
             if use_market:
                 response = _place_market_entry(symbol, direction, qty, leg_index=index)
@@ -6751,9 +6766,23 @@ def _execute_open_dca(
         except RuntimeError as exc:
             logger.error("DCA leg %s failed for %s: %s", index, symbol, exc)
             _append_orders_log("live_dca_leg_failed", symbol=symbol, leg=index, error=str(exc))
-            _set_status(message=f"DCA leg {index} failed: {exc}", last_event="error")
-            _notify_order_failed(symbol, direction, exc)
-            return
+            skipped.append({"leg": index, "reason": str(exc)})
+            if index == 0:
+                _set_status(message=f"DCA leg {index} failed: {exc}", last_event="error")
+                _notify_order_failed(symbol, direction, exc)
+                return
+            continue
+
+    if not placed:
+        _set_status(message="DCA bundle skipped: no valid legs", last_event="error")
+        _append_orders_log(
+            "live_dca_bundle_skipped",
+            symbol=symbol,
+            direction=direction,
+            skipped_legs=skipped,
+            reason="no_valid_legs",
+        )
+        return
 
     _append_orders_log(
         "live_dca_bundle",
@@ -6763,6 +6792,7 @@ def _execute_open_dca(
         sl=sl_price,
         tp=tp_price,
         legs=placed,
+        skipped_legs=skipped or None,
         plan=plan_fingerprint,
     )
     _last_execution_monotonic = time.monotonic()
@@ -6775,8 +6805,9 @@ def _execute_open_dca(
         tp_type=TP_ORDER_TYPE,
     )
     entry_summary = "market+limits" if any(r.get("entry_type") == "MARKET" for r in placed) else "limits"
+    skipped_note = f" · {len(skipped)} skipped" if skipped else ""
     _set_status(
-        message=f"LIVE DCA {direction} {symbol} · {len(placed)} legs ({entry_summary}) · SL/TP on fill",
+        message=f"LIVE DCA {direction} {symbol} · {len(placed)} legs ({entry_summary}){skipped_note} · SL/TP on fill",
         last_event="live_dca",
         last_at=time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         last_symbol=symbol,
