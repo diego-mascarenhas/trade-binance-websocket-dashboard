@@ -97,6 +97,7 @@ LOG_DIR = os.getenv("LOG_DIR", "logs")
 TRADE_PLAN_EXECUTE_DCA = _env_bool("TRADE_PLAN_EXECUTE_DCA", "true")
 TRADE_PLAN_DCA_SIGNAL_DRIVEN = _env_bool("TRADE_PLAN_DCA_SIGNAL_DRIVEN", "true")
 TRADE_PLAN_DCA_ADVERSE_ONLY = _env_bool("TRADE_PLAN_DCA_ADVERSE_ONLY", "true")
+DCA_DEFER_PROTECTION_UNTIL_LAST_LEG = _env_bool("DCA_DEFER_PROTECTION_UNTIL_LAST_LEG", "false")
 DCA_FAVORABLE_PNL_MAX_USDT = float(os.getenv("DCA_FAVORABLE_PNL_MAX_USDT", "0"))
 TRADE_PLAN_TP1_RR = float(os.getenv("TRADE_PLAN_TP1_RR", "1.0"))
 TRADE_PLAN_SL_MIN_DISTANCE_PCT = float(os.getenv("TRADE_PLAN_SL_MIN_DISTANCE_PCT", "1.0"))
@@ -371,6 +372,34 @@ def dca_legs_placed(symbol: str) -> int:
         return max(int(_get_trade_context(symbol).get("dca_legs_placed") or 0), 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _dca_progress(symbol: str) -> tuple[int, int]:
+    """Return (placed_legs, max_legs) from trade context."""
+    ctx = _get_trade_context(symbol)
+    try:
+        placed = max(int(ctx.get("dca_legs_placed") or 0), 0)
+    except (TypeError, ValueError):
+        placed = 0
+    try:
+        max_legs = max(int(ctx.get("dca_max_legs") or 0), 0)
+    except (TypeError, ValueError):
+        max_legs = 0
+    return placed, max_legs
+
+
+def _should_defer_protection_until_last_dca(symbol: str) -> bool:
+    """
+    Defer SL/TP while building signal-driven DCA legs.
+
+    Applies only when explicitly enabled; bundle mode keeps current behavior.
+    """
+    if not DCA_DEFER_PROTECTION_UNTIL_LAST_LEG or not TRADE_PLAN_DCA_SIGNAL_DRIVEN:
+        return False
+    placed, max_legs = _dca_progress(symbol)
+    if max_legs <= 1:
+        return False
+    return placed < max_legs
 
 
 def reset_dca_state(symbol: str) -> None:
@@ -3438,6 +3467,13 @@ def reconcile_position_protection(
     snapshot = _fetch_exchange_exposure(symbol)
     if not snapshot.get("open"):
         return summary
+    _sync_dca_leg_count(symbol)
+    if _should_defer_protection_until_last_dca(symbol):
+        placed, max_legs = _dca_progress(symbol)
+        summary["deferred_protection"] = True
+        summary["dca_legs_placed"] = placed
+        summary["dca_max_legs"] = max_legs
+        return summary
 
     pos_dir = _primary_position_direction(snapshot.get("direction")) or _primary_position_direction(
         direction
@@ -6415,7 +6451,13 @@ def _execute_open(
                 "leg": leg_index,
             },
         )
-        if order_id is not None and REST_PLACE_SL_TP:
+        defer_sl_tp = (
+            DCA_DEFER_PROTECTION_UNTIL_LAST_LEG
+            and TRADE_PLAN_DCA_SIGNAL_DRIVEN
+            and dca_max_legs > 1
+            and leg_index < (dca_max_legs - 1)
+        )
+        if order_id is not None and REST_PLACE_SL_TP and not defer_sl_tp:
             _place_sl_tp_after_fill(
                 symbol,
                 direction,
@@ -6425,6 +6467,16 @@ def _execute_open(
                 int(order_id),
                 entry_is_market=use_market,
                 order_response=response if use_market else None,
+            )
+        elif order_id is not None and REST_PLACE_SL_TP and defer_sl_tp:
+            _append_orders_log(
+                "sl_tp_deferred_dca",
+                symbol=symbol,
+                direction=direction,
+                leg=leg_index,
+                dca_legs_placed=leg_index + 1,
+                dca_max_legs=dca_max_legs,
+                reason="wait_last_dca_leg",
             )
     except RuntimeError as exc:
         logger.error("Order failed for %s: %s", symbol, exc)
@@ -6473,8 +6525,35 @@ def _execute_signal_dca_add(
             size_usdt=size_usdt,
         )
     except ValueError as exc:
-        _set_status(message=str(exc), last_event="error")
-        _append_orders_log("error", symbol=symbol, error=str(exc), leg=leg_index)
+        err_text = str(exc)
+        _append_orders_log(
+            "live_dca_leg_skipped",
+            symbol=symbol,
+            direction=direction,
+            leg=leg_index,
+            entry=price_str,
+            size_pct=size_pct,
+            size_usdt=size_usdt,
+            reason=err_text,
+        )
+        # In deferred-protection mode, treat sub-minimum DCA adds as skipped legs.
+        # This prevents staying unprotected forever waiting for an impossible leg size.
+        if (
+            DCA_DEFER_PROTECTION_UNTIL_LAST_LEG
+            and TRADE_PLAN_DCA_SIGNAL_DRIVEN
+            and leg_index > 0
+            and "below minimum" in err_text.lower()
+        ):
+            _update_trade_context(
+                symbol,
+                dca_legs_placed=min(leg_index + 1, max_legs),
+                dca_max_legs=max_legs,
+            )
+            _set_status(message=f"DCA leg {leg_index} skipped (min notional)", last_event="dca_leg_skipped")
+            reconcile_position_protection(symbol, direction=direction, sl=sl, tp=tp)
+            return
+        _set_status(message=err_text, last_event="error")
+        _append_orders_log("error", symbol=symbol, error=err_text, leg=leg_index)
         return
 
     sl_price = round_price_for_sl(symbol, direction, sl)
