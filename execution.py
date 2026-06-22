@@ -73,6 +73,8 @@ FLEET_REST_CACHE_ENABLED = _env_bool("FLEET_REST_CACHE_ENABLED", "true")
 FAPI_SIGNED_RECOVERY_SEC = max(0.0, float(os.getenv("FAPI_SIGNED_RECOVERY_SEC", "0")))
 FAPI_SIGNED_PACE_SEC = max(0.0, float(os.getenv("FAPI_SIGNED_PACE_SEC", "1.0")))
 FAPI_DEPTH_PACE_SEC = max(0.0, float(os.getenv("FAPI_DEPTH_PACE_SEC", "2.0")))
+FAPI_RECV_WINDOW_MS = max(1000, int(os.getenv("FAPI_RECV_WINDOW_MS", "10000")))
+FAPI_TIME_SYNC_INTERVAL_SEC = max(60.0, float(os.getenv("FAPI_TIME_SYNC_INTERVAL_SEC", "300")))
 EXECUTION_BLOCK_IF_OPEN = _env_bool("EXECUTION_BLOCK_IF_OPEN", "true")
 EXECUTION_POSITION_CACHE_SEC = float(os.getenv("EXECUTION_POSITION_CACHE_SEC", "60"))
 ACCOUNT_SNAPSHOT_CACHE_SEC = float(os.getenv("ACCOUNT_SNAPSHOT_CACHE_SEC", "120"))
@@ -150,6 +152,9 @@ _fapi_backoff_file_read_at: float = 0.0
 _fapi_backoff_lock = threading.Lock()
 _hedge_mode_lock = threading.Lock()
 _hedge_mode: bool | None = None
+_fapi_time_offset_lock = threading.Lock()
+_fapi_time_offset_ms: int = 0
+_fapi_time_sync_mono: float = 0.0
 _last_execution_monotonic: float | None = None
 _execution_inflight_lock = threading.Lock()
 _execution_inflight_symbol: str | None = None
@@ -478,9 +483,10 @@ def _round_to_tick(
 
 
 def round_price_for_profit_sl(symbol: str, direction: str, value: float) -> str:
-    """Round protective stop — favor locking more profit (DOWN)."""
+    """Round profit-lock stop — LONG: down (tighter); SHORT: up (stay above mark)."""
     filt = _load_symbol_filters(symbol)
-    return _round_to_tick(value, filt["tick_size"], rounding=ROUND_DOWN)
+    rounding = ROUND_DOWN if direction.upper() == "LONG" else ROUND_UP
+    return _round_to_tick(value, filt["tick_size"], rounding=rounding)
 
 
 def _position_qty_decimal(snapshot: dict[str, Any]) -> Decimal:
@@ -3794,15 +3800,49 @@ def maybe_trail_sl(
         fee = TRAIL_SL_FEE_PCT / 100.0
         if direction == "LONG":
             be_floor = entry * (1 + fee)
-            target = max(float(anchor), be_floor)
         else:
             be_floor = entry * (1 - fee)
-            target = min(float(anchor), be_floor)
 
-        target = _ensure_sl_behind_mark(symbol, direction, target)
+        target = _clamp_trail_sl_target(symbol, direction, entry, float(anchor), be_floor)
+        if target is None:
+            _log_trail_sl_skip(
+                symbol,
+                "profit_lock_unavailable",
+                log_decision=bool(candle_time),
+                direction=direction,
+                entry=entry,
+                anchor=anchor,
+                be_floor=be_floor,
+                **skip_common,
+            )
+            return True
+
+        target = _ensure_sl_behind_mark(symbol, direction, target, entry=entry)
         sl_price = round_price_for_profit_sl(symbol, direction, target)
         target_f = float(sl_price)
         if target_f <= 0:
+            return True
+        if direction == "SHORT" and target_f >= entry:
+            _log_trail_sl_skip(
+                symbol,
+                "wrong_side",
+                log_decision=bool(candle_time),
+                direction=direction,
+                target=target_f,
+                entry=entry,
+                **skip_common,
+            )
+            return True
+        if direction == "LONG" and target_f <= entry:
+            _log_trail_sl_skip(
+                symbol,
+                "wrong_side",
+                log_decision=bool(candle_time),
+                direction=direction,
+                target=target_f,
+                entry=entry,
+                **skip_common,
+            )
             return True
 
         current = _get_sl_trigger_from_orders(symbol, direction)
@@ -3853,8 +3893,10 @@ def maybe_trail_sl(
         except (TypeError, ValueError):
             sl_val = 0.0
         if mark is not None and sl_val > 0 and _sl_would_trigger_immediately(direction, sl_val, mark):
-            adjusted = round_price_for_sl(
-                symbol, direction, _ensure_sl_behind_mark(symbol, direction, sl_val)
+            adjusted = round_price_for_profit_sl(
+                symbol,
+                direction,
+                _ensure_sl_behind_mark(symbol, direction, sl_val, entry=entry),
             )
             try:
                 sl_val = float(adjusted)
@@ -4679,6 +4721,55 @@ def _sign_query(params: dict[str, Any]) -> str:
     return f"{query}&signature={signature}"
 
 
+def _is_recv_window_error(detail: str) -> bool:
+    lower = detail.lower()
+    return "-1021" in detail or "recvwindow" in lower
+
+
+def _fetch_fapi_server_time_ms() -> int:
+    """Public server time (no API key). Used to correct signed request timestamps."""
+    url = f"{FAPI_BASE}/fapi/v1/time"
+    request = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read().decode() or "{}")
+    return int(payload["serverTime"])
+
+
+def sync_fapi_time_offset(*, force: bool = False) -> int | None:
+    """Align signed REST timestamps with Binance serverTime. Returns offset_ms (server − local)."""
+    global _fapi_time_offset_ms, _fapi_time_sync_mono
+
+    if not force:
+        with _fapi_time_offset_lock:
+            if _fapi_time_sync_mono > 0 and time.monotonic() - _fapi_time_sync_mono < FAPI_TIME_SYNC_INTERVAL_SEC:
+                return _fapi_time_offset_ms
+
+    try:
+        local_ms = int(time.time() * 1000)
+        server_ms = _fetch_fapi_server_time_ms()
+        offset = server_ms - local_ms
+        with _fapi_time_offset_lock:
+            _fapi_time_offset_ms = offset
+            _fapi_time_sync_mono = time.monotonic()
+        if abs(offset) > 500:
+            logger.warning(
+                "Binance clock offset %sms — signed REST timestamps adjusted (sync server time on host if large)",
+                offset,
+            )
+        else:
+            logger.debug("Binance clock offset %sms", offset)
+        return offset
+    except Exception as exc:
+        logger.warning("Binance time sync failed: %s", exc)
+        return None
+
+
+def _fapi_timestamp_ms() -> int:
+    with _fapi_time_offset_lock:
+        offset = _fapi_time_offset_ms
+    return int(time.time() * 1000) + offset
+
+
 def _fapi_public_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     if _fapi_in_backoff():
         until = _read_shared_fapi_backoff_until()
@@ -4722,19 +4813,10 @@ def _fapi_public_get(path: str, params: dict[str, Any] | None = None) -> dict[st
         raise RuntimeError(detail or str(exc)) from exc
 
 
-def _fapi_request(method: str, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    block = _fapi_rest_block_reason()
-    if block:
-        _record_fapi_rest_metrics(
-            kind="signed",
-            method=method,
-            path=path,
-            outcome="blocked",
-        )
-        raise RuntimeError(block)
+def _fapi_request_signed(method: str, path: str, params: dict[str, Any] | None) -> dict[str, Any]:
     params = dict(params or {})
-    params["timestamp"] = int(time.time() * 1000)
-    params["recvWindow"] = 5000
+    params["timestamp"] = _fapi_timestamp_ms()
+    params["recvWindow"] = FAPI_RECV_WINDOW_MS
     body = _sign_query(params)
     url = f"{FAPI_BASE}{path}"
     headers = {"X-MBX-APIKEY": os.getenv("BINANCE_API_KEY", "")}
@@ -4745,32 +4827,63 @@ def _fapi_request(method: str, path: str, params: dict[str, Any] | None = None) 
         data = body.encode()
         headers["Content-Type"] = "application/x-www-form-urlencoded"
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        _acquire_signed_rest_pace()
-        with urllib.request.urlopen(request, timeout=20) as response:
-            payload = response.read().decode()
-            _record_fapi_rest_metrics(
-                kind="signed",
-                method=method,
-                path=path,
-                outcome="success",
-                binance_weight_1m=response.headers.get("X-MBX-USED-WEIGHT-1M"),
-                binance_order_count_1m=response.headers.get("X-MBX-ORDER-COUNT-1M"),
-            )
-            clear_fapi_backoff(reason=f"{method} {path}")
-            return json.loads(payload) if payload else {}
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode()
+    _acquire_signed_rest_pace()
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = response.read().decode()
         _record_fapi_rest_metrics(
             kind="signed",
             method=method,
             path=path,
-            outcome="error",
-            binance_weight_1m=exc.headers.get("X-MBX-USED-WEIGHT-1M"),
-            binance_order_count_1m=exc.headers.get("X-MBX-ORDER-COUNT-1M"),
+            outcome="success",
+            binance_weight_1m=response.headers.get("X-MBX-USED-WEIGHT-1M"),
+            binance_order_count_1m=response.headers.get("X-MBX-ORDER-COUNT-1M"),
         )
-        _apply_fapi_error_backoff(detail)
-        raise RuntimeError(detail or str(exc)) from exc
+        clear_fapi_backoff(reason=f"{method} {path}")
+        return json.loads(payload) if payload else {}
+
+
+def _fapi_request(method: str, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    block = _fapi_rest_block_reason()
+    if block:
+        _record_fapi_rest_metrics(
+            kind="signed",
+            method=method,
+            path=path,
+            outcome="blocked",
+        )
+        raise RuntimeError(block)
+
+    sync_fapi_time_offset()
+
+    last_error: RuntimeError | None = None
+    for attempt in range(2):
+        try:
+            return _fapi_request_signed(method, path, params)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode()
+            _record_fapi_rest_metrics(
+                kind="signed",
+                method=method,
+                path=path,
+                outcome="error",
+                binance_weight_1m=exc.headers.get("X-MBX-USED-WEIGHT-1M"),
+                binance_order_count_1m=exc.headers.get("X-MBX-ORDER-COUNT-1M"),
+            )
+            if attempt == 0 and _is_recv_window_error(detail):
+                logger.warning(
+                    "%s %s recvWindow -1021 — resyncing Binance clock and retrying",
+                    method,
+                    path,
+                )
+                sync_fapi_time_offset(force=True)
+                last_error = RuntimeError(detail or str(exc))
+                continue
+            _apply_fapi_error_backoff(detail)
+            raise RuntimeError(detail or str(exc)) from exc
+    if last_error is not None:
+        _apply_fapi_error_backoff(str(last_error))
+        raise last_error
+    raise RuntimeError(f"{method} {path} failed after recvWindow retry")
 
 
 def _load_symbol_filters(symbol: str) -> dict[str, Decimal]:
@@ -5111,6 +5224,63 @@ def _persist_recalculated_tp(
     )
 
 
+def _mark_cushion(symbol: str) -> float:
+    filt = _load_symbol_filters(symbol)
+    return float(filt["tick_size"]) * 2
+
+
+def _is_profit_lock_sl(direction: str, entry: float, sl: float) -> bool:
+    direction = direction.upper()
+    if entry <= 0 or sl <= 0:
+        return False
+    if direction == "SHORT":
+        return sl < entry
+    if direction == "LONG":
+        return sl > entry
+    return False
+
+
+def _clamp_trail_sl_target(
+    symbol: str,
+    direction: str,
+    entry: float,
+    anchor: float,
+    be_floor: float,
+) -> float | None:
+    """Profit-lock trail target: SHORT below entry & above mark; LONG above entry & below mark."""
+    direction = direction.upper()
+    if entry <= 0 or anchor <= 0:
+        return None
+    mark = _get_mark_price(symbol)
+    cushion = _mark_cushion(symbol)
+
+    if direction == "SHORT":
+        target = min(float(anchor), float(be_floor))
+        if mark is not None and mark > 0:
+            min_valid = mark + cushion
+            if min_valid >= entry:
+                return None
+            if target < min_valid:
+                target = min_valid
+        if target >= entry:
+            return None
+        return target
+
+    if direction == "LONG":
+        target = max(float(anchor), float(be_floor))
+        if mark is not None and mark > 0:
+            max_valid = mark - cushion
+            if max_valid <= entry:
+                return None
+            if target > max_valid:
+                target = max_valid
+        if target <= entry:
+            return None
+        return target
+
+    return None
+
+
 def _sl_would_trigger_immediately(direction: str, sl: float, mark: float) -> bool:
     """True when SL trigger would fire at current mark (Binance -2021)."""
     direction = direction.upper()
@@ -5119,19 +5289,31 @@ def _sl_would_trigger_immediately(direction: str, sl: float, mark: float) -> boo
     return mark >= sl
 
 
-def _ensure_sl_behind_mark(symbol: str, direction: str, sl: float) -> float:
+def _ensure_sl_behind_mark(
+    symbol: str,
+    direction: str,
+    sl: float,
+    *,
+    entry: float | None = None,
+) -> float:
     """Nudge SL so Binance accepts it (mark not already through the stop)."""
     mark = _get_mark_price(symbol)
     if mark is None or mark <= 0:
         return sl
-    filt = _load_symbol_filters(symbol)
-    tick = float(filt["tick_size"])
-    cushion = tick * 2
+    cushion = _mark_cushion(symbol)
     direction = direction.upper()
+    profit_lock = entry is not None and entry > 0 and _is_profit_lock_sl(direction, entry, sl)
+
     if direction == "LONG" and _sl_would_trigger_immediately(direction, sl, mark):
-        return max(mark - cushion, tick)
+        adjusted = max(mark - cushion, cushion)
+        if profit_lock and entry and adjusted <= entry:
+            return sl
+        return adjusted
     if direction == "SHORT" and _sl_would_trigger_immediately(direction, sl, mark):
-        return mark + cushion
+        adjusted = mark + cushion
+        if profit_lock and entry and adjusted >= entry:
+            return sl
+        return adjusted
     return sl
 
 

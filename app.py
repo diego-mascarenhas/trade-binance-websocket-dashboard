@@ -4802,6 +4802,7 @@ def run_server() -> None:
         INTERVAL,
     )
     if execution.EXECUTION_ENABLED and execution.EXECUTION_MODE == "live":
+        execution.sync_fapi_time_offset(force=True)
         mode = "hedge" if execution.is_hedge_mode() else "one-way"
         logger.info("Execution live · Binance position mode: %s", mode)
 
@@ -4838,6 +4839,7 @@ def execution_maintenance_loop() -> None:
         if not execution.EXECUTION_ENABLED or execution.EXECUTION_MODE != "live":
             continue
         try:
+            execution.sync_fapi_time_offset()
             get_candles_df(refresh_execution=True)
         except Exception as exc:
             logger.warning("%s: execution maintenance loop failed: %s", SYMBOL.upper(), exc)
