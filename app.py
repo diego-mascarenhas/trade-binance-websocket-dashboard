@@ -1686,9 +1686,9 @@ def _ob_entry_block_reason(
     trade_plan: dict | None,
 ) -> str | None:
     """
-    Block repeat valid entries on the same OB snapshot.
-    With an open position, allow the next leg only when price reaches the next DCA level
-    or the OB walls shift (next structural OB).
+    Block repeat valid entries on the same OB only while scaling in (DCA).
+    Flat book: same OB is allowed again. With an open position, allow the next leg
+    only when price reaches the next DCA level or the OB walls shift.
     """
     global last_recorded_entry_ob
 
@@ -1700,13 +1700,16 @@ def _ob_entry_block_reason(
         and execution.dca_legs_placed(SYMBOL) == 0
         and not execution.has_open_limit_same_side(SYMBOL, signal)
     ):
-        if last_recorded_entry_ob and last_recorded_entry_ob.get("signal") != signal:
-            last_recorded_entry_ob = None
+        last_recorded_entry_ob = None
+        return None
 
     if not last_recorded_entry_ob or last_recorded_entry_ob.get("signal") != signal:
         return None
 
     pos_dir = execution.get_open_position_direction(SYMBOL)
+    if pos_dir != signal:
+        return None
+
     same_walls = _ob_walls_match(
         last_recorded_entry_ob.get("support"),
         last_recorded_entry_ob.get("resistance"),
@@ -1717,16 +1720,11 @@ def _ob_entry_block_reason(
     ref_price = latest_price if latest_price and latest_price > 0 else entry
     placed = execution.dca_legs_placed(SYMBOL)
 
-    if pos_dir == signal:
-        if not same_walls:
-            return None
-        if not _next_dca_leg_price_ready(signal, trade_plan, placed, ref_price):
-            return "ob_dca_not_ready"
-        if last_recorded_entry_ob.get("leg_index") == placed:
-            return "same_ob_level"
+    if not same_walls:
         return None
-
-    if same_walls:
+    if not _next_dca_leg_price_ready(signal, trade_plan, placed, ref_price):
+        return "ob_dca_not_ready"
+    if last_recorded_entry_ob.get("leg_index") == placed:
         return "same_ob_level"
     return None
 

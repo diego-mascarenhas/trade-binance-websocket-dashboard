@@ -801,7 +801,7 @@ def _synthesize_block_reason(
         return f"Entrada repetida antes del cooldown ({cooldown or '?'}s)"
 
     if reason == "same_ob_level":
-        return "Mismo OB que la última entrada — espera el siguiente nivel o cierre"
+        return "Posición abierta: mismo OB y misma pierna DCA — espera el siguiente nivel"
 
     if reason == "ob_dca_not_ready":
         return "Posición abierta: el precio aún no llegó al siguiente nivel DCA del OB"
