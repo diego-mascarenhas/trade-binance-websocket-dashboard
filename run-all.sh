@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Start hub page + one dashboard process per pair.
 # Usage:
-#   ./run-all.sh              # default pairs
+#   ./run-all.sh              # pairs from PAIRS in .env (or hub/pairs.json fallback)
 #   ./run-all.sh stop         # stop hub + dashboards started by this script
 #   PAIRS="DOGEUSDT:8051,BNBUSDT:8052" ./run-all.sh   # override + rewrite hub/pairs.json
 #   Edit hub/pairs.json directly — used on start unless PAIRS= is set
@@ -11,6 +11,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
 
 HUB_PORT="${HUB_PORT:-8050}"
 PID_FILE="${PID_FILE:-.run-all.pids}"
