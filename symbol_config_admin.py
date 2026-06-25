@@ -787,9 +787,12 @@ def restore_fleet_to_env_defaults(*, reason: str | None = None) -> dict[str, Any
         return {"ok": False, "error": "DB_ENABLED=false"}
 
     fleet = dashboard_notify.load_fleet_symbols()
+    fleet_set = set(fleet)
     rows = db_store.list_active_symbol_configs()
     active_symbols = {row["symbol"] for row in rows if row.get("symbol")}
-    targets = sorted(symbol for symbol in fleet if symbol in active_symbols)
+    in_fleet = sorted(symbol for symbol in fleet if symbol in active_symbols)
+    extra = sorted(symbol for symbol in active_symbols if symbol not in fleet_set)
+    targets = in_fleet + extra
     if not targets:
         return {
             "ok": True,
@@ -802,8 +805,6 @@ def restore_fleet_to_env_defaults(*, reason: str | None = None) -> dict[str, Any
     errors: list[str] = []
 
     for symbol in targets:
-        if symbol not in fleet:
-            continue
         version = db_store.deactivate_symbol_config(
             symbol,
             updated_by=UPDATED_BY,
@@ -814,18 +815,31 @@ def restore_fleet_to_env_defaults(*, reason: str | None = None) -> dict[str, Any
             results.append({"ok": False, "symbol": symbol})
             continue
         reload = dashboard_notify.notify_dashboard_reload(symbol)
-        results.append({"ok": True, "symbol": symbol, "config_version": version, "reload": reload})
+        if symbol in fleet_set and not reload.get("ok"):
+            errors.append(f"{symbol}: reload {reload.get('error', 'failed')}")
+        results.append(
+            {
+                "ok": True,
+                "symbol": symbol,
+                "config_version": version,
+                "reload": reload,
+                "outside_fleet": symbol not in fleet_set,
+            }
+        )
 
     restored = sum(1 for result in results if result.get("ok"))
     message = f"Restaurado a .env en {restored}/{len(targets)} símbolo(s)."
+    if extra:
+        message += f" Incluye {len(extra)} fuera de la flota actual."
     if errors:
-        message = f"Restaurado en {restored}/{len(targets)} símbolo(s). Fallos: {'; '.join(errors[:5])}"
+        message = f"Restaurado en {restored}/{len(targets)} símbolo(s). Avisos: {'; '.join(errors[:5])}"
 
     return {
         "ok": restored > 0 and not errors,
         "partial": restored > 0 and bool(errors),
         "restored_symbols": restored,
         "total_symbols": len(targets),
+        "extra_symbols": extra,
         "errors": errors,
         "results": results,
         "message": message,

@@ -1051,6 +1051,15 @@ function renderActiveConfigStatus(status) {
     const symbolCount = status.symbols_with_overrides ?? 0;
     const fleetSize = status.fleet_size ?? 0;
 
+    const extraSymbols = status.extra_symbols || [];
+    const extraNote =
+        extraSymbols.length > 0
+            ? `<p class="note warn" style="margin:8px 0 0;font-size:0.78rem;">
+                Overrides en símbolos fuera de la flota (${escapeHtml(extraSymbols.join(", "))}).
+                <strong>Restaurar .env</strong> también los limpia.
+            </p>`
+            : "";
+
     activeConfigStatusEl.hidden = false;
     activeConfigStatusEl.innerHTML = `
         <div class="active-config-head">
@@ -1064,6 +1073,7 @@ function renderActiveConfigStatus(status) {
             </div>
             ${perSymbolBlocks}
         </div>
+        ${extraNote}
         <p class="note" style="margin:10px 0 0;font-size:0.78rem;">
             Estos valores sustituyen al <code>.env</code> mientras estén activos.
             Usa <strong>Restaurar .env</strong> para volver a los defaults.
@@ -1331,16 +1341,10 @@ async function restoreAllSuggestions() {
     }
     setBulkFeedback("Restaurando overrides a valores del .env…", "info");
     try {
-        const result =
-            hasBulkApplicableSuggestions() && bulkApplied
-                ? await postJson("/api/suggestions/restore-all", {
-                      suggestions: lastSuggestions,
-                      reason: "DeepSeek bulk restore",
-                  })
-                : await postJson("/api/config-overrides/restore", {
-                      reason: "Analytics restore all to .env",
-                  });
-        if (!result.ok && !result.partial) {
+        const result = await postJson("/api/config-overrides/restore", {
+            reason: "Analytics restore all to .env",
+        });
+        if (!result.ok && !result.partial && !(result.restored_symbols === 0 && result.message)) {
             setBulkFeedback(result.error || "No se pudo restaurar.", "error");
             return;
         }

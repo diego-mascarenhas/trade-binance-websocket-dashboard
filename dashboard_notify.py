@@ -4,17 +4,49 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent
 PAIRS_FILE = ROOT / "hub" / "pairs.json"
+load_dotenv(ROOT / ".env")
 
 
-def load_fleet_symbols() -> list[str]:
+def _parse_pairs_items(raw: str) -> list[tuple[str, int | None]]:
+    items: list[tuple[str, int | None]] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            symbol_part, port_part = part.split(":", 1)
+            symbol = symbol_part.strip().upper()
+            try:
+                port = int(port_part.strip())
+            except (TypeError, ValueError):
+                port = None
+        else:
+            symbol = part.upper()
+            port = None
+        if symbol:
+            items.append((symbol, port))
+    return items
+
+
+def _pairs_from_env() -> list[tuple[str, int | None]]:
+    raw = os.getenv("PAIRS", "").strip()
+    if not raw:
+        return []
+    return _parse_pairs_items(raw)
+
+
+def _pairs_from_json() -> list[tuple[str, int | None]]:
     if not PAIRS_FILE.is_file():
         return []
     try:
@@ -22,30 +54,41 @@ def load_fleet_symbols() -> list[str]:
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("Could not read %s: %s", PAIRS_FILE, exc)
         return []
-    symbols: list[str] = []
+
+    items: list[tuple[str, int | None]] = []
     for item in pairs:
         symbol = str(item.get("symbol", "")).strip().upper()
-        if symbol:
+        if not symbol:
+            continue
+        try:
+            port = int(item["port"])
+        except (KeyError, TypeError, ValueError):
+            port = None
+        items.append((symbol, port))
+    return items
+
+
+def load_fleet_pairs() -> list[tuple[str, int | None]]:
+    """Fleet symbol/port list — PAIRS in .env first, then hub/pairs.json."""
+    items = _pairs_from_env()
+    if items:
+        return items
+    return _pairs_from_json()
+
+
+def load_fleet_symbols() -> list[str]:
+    symbols: list[str] = []
+    for symbol, _port in load_fleet_pairs():
+        if symbol not in symbols:
             symbols.append(symbol)
     return symbols
 
 
 def _load_pair_port(symbol: str) -> int | None:
     symbol = symbol.strip().upper()
-    if not PAIRS_FILE.is_file():
-        return None
-    try:
-        pairs = json.loads(PAIRS_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Could not read %s: %s", PAIRS_FILE, exc)
-        return None
-
-    for item in pairs:
-        if str(item.get("symbol", "")).upper() == symbol:
-            try:
-                return int(item["port"])
-            except (KeyError, TypeError, ValueError):
-                return None
+    for pair_symbol, port in load_fleet_pairs():
+        if pair_symbol == symbol:
+            return port
     return None
 
 
@@ -67,7 +110,7 @@ def _notify_dashboard_reload_once(symbol: str, *, timeout: float) -> dict:
         return {
             "ok": False,
             "symbol": symbol.upper(),
-            "error": f"No dashboard port found for {symbol.upper()} in hub/pairs.json",
+            "error": f"No dashboard port found for {symbol.upper()} (check PAIRS or hub/pairs.json)",
         }
 
     url = f"http://127.0.0.1:{port}/api/reload-config"
