@@ -97,7 +97,8 @@ LOG_DIR = os.getenv("LOG_DIR", "logs")
 TRADE_PLAN_EXECUTE_DCA = _env_bool("TRADE_PLAN_EXECUTE_DCA", "true")
 TRADE_PLAN_DCA_SIGNAL_DRIVEN = _env_bool("TRADE_PLAN_DCA_SIGNAL_DRIVEN", "true")
 TRADE_PLAN_DCA_ADVERSE_ONLY = _env_bool("TRADE_PLAN_DCA_ADVERSE_ONLY", "true")
-DCA_DEFER_PROTECTION_UNTIL_LAST_LEG = _env_bool("DCA_DEFER_PROTECTION_UNTIL_LAST_LEG", "false")
+DCA_DEFER_PROTECTION_UNTIL_LAST_LEG = _env_bool("DCA_DEFER_PROTECTION_UNTIL_LAST_LEG", "true")
+DCA_MARKET_ADDS = _env_bool("DCA_MARKET_ADDS", "true")
 DCA_FAVORABLE_PNL_MAX_USDT = float(os.getenv("DCA_FAVORABLE_PNL_MAX_USDT", "0"))
 TRADE_PLAN_TP1_RR = float(os.getenv("TRADE_PLAN_TP1_RR", "1.0"))
 TRADE_PLAN_SL_MIN_DISTANCE_PCT = float(os.getenv("TRADE_PLAN_SL_MIN_DISTANCE_PCT", "1.0"))
@@ -390,8 +391,9 @@ def _dca_progress(symbol: str) -> tuple[int, int]:
 
 def _should_defer_protection_until_last_dca(symbol: str) -> bool:
     """
-    Defer SL/TP while building signal-driven DCA legs.
+    Defer SL while building signal-driven DCA legs.
 
+    TP is still allowed to reconcile/adjust on each leg.
     Applies only when explicitly enabled; bundle mode keeps current behavior.
     """
     if not DCA_DEFER_PROTECTION_UNTIL_LAST_LEG or not TRADE_PLAN_DCA_SIGNAL_DRIVEN:
@@ -3468,12 +3470,12 @@ def reconcile_position_protection(
     if not snapshot.get("open"):
         return summary
     _sync_dca_leg_count(symbol)
-    if _should_defer_protection_until_last_dca(symbol):
+    defer_sl_until_last = _should_defer_protection_until_last_dca(symbol)
+    if defer_sl_until_last:
         placed, max_legs = _dca_progress(symbol)
         summary["deferred_protection"] = True
         summary["dca_legs_placed"] = placed
         summary["dca_max_legs"] = max_legs
-        return summary
 
     pos_dir = _primary_position_direction(snapshot.get("direction")) or _primary_position_direction(
         direction
@@ -3567,6 +3569,13 @@ def reconcile_position_protection(
 
     need_sl = not protection["has_sl"]
     need_tp = not protection["has_tp"]
+    if defer_sl_until_last:
+        if protection["has_sl"]:
+            _cancel_symbol_sl_orders(symbol, pos_dir)
+            _invalidate_position_cache(symbol)
+            protection = get_position_protection(symbol, pos_dir)
+            summary.update(protection)
+        need_sl = False
 
     if (
         not need_tp
@@ -3586,6 +3595,7 @@ def reconcile_position_protection(
         and sl_val is not None
         and sl_val > 0
         and entry_f is not None
+        and not defer_sl_until_last
         and not ctx.get("be_applied")
         and _sl_order_needs_refresh(symbol, pos_dir, float(sl_val), entry_f)
     ):
@@ -6478,6 +6488,7 @@ def _execute_open(
                 dca_max_legs=dca_max_legs,
                 reason="wait_last_dca_leg",
             )
+            reconcile_position_protection(symbol, direction=direction, sl=sl, tp=tp)
     except RuntimeError as exc:
         logger.error("Order failed for %s: %s", symbol, exc)
         _append_orders_log("live_open_failed", symbol=symbol, error=str(exc), **payload)
@@ -6499,7 +6510,7 @@ def _execute_signal_dca_add(
     *,
     size_usdt: float | None = None,
 ) -> None:
-    """Place one add-on limit when a new valid entry fires with an open position."""
+    """Place one add-on DCA leg when a new valid entry fires with an open position."""
     global _last_execution_monotonic
 
     symbol = symbol.upper()
@@ -6516,11 +6527,13 @@ def _execute_signal_dca_add(
         _set_status(message=f"DCA add blocked: {block_reason}", last_event=block_reason)
         return
 
-    price_str = round_price_for_entry(symbol, direction, entry)
+    use_market = DCA_MARKET_ADDS
+    qty_entry = _entry_price_for_quantity(symbol, entry, use_market=use_market)
+    price_str = round_price(symbol, entry) if use_market else round_price_for_entry(symbol, direction, entry)
     try:
         qty = resolve_leg_order_quantity(
             symbol,
-            float(price_str),
+            qty_entry if use_market else float(price_str),
             size_pct=size_pct,
             size_usdt=size_usdt,
         )
@@ -6602,7 +6615,10 @@ def _execute_signal_dca_add(
         return
 
     try:
-        response = _place_limit_entry(symbol, direction, price_str, qty, leg_index=leg_index)
+        if use_market:
+            response = _place_market_entry(symbol, direction, qty, leg_index=leg_index)
+        else:
+            response = _place_limit_entry(symbol, direction, price_str, qty, leg_index=leg_index)
         order_id = response.get("orderId")
         _append_orders_log(
             "live_dca_add",
@@ -6613,6 +6629,7 @@ def _execute_signal_dca_add(
             entry=price_str,
             qty=qty,
             size_pct=size_pct,
+            entry_type="MARKET" if use_market else "LIMIT",
             plan=plan_fingerprint,
         )
         record_trade_context(
@@ -6630,10 +6647,11 @@ def _execute_signal_dca_add(
         telegram.notify_live_open(
             symbol,
             direction,
-            f"DCA {leg_index} @ {price_str}",
+            f"DCA {leg_index} @ {price_str}" if not use_market else f"DCA {leg_index} @ ~{price_str} (market)",
             sl_price,
             tp_label,
             vol_usdt,
+            entry_order_type="MARKET" if use_market else "LIMIT",
         )
         _set_status(
             message=f"LIVE DCA add {direction} {symbol} leg {leg_index} · {order_id}",
@@ -6780,7 +6798,7 @@ def _execute_open_dca(
     for index, leg in enumerate(legs):
         price = float(leg["price"])
         size_pct = float(leg["size_pct"])
-        use_market = _use_market_for_first_leg(index)
+        use_market = _use_market_for_first_leg(index) or (index > 0 and DCA_MARKET_ADDS)
         qty_price = _entry_price_for_quantity(symbol, price, use_market=use_market)
         price_str = (
             round_price(symbol, price)

@@ -287,7 +287,7 @@
                     <li>Tamaño: <code>POSITION_SIZE_USDT</code> (25) o <code>POSITION_WALLET_PCT</code> si &gt; 0.</li>
                     <li>Apalancamiento: <code>LEVERAGE</code> (4) o <code>LEVERAGE_MODE=max</code> (máximo del símbolo).</li>
                     <li>Primera pierna: <code>ENTRY_FIRST_LEG_MARKET=true</code> (MARKET + SL/TP desde fill real).</li>
-                    <li>DCA adicionales: órdenes LIMIT.</li>
+                    <li>DCA adicionales: <code>DCA_MARKET_ADDS=true</code> (MARKET por defecto; SL puede diferirse a la última pierna).</li>
                     <li>Órdenes LIMIT de entrada sin fill: canceladas tras <code>ENTRY_LIMIT_TTL_SEC</code> (600 s).</li>
                     <li>Cooldown entre órdenes: <code>EXECUTION_ORDER_COOLDOWN</code> (180 s).</li>
                     <li>Mantenimiento SL/TP: cada <code>EXECUTION_MAINTENANCE_SEC</code> (60 s).</li>
@@ -527,6 +527,8 @@
                             <tr><td><code>POSITION_WALLET_PCT</code></td><td>0</td><td>% wallet (si &gt; 0, prioriza)</td></tr>
                             <tr><td><code>LEVERAGE</code></td><td>4</td><td>Apalancamiento fijo</td></tr>
                             <tr><td><code>ENTRY_FIRST_LEG_MARKET</code></td><td>true</td><td>Primera pierna MARKET</td></tr>
+                            <tr><td><code>DCA_MARKET_ADDS</code></td><td>true</td><td>Piernas DCA en MARKET</td></tr>
+                            <tr><td><code>DCA_DEFER_PROTECTION_UNTIL_LAST_LEG</code></td><td>true</td><td>Difiere SL hasta el último DCA y mantiene TP ajustado</td></tr>
                             <tr><td><code>ENTRY_LIMIT_TTL_SEC</code></td><td>600</td><td>Cancelar LIMIT sin fill</td></tr>
                             <tr><td><code>EXECUTION_ORDER_COOLDOWN</code></td><td>180</td><td>Cooldown órdenes</td></tr>
                             <tr><td><code>FLEET_SIDE_BALANCE_MAX_PCT</code></td><td>20</td><td>Cap imbalance L/S</td></tr>

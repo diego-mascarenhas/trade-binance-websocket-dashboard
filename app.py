@@ -176,7 +176,9 @@ TRADE_PLAN_EXECUTE_DCA = os.getenv("TRADE_PLAN_EXECUTE_DCA", "true").lower() in 
     "yes",
 )
 LOG_DIR = os.getenv("LOG_DIR", "logs")
-DB_CONFIG_POLL_SEC = int(os.getenv("DB_CONFIG_POLL_SEC", "0"))
+# Poll DB config periodically so preset/apply/restore take effect without process restart.
+# Set 0 explicitly in .env only if you want to disable hot-reload.
+DB_CONFIG_POLL_SEC = int(os.getenv("DB_CONFIG_POLL_SEC", "30"))
 
 INDICATOR_FILTERS_ENABLED = os.getenv("INDICATOR_FILTERS_ENABLED", "true").lower() in (
     "1",
