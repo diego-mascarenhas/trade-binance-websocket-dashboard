@@ -170,6 +170,10 @@ TRADE_PLAN_DCA_EQUAL_SPLIT = os.getenv("TRADE_PLAN_DCA_EQUAL_SPLIT", "false").lo
     "true",
     "yes",
 )
+TRADE_PLAN_DCA_LEG_MULTIPLIER = max(
+    float(os.getenv("TRADE_PLAN_DCA_LEG_MULTIPLIER", "1.5")),
+    0.0,
+)
 TRADE_PLAN_EXECUTE_DCA = os.getenv("TRADE_PLAN_EXECUTE_DCA", "true").lower() in (
     "1",
     "true",
@@ -1189,6 +1193,25 @@ def build_dca_leg_allocations(
     rows: list[dict[str, float]] = []
     cumulative_usdt = entry_notional_usdt
 
+    # Progressive adds: each new DCA leg = previous leg × multiplier.
+    # Example multiplier=1.5 => 150%, 225%, 337.5%... of initial entry leg.
+    if TRADE_PLAN_DCA_LEG_MULTIPLIER > 0:
+        prev_leg_usdt = entry_notional_usdt
+        for _ in dca_prices:
+            increment_usdt = prev_leg_usdt * TRADE_PLAN_DCA_LEG_MULTIPLIER
+            cumulative_usdt += increment_usdt
+            rows.append(
+                {
+                    "increment_usdt": increment_usdt,
+                    "cumulative_usdt": cumulative_usdt,
+                    "band_pct": 0.0,
+                    "dist_pct": 0.0,
+                    "increment_pct": execution.wallet_pct_from_notional_usdt(increment_usdt),
+                }
+            )
+            prev_leg_usdt = increment_usdt
+        return rows
+
     if TRADE_PLAN_DCA_COMPENSATION and not TRADE_PLAN_DCA_EQUAL_SPLIT:
         prev_dist = 0.0
         for price in dca_prices:
@@ -1317,7 +1340,9 @@ def compute_trade_plan(
         entry_notional_usdt,
         initial_pct,
     )
-    if TRADE_PLAN_DCA_COMPENSATION and not TRADE_PLAN_DCA_EQUAL_SPLIT:
+    if TRADE_PLAN_DCA_LEG_MULTIPLIER > 0:
+        size_mode = "leg-multiplier"
+    elif TRADE_PLAN_DCA_COMPENSATION and not TRADE_PLAN_DCA_EQUAL_SPLIT:
         size_mode = "usdt+dist%"
     elif TRADE_PLAN_DCA_EQUAL_SPLIT:
         size_mode = "equal-remainder"
@@ -1342,12 +1367,21 @@ def compute_trade_plan(
         cum = float(alloc["cumulative_usdt"])
         band = float(alloc.get("band_pct") or 0.0)
         dist_pct = float(alloc.get("dist_pct") or 0.0)
+        if size_mode == "usdt+dist%":
+            label = (
+                f"DCA {index + 1} · +{inc:.2f} USDT "
+                f"({entry_notional_usdt:.0f}×{band:.2f}%={inc:.0f}) · pos ~{cum:.0f} USDT"
+            )
+        elif size_mode == "leg-multiplier":
+            label = (
+                f"DCA {index + 1} · x{TRADE_PLAN_DCA_LEG_MULTIPLIER:.2f} prev "
+                f"· +{inc:.2f} USDT · pos ~{cum:.0f} USDT"
+            )
+        else:
+            label = f"DCA {index + 1} · +{inc:.2f} USDT · pos ~{cum:.0f} USDT"
         legs.append(
             {
-                "label": (
-                    f"DCA {index + 1} · +{inc:.2f} USDT "
-                    f"({entry_notional_usdt:.0f}×{band:.2f}%={inc:.0f}) · pos ~{cum:.0f} USDT"
-                ),
+                "label": label,
                 "price": dca_price,
                 "size_pct": float(alloc["increment_pct"]),
                 "size_usdt": inc,

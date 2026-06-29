@@ -4607,6 +4607,8 @@ def calculate_quantity_for_notional(
     symbol: str,
     entry_price: float,
     notional_usdt: float,
+    *,
+    strict_min_qty: bool = False,
 ) -> str:
     """Qty from explicit USDT notional (DCA adds anchored to entry volume)."""
     if entry_price <= 0:
@@ -4617,6 +4619,8 @@ def calculate_quantity_for_notional(
     filt = _load_symbol_filters(symbol)
     qty_str = round_qty(symbol, qty)
     if Decimal(qty_str) < filt["min_qty"]:
+        if strict_min_qty:
+            raise ValueError(f"Order quantity below minimum lot for {symbol}")
         qty_str = format(filt["min_qty"], "f")
     if Decimal(qty_str) * Decimal(str(entry_price)) < filt["min_notional"]:
         raise ValueError(f"Order notional below minimum for {symbol}")
@@ -4629,10 +4633,16 @@ def resolve_leg_order_quantity(
     *,
     size_pct: float,
     size_usdt: float | None = None,
+    strict_min_qty: bool = False,
 ) -> str:
     if size_usdt is not None and float(size_usdt) > 0:
-        return calculate_quantity_for_notional(symbol, entry_price, float(size_usdt))
-    return _calculate_quantity(symbol, entry_price, size_pct)
+        return calculate_quantity_for_notional(
+            symbol,
+            entry_price,
+            float(size_usdt),
+            strict_min_qty=strict_min_qty,
+        )
+    return _calculate_quantity(symbol, entry_price, size_pct, strict_min_qty=strict_min_qty)
 
 
 def _position_adverse_for_dca(
@@ -5834,7 +5844,13 @@ def _calculate_notional_usdt() -> float:
     return POSITION_SIZE_USDT
 
 
-def _calculate_quantity(symbol: str, entry_price: float, size_pct: float = 100.0) -> str:
+def _calculate_quantity(
+    symbol: str,
+    entry_price: float,
+    size_pct: float = 100.0,
+    *,
+    strict_min_qty: bool = False,
+) -> str:
     notional = _calculate_notional_usdt() * (size_pct / 100.0)
     if entry_price <= 0:
         raise ValueError("Invalid entry price for quantity")
@@ -5842,6 +5858,8 @@ def _calculate_quantity(symbol: str, entry_price: float, size_pct: float = 100.0
     filt = _load_symbol_filters(symbol)
     qty_str = round_qty(symbol, qty)
     if Decimal(qty_str) < filt["min_qty"]:
+        if strict_min_qty:
+            raise ValueError(f"Order quantity below minimum lot for {symbol}")
         qty_str = format(filt["min_qty"], "f")
     if Decimal(qty_str) * Decimal(str(entry_price)) < filt["min_notional"]:
         raise ValueError(f"Order notional below minimum for {symbol}")
@@ -6308,6 +6326,7 @@ def _execute_open(
             qty_entry,
             size_pct=size_pct,
             size_usdt=size_usdt,
+            strict_min_qty=leg_index > 0,
         )
     except ValueError as exc:
         _set_status(message=str(exc), last_event="error")
@@ -6536,6 +6555,7 @@ def _execute_signal_dca_add(
             qty_entry if use_market else float(price_str),
             size_pct=size_pct,
             size_usdt=size_usdt,
+            strict_min_qty=True,
         )
     except ValueError as exc:
         err_text = str(exc)
@@ -6812,6 +6832,7 @@ def _execute_open_dca(
                 qty_price if use_market else float(price_str),
                 size_pct=size_pct,
                 size_usdt=float(leg_usdt) if leg_usdt is not None else None,
+                strict_min_qty=index > 0,
             )
         except ValueError as exc:
             _append_orders_log(
