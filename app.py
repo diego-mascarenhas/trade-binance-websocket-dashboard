@@ -1830,6 +1830,15 @@ def record_valid_entry(
 
     now = time.monotonic()
     pos_dir = execution.get_open_position_direction(SYMBOL)
+    if pos_dir and pos_dir != signal:
+        log_decision_event(
+            "valid_entry_blocked",
+            outcome="blocked",
+            block_reason="opposite_direction_open",
+            market_snapshot=market,
+        )
+        return
+
     skip_time_cooldown = OB_DCA_GATE_ENABLED and pos_dir == signal
     if (
         not skip_time_cooldown
@@ -1853,6 +1862,82 @@ def record_valid_entry(
             last["reasons"] = reasons
             return
 
+    leg_index = execution.dca_legs_placed(SYMBOL) if execution.has_open_position(SYMBOL) else 0
+    if trade_plan and trade_plan.get("active"):
+        legs = trade_plan.get("legs") or []
+        use_dca = TRADE_PLAN_EXECUTE_DCA and len(legs) > 1
+        if use_dca and execution.TRADE_PLAN_DCA_SIGNAL_DRIVEN:
+            execution._sync_dca_leg_count(SYMBOL)
+            placed = execution.dca_legs_placed(SYMBOL)
+            if execution.has_open_position(SYMBOL):
+                leg_index = placed
+            else:
+                leg_index = 0
+            if leg_index >= len(legs):
+                log_decision_event(
+                    "valid_entry_blocked",
+                    outcome="blocked",
+                    block_reason="dca_max_legs",
+                    market_snapshot=market,
+                )
+                return
+            leg = legs[leg_index]
+            dca_entry = execution.resolve_dca_leg_entry_price(leg_index, leg, float(entry))
+            if leg_index == 0:
+                allowed, block_reason = execution.can_place_new_order(
+                    SYMBOL,
+                    signal,
+                    dca_entry,
+                    size_pct=float(leg["size_pct"]),
+                )
+                if not allowed:
+                    log_decision_event(
+                        "valid_entry_blocked",
+                        outcome="blocked",
+                        block_reason=block_reason,
+                        market_snapshot=market,
+                    )
+                    return
+            elif leg_index >= 1:
+                allowed, block_reason = execution.can_place_dca_add(
+                    SYMBOL,
+                    signal,
+                    dca_entry,
+                    size_pct=float(leg["size_pct"]),
+                    max_legs=len(legs),
+                )
+                if not allowed:
+                    log_decision_event(
+                        "valid_entry_blocked",
+                        outcome="blocked",
+                        block_reason=block_reason,
+                        market_snapshot=market,
+                    )
+                    return
+            size_pct = float(leg["size_pct"])
+            leg_notional = float(leg["size_usdt"]) if leg.get("size_usdt") is not None else None
+        elif use_dca:
+            size_pct = sum(float(leg["size_pct"]) for leg in legs)
+            leg_notional = None
+        else:
+            first = legs[0] if legs else {}
+            size_pct = float(first.get("size_pct") or trade_plan.get("partial_close_pct", 50))
+            leg_notional = float(first["size_usdt"]) if first.get("size_usdt") is not None else None
+        order_notional = (
+            leg_notional
+            if leg_notional is not None
+            else execution.estimate_order_notional_usdt(size_pct)
+        )
+        blocked, balance_reason = execution.fleet_side_balance_blocks(signal, order_notional)
+        if blocked:
+            log_decision_event(
+                "valid_entry_blocked",
+                outcome="blocked",
+                block_reason=balance_reason,
+                market_snapshot=market,
+            )
+            return
+
     valid_entries.append(
         {
             "t": candle_time,
@@ -1863,7 +1948,6 @@ def record_valid_entry(
         }
     )
     last_valid_entry_monotonic = now
-    leg_index = execution.dca_legs_placed(SYMBOL) if execution.has_open_position(SYMBOL) else 0
     last_recorded_entry_ob = {
         "signal": signal,
         "support": support,
@@ -1907,65 +1991,6 @@ def record_valid_entry(
         format_price(sl_val) if sl_val else None,
         format_price(tp1_val) if tp1_val else None,
     )
-    if trade_plan and trade_plan.get("active"):
-        legs = trade_plan.get("legs") or []
-        use_dca = TRADE_PLAN_EXECUTE_DCA and len(legs) > 1
-        if use_dca and execution.TRADE_PLAN_DCA_SIGNAL_DRIVEN:
-            execution._sync_dca_leg_count(SYMBOL)
-            placed = execution.dca_legs_placed(SYMBOL)
-            if execution.has_open_position(SYMBOL):
-                leg_index = placed
-            else:
-                leg_index = 0
-            if leg_index >= len(legs):
-                log_decision_event(
-                    "valid_entry_blocked",
-                    outcome="blocked",
-                    block_reason="dca_max_legs",
-                    market_snapshot=market,
-                )
-                return
-            leg = legs[leg_index]
-            dca_entry = execution.resolve_dca_leg_entry_price(leg_index, leg, float(entry))
-            if leg_index >= 1 and execution.TRADE_PLAN_DCA_ADVERSE_ONLY:
-                allowed, block_reason = execution.can_place_dca_add(
-                    SYMBOL,
-                    signal,
-                    dca_entry,
-                    size_pct=float(leg["size_pct"]),
-                    max_legs=len(legs),
-                )
-                if not allowed:
-                    log_decision_event(
-                        "valid_entry_blocked",
-                        outcome="blocked",
-                        block_reason=block_reason,
-                        market_snapshot=market,
-                    )
-                    return
-            size_pct = float(leg["size_pct"])
-            leg_notional = float(leg["size_usdt"]) if leg.get("size_usdt") is not None else None
-        elif use_dca:
-            size_pct = sum(float(leg["size_pct"]) for leg in legs)
-            leg_notional = None
-        else:
-            first = legs[0] if legs else {}
-            size_pct = float(first.get("size_pct") or trade_plan.get("partial_close_pct", 50))
-            leg_notional = float(first["size_usdt"]) if first.get("size_usdt") is not None else None
-        order_notional = (
-            leg_notional
-            if leg_notional is not None
-            else execution.estimate_order_notional_usdt(size_pct)
-        )
-        blocked, balance_reason = execution.fleet_side_balance_blocks(signal, order_notional)
-        if blocked:
-            log_decision_event(
-                "valid_entry_blocked",
-                outcome="blocked",
-                block_reason=balance_reason,
-                market_snapshot=market,
-            )
-            return
     execution.try_execute_valid_entry(
         SYMBOL,
         signal,
@@ -2101,6 +2126,13 @@ def _attempt_signal_entry(
                     market_snapshot=ob_market,
                 )
             return
+        log_decision_event(
+            "valid_entry_blocked",
+            outcome="blocked",
+            block_reason="opposite_direction_open",
+            market_snapshot=ob_market,
+        )
+        return
 
     if effective_plan and effective_plan.get("active"):
         record_valid_entry(

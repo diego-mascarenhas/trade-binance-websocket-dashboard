@@ -803,6 +803,12 @@ def _synthesize_block_reason(
     if reason == "same_ob_level":
         return "Posición abierta: mismo OB y misma pierna DCA — espera el siguiente nivel"
 
+    if reason == "opposite_direction_open":
+        return "Señal opuesta con posición abierta — solo cierre OB o misma dirección (DCA)"
+
+    if reason == "dca_direction_mismatch":
+        return "DCA rechazado: señal opuesta a la posición abierta"
+
     if reason == "ob_dca_not_ready":
         return "Posición abierta: el precio aún no llegó al siguiente nivel DCA del OB"
 

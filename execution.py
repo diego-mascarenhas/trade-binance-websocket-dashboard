@@ -713,9 +713,42 @@ def _apply_breakeven_sl(
         lock_profit_pct=lock_pct,
         spread_abs=spread_abs,
     )
-    be_sl = _ensure_sl_behind_mark(symbol, direction, be_raw)
+    be_sl = _ensure_sl_behind_mark(symbol, direction, be_raw, entry=entry)
     sl_price = round_price_for_profit_sl(symbol, direction, be_sl)
-    placed, skipped = _place_sl_for_position(symbol, pos_dir, sl_price, qty, log_suffix="_be")
+    try:
+        sl_val = float(sl_price)
+    except (TypeError, ValueError):
+        sl_val = 0.0
+    mark = _get_mark_price(symbol)
+    if (
+        mark is not None
+        and sl_val > 0
+        and _is_profit_lock_sl(direction, entry, sl_val)
+        and _sl_would_trigger_immediately(direction, sl_val, mark)
+    ):
+        closed = _perform_market_close(
+            symbol,
+            pos_dir,
+            trigger="profit_lock",
+            trigger_detail=trigger_detail,
+        )
+        if closed:
+            _append_orders_log(
+                "profit_lock_market_close",
+                symbol=symbol,
+                direction=pos_dir,
+                entry=entry,
+                sl=sl_price,
+                mark=mark,
+                trigger=trigger,
+                trigger_detail=trigger_detail,
+                lock_profit_pct=round(_resolve_lock_profit_pct(snapshot), 4),
+            )
+        return closed
+
+    placed, skipped = _place_sl_for_position(
+        symbol, pos_dir, sl_price, qty, log_suffix="_be", entry=entry
+    )
     if not placed:
         if skipped:
             logger.info("%s: BE SL skipped (mark through stop)", symbol)
@@ -5659,6 +5692,7 @@ def _place_sl_for_position(
     qty: str,
     *,
     log_suffix: str = "",
+    entry: float | None = None,
 ) -> tuple[bool, bool]:
     """Place SL if valid vs mark. Returns (placed, skipped_immediate)."""
     symbol = symbol.upper()
@@ -5670,11 +5704,19 @@ def _place_sl_for_position(
 
     mark = _get_mark_price(symbol)
     sl_use = sl_val
+    profit_lock = (
+        entry is not None
+        and entry > 0
+        and sl_val > 0
+        and _is_profit_lock_sl(direction, entry, sl_val)
+    )
     if mark is not None and sl_val > 0 and _sl_would_trigger_immediately(direction, sl_val, mark):
         original = sl_val
-        sl_use = _ensure_sl_behind_mark(symbol, direction, sl_val)
+        sl_use = _ensure_sl_behind_mark(symbol, direction, sl_val, entry=entry)
         if abs(sl_use - original) > 1e-12:
             sl_price = round_price_for_sl(symbol, direction, sl_use)
+            if profit_lock:
+                sl_price = round_price_for_profit_sl(symbol, direction, sl_use)
             sl_val = float(sl_price)
             _append_orders_log(
                 "sl_repriced_for_mark",
@@ -5715,7 +5757,7 @@ def _place_sl_for_position(
             retry_sl = round_price_for_sl(
                 symbol,
                 direction,
-                _ensure_sl_behind_mark(symbol, direction, sl_val),
+                _ensure_sl_behind_mark(symbol, direction, sl_val, entry=entry),
             )
             if retry_sl != sl_price:
                 try:
