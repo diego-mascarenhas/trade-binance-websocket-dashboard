@@ -10,3 +10,5 @@ __pycache__/
 .pytest_cache/
 logs/*
 .run-all.pids
+dca-grid/*.log
+dca-grid/*.pid

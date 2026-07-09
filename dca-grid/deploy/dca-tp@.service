@@ -1,0 +1,22 @@
+[Unit]
+Description=DCA trailing-TP manager (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User and paths to your server.
+User=trader
+WorkingDirectory=/opt/dca-grid
+# API keys (and optional FAPI_BASE) live here; chmod 600.
+EnvironmentFile=/etc/dca-grid.env
+# %i is the symbol, e.g. dca-tp@SOLUSDT. Direction is auto-detected from the
+# open position each pass, so only the symbol is needed here.
+ExecStart=/usr/bin/python3 -u /opt/dca-grid/ob_dca_grid.py %i --tp-only --execute
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/dca-grid/%i.log
+StandardError=append:/var/log/dca-grid/%i.log
+
+[Install]
+WantedBy=multi-user.target

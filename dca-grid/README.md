@@ -49,6 +49,60 @@ minimum gap (`--min-gap`), within the fetched depth (`--limit`, up to 1000).
 > (often ~20-30% for alts). If fewer than `--so-count` walls qualify, raise
 > `--limit` or lower `--min-gap`.
 
+### Trailing TP on the opposite order book (profit-guaranteed)
+
+The TP is a `TRAILING_STOP_MARKET` (Binance algo order) whose activation is
+snapped to a **wall on the opposite side** of the book:
+
+- SHORT → BUY trailing, activation on a **bid/support** wall below the average.
+- LONG → SELL trailing, activation on an **ask/resistance** wall above the average.
+
+The activation is clamped so the **worst-case** trailing exit (after the full
+callback retrace) is still green:
+
+```
+SHORT (BUY):  activation * (1 + callback%) <= avg * (1 - fee_buffer%)
+LONG  (SELL): activation * (1 - callback%) >= avg * (1 + fee_buffer%)
+```
+
+If no wall is deep enough to satisfy that, the activation is clamped to the
+profit floor (so it never sits at a loss).
+
+The TP is **automatic**. When you place the grid with `--execute`, the script
+then enters a loop that manages the trailing TP for you (no extra flag needed):
+
+```bash
+# Place grid AND auto-manage the TP (default)
+python3 ob_dca_grid.py SOLUSDT --direction short --execute
+
+# Place grid only, no TP management
+python3 ob_dca_grid.py SOLUSDT --direction short --execute --no-tp
+
+# Attach the automatic TP to an ALREADY-placed grid (no new grid orders)
+python3 ob_dca_grid.py SOLUSDT --direction short --tp-only --execute
+```
+
+The manager polls the live position (`positionRisk` → real average), recomputes
+the activation from the current opposite-OB walls, and cancels/replaces the
+reduce-only trailing TP whenever the position size or target changes. It keeps
+running (waiting when there is no position yet). Stop it with `Ctrl+C`
+(the last TP order stays in place).
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--no-tp` | off | Do NOT auto-manage the TP after placing the grid |
+| `--tp-only` | off | Skip the grid; only auto-manage the TP for the position |
+| `--tp-callback` | `0.2` | Callback rate % (0.1..10) |
+| `--tp-fee-buffer` | `0.12` | Extra profit margin % (fees+buffer) to stay green |
+| `--tp-wall-min-mult` | `3` | Min wall size vs median book qty to count as a wall |
+| `--tp-wall-pick` | `nearest` | `nearest` or `strongest` opposite wall |
+| `--tp-poll-sec` | `5` | Position/TP re-sync interval |
+
+> The TP uses the **live position average**, not the current price. When only the
+> base is filled the average is near entry, so the activation sits close; as DCAs
+> fill and the average moves, the loop moves the TP with it — always keeping the
+> callback in profit.
+
 ---
 
 ## `dca_grid.py` — geometric derivation

@@ -1,0 +1,20 @@
+[Unit]
+Description=DCA autonomous supervisor (%i) — re-arm grid + trailing TP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/opt/dca-grid
+EnvironmentFile=/etc/dca-grid.env
+# %i is the symbol, e.g. dca-super@ADAUSDT. Fully autonomous: re-arms the grid
+# when flat (auto-direction, 5% wallet, max leverage) and manages the trailing TP.
+ExecStart=/usr/bin/python3 -u /opt/dca-grid/ob_dca_grid.py %i --max-range 12 --supervise --execute
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/dca-grid/%i.log
+StandardError=append:/var/log/dca-grid/%i.log
+
+[Install]
+WantedBy=multi-user.target
